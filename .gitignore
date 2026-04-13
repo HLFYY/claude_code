@@ -1,7 +1,7 @@
 # 忽略当前目录下的某个文件夹
-.codex/
+.claude/
 .idea/
-.cache/
+cache/
 
 # 忽略任意层级同名文件夹
 **/node_modules/
@@ -10,5 +10,4 @@
 # 忽略特定文件
 *.log
 *.env
-*.csv
 config.py
