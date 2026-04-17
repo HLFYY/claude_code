@@ -42,26 +42,26 @@ CFG = {
 
     # ── 买点1：缩量确认 ──
     "confirm_weeks":          1,            # 突破后需缩量的周数
-    "shrink_ratio":           0.65,          # 后续每周量 ≤ 突破周量 × X
+    "shrink_ratio":           0.7,          # 后续每周量 ≤ 突破周量 × X
     "bp1_entry_buffer":       2,            # 确认完成后还允许等几周入场（bp1_max_age = confirm_weeks + buffer）
-    "bp1_confirmed_only":     True,         # True=只要已完成缩量确认；False=待确认也收录
+    "bp1_confirmed_only":     False,         # True=只要已完成缩量确认；False=待确认也收录
 
     # ── 买点2：回踩重启 ──
     "bp2_breakout_min_age":   6,
     "bp2_breakout_max_age":   52,
     "pullback_min":           0.15,         # 回踩最小幅度（从突破后高点下跌≥X%）
     "pullback_max":           0.40,         # 回踩最大幅度
-    "consolidation_min_weeks": 6,           # 盘整至少N周（原4，调大=洗盘更充分）
+    "consolidation_min_weeks": 4,           # 盘整至少N周（原4，调大=洗盘更充分）
     "restart_vol_ratio":      2.0,          # 近4周量 ≥ 盘整均量 × X
     "bp2_max_recovery_ratio": 0.75,         # 当前价在[低点→回踩前高点]区间的恢复比例上限（0.618=黄金分割，0.75=四分之三）
 
     # ── 通用过滤 ──
-    "min_price":              5.0,          # 最低股价（原3，调高过滤低价垃圾股）
+    "min_price":              3.0,          # 最低股价（原3，调高过滤低价垃圾股）
     "min_turnover":           0.5,          # 最低周换手率%（过滤流动性差的冷门股）
     "min_market_cap":         80,          # 最低总市值（亿元，用流通市值估算；0=不过滤）
     "min_weeks_data":         78,           # 最少数据周数（原60，调高确保有足够历史）
     "exclude_st":             True,
-    "min_score":              25,
+    "min_score":              5,
 }
 
 # ─────────────────────────────────────────────
@@ -328,7 +328,7 @@ def check_buy_point_1(df: pd.DataFrame) -> Optional[dict]:
 
         # 缩量确认
         after = df["volume"].values[bp["idx"]+1 : bp["idx"]+1+CONFIRM]
-        if len(after) == 0:
+        if len(after) < CONFIRM:
             confirm_ok   = False
             shrink_score = None
         else:
@@ -626,6 +626,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # daily = fetch_daily_recent('sz.002001', n=30)
+    # daily = fetch_daily_recent('sz.300497', n=30)
     # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
     # print(atr_pct)
+    # print(atr_pct*1.2)
