@@ -31,7 +31,7 @@ CFG = {
     # ── 数据 ──
     "start_date":             "2023-01-01",
     "cache_dir":              "./cache",
-    "cache_fresh_days":       5,            # 缓存最新数据距今≤N天视为"本周已是最新"，无需补拉
+    # 周线新鲜度：以"下一个周五 15:00 收盘"为界，收盘前不重拉（见 _weekly_is_fresh）
     "max_workers":            8,            # 线程数（网络请求已串行，此值影响分析并行度）
     "request_delay":          0.05,        # 串行请求间隔（秒）
 
@@ -75,6 +75,11 @@ import baostock as _bs_global
 _bs_lock    = threading.Lock()   # 所有网络请求串行化
 _bs_logged  = False
 
+_no_new_count        = 0              # 连续无新数据的拉取次数
+_first_new_logged    = False          # 是否已打印第一条拉取日期
+_stop_scan           = threading.Event()  # 触发后 process_one 直接跳过
+_last_known_date     = None           # 最近一次缓存/拉取的数据日期
+
 def _ensure_login():
     global _bs_logged
     if not _bs_logged:
@@ -96,6 +101,20 @@ def _cache_path_daily(code: str) -> str:
     os.makedirs(CFG["cache_dir"], exist_ok=True)
     safe = code.replace(".", "_")
     return os.path.join(CFG["cache_dir"], f"{safe}_d.pkl")
+
+
+def _weekly_is_fresh(df: pd.DataFrame) -> bool:
+    """
+    判断周线缓存是否仍然有效。
+    逻辑：最新一根周线的收盘日（周五）加 7 天 = 下一根周线的收盘日，
+    下一根收盘日 15:00 之前数据不会有更新，视为新鲜。
+    例：上周五 Apr 10 的数据，在本周五 Apr 17 15:00 之前都是最新。
+    """
+    last_date  = df["date"].iloc[-1]                          # pandas Timestamp
+    next_close = (last_date + timedelta(days=7)).to_pydatetime().replace(
+        hour=15, minute=0, second=0, microsecond=0
+    )
+    return datetime.now() < next_close
 
 
 def _parse_raw(df: pd.DataFrame) -> pd.DataFrame:
@@ -141,10 +160,12 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
             cached = pickle.load(f)
 
     if cached is not None and not cached.empty:
-        last_date  = cached["date"].iloc[-1]
-        days_since = (datetime.now() - last_date).days
-        if days_since <= CFG["cache_fresh_days"]:
-            return cached                  # 本周数据已是最新，直接返回
+        if _weekly_is_fresh(cached):
+            return cached                  # 下一根周线尚未收盘，直接返回
+
+    # 已确认无新数据，跳过网络请求直接用缓存
+    if _stop_scan.is_set():
+        return cached
 
     # ── 需要网络请求（串行） ──
     with _bs_lock:
@@ -153,9 +174,10 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
             with open(path, "rb") as f:
                 cached = pickle.load(f)
             if cached is not None and not cached.empty:
-                days_since = (datetime.now() - cached["date"].iloc[-1]).days
-                if days_since <= CFG["cache_fresh_days"]:
+                if _weekly_is_fresh(cached):
                     return cached
+
+        global _no_new_count, _first_new_logged, _last_known_date
 
         if cached is not None and not cached.empty:
             # ── 增量模式：只拉最后日期之后的数据 ──
@@ -172,11 +194,19 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                 )
                 with open(path, "wb") as f:
                     pickle.dump(merged, f)
+                _no_new_count = 0
+                _last_known_date = merged["date"].iloc[-1].date()
+                if not _first_new_logged:
+                    _first_new_logged = True
+                    tqdm.write(f"拉取后数据日期: {_last_known_date}")
                 return merged
             else:
-                # 无新数据（停牌或本周未收盘），更新文件 mtime 避免重复尝试
-                with open(path, "wb") as f:
-                    pickle.dump(cached, f)
+                # 无新数据（本周未收盘或停牌）
+                _last_known_date = cached["date"].iloc[-1].date()
+                _no_new_count += 1
+                if _no_new_count >= 10 and not _stop_scan.is_set():
+                    _stop_scan.set()
+                    tqdm.write(f"无新数据，停止扫描，接口数据时间:{_last_known_date}")
                 return cached
         else:
             # ── 全量模式：首次下载 ──
@@ -185,6 +215,11 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                 return None
             with open(path, "wb") as f:
                 pickle.dump(df, f)
+            _no_new_count = 0
+            _last_known_date = df["date"].iloc[-1].date()
+            if not _first_new_logged:
+                _first_new_logged = True
+                tqdm.write(f"拉取后数据日期: {_last_known_date}")
             return df
 
 
@@ -567,7 +602,9 @@ def save_results(results: list):
     df = pd.DataFrame(results)
     df = df.rename(columns=_CN_COLUMNS)
     fname = f"result_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    df.to_csv(fname, index=False, encoding="utf-8-sig")
+    with open(fname, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(f"数据更新时间,{_last_known_date}\n")
+        df.to_csv(f, index=False)
     print(f"结果已保存: {fname}")
 
 
@@ -585,6 +622,7 @@ def main():
     cache_dir = CFG["cache_dir"]
     cached_count = 0
     fresh_count  = 0
+    first_cache_date = None
     if os.path.exists(cache_dir):
         for code, _ in rows:
             p = _cache_path(code)
@@ -593,12 +631,16 @@ def main():
                 try:
                     with open(p, "rb") as f:
                         df = pickle.load(f)
-                    if (datetime.now() - df["date"].iloc[-1]).days <= CFG["cache_fresh_days"]:
+                    if first_cache_date is None:
+                        first_cache_date = df["date"].iloc[-1].date()
+                    if _weekly_is_fresh(df):
                         fresh_count += 1
                 except Exception:
                     pass
     need_update = cached_count - fresh_count
     no_cache    = total - cached_count
+    if first_cache_date is not None:
+        print(f"缓存数据日期: {first_cache_date}")
     print(f"共 {total} 只股票  |  缓存已是最新:{fresh_count}  需增量更新:{need_update}  无缓存(首次):{no_cache}")
     print(f"开始扫描...\n")
 
@@ -620,6 +662,8 @@ def main():
                     errors += 1
 
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
+    if _stop_scan.is_set() and results:
+        print(f"⚠️  注意：接口无最新数据（数据截止 {_last_known_date}），以下结果基于历史缓存，请勿直接操作！")
     print_results(results)
     save_results(results)
 
