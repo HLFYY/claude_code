@@ -29,39 +29,45 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 CFG = {
     # ── 数据 ──
-    "start_date":             "2023-01-01",
-    "cache_dir":              "./cache",
+    "start_date":       "2023-01-01",
+    "cache_dir":        "./cache",
     # 周线新鲜度：以"下一个周五 15:00 收盘"为界，收盘前不重拉（见 _weekly_is_fresh）
-    "max_workers":            8,            # 线程数（网络请求已串行，此值影响分析并行度）
-    "request_delay":          0.05,        # 串行请求间隔（秒）
+    "max_workers":      8,
+    "request_delay":    0.05,
 
-    # ── 倍量突破 ──
-    "vol_avg_weeks":          10,           # 均量窗口（周）
-    "vol_ratio":              2.5,          # 倍量阈值（突破周量 ≥ 均量 × X）
-    "new_high_weeks":         52,           # N周新高（78=1.5年）
+    # ── 均线（周） ──
+    "ma_long":          20,   # 20周线：判断方向 + 新高基准
+    "ma_short":         5,    # 5周线：买点2回踩支撑
 
-    # ── 买点1：缩量确认 ──
-    "confirm_weeks":          1,            # 突破后需缩量的周数
-    "shrink_ratio":           0.7,          # 后续每周量 ≤ 突破周量 × X
-    "bp1_entry_buffer":       2,            # 确认完成后还允许等几周入场（bp1_max_age = confirm_weeks + buffer）
-    "bp1_confirmed_only":     False,         # True=只要已完成缩量确认；False=待确认也收录
+    # ── 买点1：放量突破确认型 ──
+    # 力度周（W1）条件
+    "bp1_vol_ratio":         2.0,   # 成交额 ≥ 上周×2（倍量）
+    "bp1_gain_min":          0.05,  # 周涨幅 ≥ 5%
+    # 确认周（W2）条件
+    "bp1_confirm_shrink":    0.8,   # 缩量：成交额 ≤ W1×0.8 → 优先做
+    "bp1_confirm_warm_max":  1.3,   # 温和放量上限：≤ W1×1.3 → 可做排后
+                                    # > W1×1.3 明显放量 → 不做
+    "bp1_confirm_gain_max":  0.12,  # W2 涨幅 < 12%
+    "bp1_max_entry_age":     2,     # W1 最多2周前（W2最优/W3次优/W4+不做）
 
-    # ── 买点2：回踩重启 ──
-    "bp2_breakout_min_age":   6,
-    "bp2_breakout_max_age":   52,
-    "pullback_min":           0.15,         # 回踩最小幅度（从突破后高点下跌≥X%）
-    "pullback_max":           0.40,         # 回踩最大幅度
-    "consolidation_min_weeks": 4,           # 盘整至少N周（原4，调大=洗盘更充分）
-    "restart_vol_ratio":      2.0,          # 近4周量 ≥ 盘整均量 × X
-    "bp2_max_recovery_ratio": 0.75,         # 当前价在[低点→回踩前高点]区间的恢复比例上限（0.618=黄金分割，0.75=四分之三）
+    # ── 买点2：回踩反包型 ──
+    "bp2_pre_green_min":     2,     # 回踩前连续收红 ≥ 2 周
+    "bp2_pullback_max":      4,     # 回踩最大持续周数（1-4周）
+    "bp2_near_double_weeks": 4,     # 近N周内必须有一周倍量
+    "bp2_confirm_vol_max":   1.3,   # 反包周量能上限（明显放量则不做）
+
+    # ── 硬过滤（一票否决）──
+    "hard_gain_max":         0.30,  # 本周涨幅 ≥ 30% 过热
+    "hard_consec_green_max": 7,     # 连红 ≥ 7 周
+    "hard_hist_spike_min":   0.20,  # 历史须有单周涨幅 ≥ 20%（辨识度验证）
 
     # ── 通用过滤 ──
-    "min_price":              3.0,          # 最低股价（原3，调高过滤低价垃圾股）
-    "min_turnover":           0.5,          # 最低周换手率%（过滤流动性差的冷门股）
-    "min_market_cap":         80,          # 最低总市值（亿元，用流通市值估算；0=不过滤）
-    "min_weeks_data":         78,           # 最少数据周数（原60，调高确保有足够历史）
-    "exclude_st":             True,
-    "min_score":              5,
+    "min_price":        3.0,
+    "min_turnover":     0.5,   # 最低周换手率%
+    "min_market_cap":   50,    # 最低流通市值估算（亿）
+    "min_weeks_data":   78,    # 最少历史周数
+    "exclude_st":       True,
+    "min_score":        5,
 }
 
 # ─────────────────────────────────────────────
@@ -79,6 +85,9 @@ _no_new_count        = 0              # 连续无新数据的拉取次数
 _first_new_logged    = False          # 是否已打印第一条拉取日期
 _stop_scan           = threading.Event()  # 触发后 process_one 直接跳过
 _last_known_date     = None           # 最近一次缓存/拉取的数据日期
+
+_daily_fail_reasons  = {}             # 日线确认失败原因计数 {"原因": N}
+_daily_fail_lock     = threading.Lock()
 
 def _ensure_login():
     global _bs_logged
@@ -123,6 +132,10 @@ def _parse_raw(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     for col in ["open", "high", "low", "close", "volume", "turnover"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 成交额：优先用接口 amount 字段，否则用 volume×close 估算
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["amount"] = df.get("amount", pd.Series(dtype=float)).fillna(df["volume"] * df["close"])
     return df.dropna(subset=["close", "volume"]).reset_index(drop=True)
 
 
@@ -133,7 +146,7 @@ def _bs_fetch(code: str, start_date: str) -> Optional[pd.DataFrame]:
         time.sleep(CFG["request_delay"])
         rs = _bs_global.query_history_k_data_plus(
             code,
-            "date,open,high,low,close,volume,turn",
+            "date,open,high,low,close,volume,amount,turn",
             start_date=start_date,
             frequency="w",
             adjustflag="2",
@@ -158,6 +171,9 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
     if os.path.exists(path):
         with open(path, "rb") as f:
             cached = pickle.load(f)
+        # 旧缓存没有 amount 列，用 volume×close 估算补全
+        if cached is not None and "amount" not in cached.columns:
+            cached["amount"] = cached["volume"] * cached["close"]
 
     if cached is not None and not cached.empty:
         if _weekly_is_fresh(cached):
@@ -301,185 +317,335 @@ def _calc_atr(df: pd.DataFrame, n: int = 14) -> float:
 
 
 # ─────────────────────────────────────────────
-#  核心算法：找所有倍量突破点
+#  辅助函数
 # ─────────────────────────────────────────────
 
-def _find_volume_breakouts(df: pd.DataFrame) -> list:
-    N_HIGH  = CFG["new_high_weeks"]
-    N_VOL   = CFG["vol_avg_weeks"]
-    RATIO   = CFG["vol_ratio"]
-    min_idx = N_HIGH + N_VOL
+def _count_consec_green(closes: np.ndarray, opens: np.ndarray, end_idx: int) -> int:
+    """从 end_idx 往前数连续收红（close≥open）周数"""
+    count = 0
+    for i in range(end_idx, -1, -1):
+        if closes[i] >= opens[i]:
+            count += 1
+        else:
+            break
+    return count
 
-    closes  = df["close"].values
-    volumes = df["volume"].values
-    breakouts = []
 
-    for i in range(min_idx, len(df)):
-        prior_high = closes[i - N_HIGH: i].max()
-        if closes[i] <= prior_high:
-            continue
-
-        avg_vol = volumes[i - N_VOL: i].mean()
-        if avg_vol == 0:
-            continue
-        vol_r = volumes[i] / avg_vol
-        if vol_r < RATIO:
-            continue
-
-        breakouts.append({
-            "idx":       i,
-            "date":      df["date"].iloc[i],
-            "close":     closes[i],
-            "prior_high": prior_high,
-            "vol":       volumes[i],
-            "avg_vol":   avg_vol,
-            "vol_ratio": round(vol_r, 2),
-        })
-
-    breakouts.reverse()   # 最新在前
-    return breakouts
+def _ma(closes: np.ndarray, idx: int, window: int) -> float:
+    """idx 处的 window 周移动平均（不含 idx 本周，用于判断突破）"""
+    if idx < window:
+        return float("nan")
+    return float(closes[idx - window: idx].mean())
 
 
 # ─────────────────────────────────────────────
-#  买点1
+#  买点1 日线确认（力度周内部）
+# ─────────────────────────────────────────────
+
+def _check_daily_w1(daily: pd.DataFrame, w1_date, gain_w1: float) -> list:
+    """
+    检查力度周（W1）内的日线质量。
+    返回失败原因列表，空列表表示全部通过。
+    1. 涨放量跌缩量：上涨日均成交额 > 下跌日均成交额（买方主导）
+    2. 无大幅回吐：无单日跌幅 ≥ W1周涨幅×50%（相对前收）的阴线
+    3. 无大阴线：振幅 > W1周涨幅×30% 且最低价跌幅 > 3% 的阴线
+    数据不足时（W1 超出近期日线范围）直接放行，返回空列表。
+    """
+    w1_ts   = pd.Timestamp(w1_date)
+    w_start = w1_ts - timedelta(days=6)
+    week_df = daily[(daily["date"] >= w_start) & (daily["date"] <= w1_ts)].copy()
+
+    if len(week_df) < 3:
+        return []   # 数据不足，放行
+
+    closes  = week_df["close"].values
+    opens   = week_df["open"].values
+    highs   = week_df["high"].values
+    lows    = week_df["low"].values
+    amounts = week_df["amount"].values if "amount" in week_df.columns \
+              else (week_df["volume"].values * closes)
+
+    pullback_limit = gain_w1 * 0.5
+    big_red_limit  = gain_w1 * 0.3
+
+    reasons = []
+
+    # ── 检查1：涨放量跌缩量 ──
+    up_mask   = closes >= opens
+    down_mask = closes < opens
+    up_amt   = amounts[up_mask].mean()   if up_mask.any()   else 0
+    down_amt = amounts[down_mask].mean() if down_mask.any() else 0
+    if down_mask.any() and up_mask.any() and up_amt <= down_amt:
+        reasons.append("涨放量跌缩量")
+
+    # ── 检查2：无大幅回吐 ──
+    for i in range(1, len(week_df)):
+        if closes[i - 1] <= 0:
+            continue
+        daily_chg = (closes[i] - closes[i - 1]) / closes[i - 1]
+        if daily_chg <= -pullback_limit and closes[i] < opens[i]:
+            reasons.append("大幅回吐")
+            break
+
+    # ── 检查3：无大阴线（振幅 > W1周涨幅×30% 且最低价跌幅 > 3%）──
+    for i in range(len(week_df)):
+        candle_rng = highs[i] - lows[i]
+        ref_price  = max(closes[i], 0.01)
+        prev_close = closes[i - 1] if i > 0 else opens[i]
+        low_drop   = (prev_close - lows[i]) / max(prev_close, 0.01)
+        if (closes[i] < opens[i]
+                and candle_rng / ref_price > big_red_limit
+                and low_drop > 0.03):
+            reasons.append("大阴线")
+            break
+
+    return reasons
+
+
+# ─────────────────────────────────────────────
+#  买点1：放量突破确认型（优先级最高）
 # ─────────────────────────────────────────────
 
 def check_buy_point_1(df: pd.DataFrame) -> Optional[dict]:
-    """倍量突破新高 + 缩量确认"""
-    CONFIRM = CFG["confirm_weeks"]
-    SHRINK  = CFG["shrink_ratio"]
-    MAX_AGE = CONFIRM + CFG.get("bp1_entry_buffer", 1)   # 确认需 CONFIRM 周，之后再给 buffer 周入场
-    last_idx = len(df) - 1
+    """
+    力度周 W1：20周新高 + 收盘站上20MA + 20MA走平或向上 + 周涨幅≥5% + 成交额≥上周×2
+    确认周 W2：收盘>W1 + 收红 + 涨幅<12% + 成交额≤W1×1.3（>1.3不做）
+    入场窗口：
+      age=0 → W1就是本周，下周一入场（W2最优，W2未知故标"待W2"）
+      age=1 → W1上周，本周=W2已收盘可验证（最优）
+      age=2 → W1两周前，本周=W3（次优）
+      age≥3 → 不做
+    日线确认由 process_one 在命中后单独拉取并调用 _check_daily_w1。
+    """
+    MA_L    = CFG["ma_long"]
+    last    = len(df) - 1
+    closes  = df["close"].values
+    opens   = df["open"].values
+    amounts = df["amount"].values
+    MAX_AGE = CFG["bp1_max_entry_age"]   # 2
 
-    for bp in _find_volume_breakouts(df):
-        age = last_idx - bp["idx"]
-        if age > MAX_AGE:
-            break
-
-        # 价格须站稳（允许 -5%）
-        cur = df["close"].iloc[-1]
-        if cur < bp["close"] * 0.95:
+    for age in range(0, MAX_AGE + 1):   # age=0 表示 W1 = 本周
+        w1 = last - age
+        if w1 < MA_L + 2:
             continue
 
-        # 缩量确认
-        after = df["volume"].values[bp["idx"]+1 : bp["idx"]+1+CONFIRM]
-        if len(after) < CONFIRM:
-            confirm_ok   = False
-            shrink_score = None
-        else:
-            confirm_ok   = all(v <= bp["vol"] * SHRINK for v in after)
-            shrink_score = round(float(after.mean()) / bp["vol"], 2)
-
-        # 只要已确认模式：待确认直接跳过
-        if CFG.get("bp1_confirmed_only", False) and not confirm_ok:
+        # ── W1 条件 ──
+        # 1. 20周新高（收盘 > 前20周最高收盘）
+        prior_20_high = closes[w1 - MA_L: w1].max()
+        if closes[w1] <= prior_20_high:
             continue
 
-        # 评分：倍量比越大越好，越新越好，已确认加分
-        freshness = max(0, MAX_AGE - age) / MAX_AGE   # 0~1，越新越高
-        score = round(bp["vol_ratio"] * 8 + freshness * 20 + (10 if confirm_ok else 0), 1)
+        # 2. 20周线走平或向上（容差0.1%）
+        ma20_w1   = closes[w1 - MA_L: w1].mean()
+        ma20_prev = closes[w1 - MA_L - 1: w1 - 1].mean()
+        if ma20_w1 < ma20_prev * 0.999:
+            continue
+
+        # 3. 收盘站上20周线
+        if closes[w1] <= ma20_w1:
+            continue
+
+        # 4. 周涨幅 ≥ 5%
+        if closes[w1 - 1] <= 0:
+            continue
+        gain_w1 = (closes[w1] - closes[w1 - 1]) / closes[w1 - 1]
+        if gain_w1 < CFG["bp1_gain_min"]:
+            continue
+
+        # 5. 成交额 ≥ 上周×2（倍量）
+        if amounts[w1 - 1] <= 0:
+            continue
+        w1_vol_ratio = amounts[w1] / amounts[w1 - 1]
+        if w1_vol_ratio < CFG["bp1_vol_ratio"]:
+            continue
+
+        # ── age=0：W1 = 本周，W2 尚未发生，直接输出待入场信号 ──
+        if age == 0:
+            score = round(30 + min(w1_vol_ratio * 3, 12), 1)  # 最优优先级
+            return {
+                "signal":         "买点1-W1(下周一入场)",
+                "score":          score,
+                "breakout_date":  df["date"].iloc[w1].strftime("%Y-%m-%d"),
+                "breakout_price": round(closes[w1], 2),
+                "current_price":  round(closes[last], 2),
+                "chg_since":      f"{(closes[last]/closes[w1]-1)*100:+.1f}%",
+                "vol_ratio":      round(w1_vol_ratio, 2),
+                "w2_vol_ratio":   None,
+                "weeks_ago":      0,
+                "gain_w1":        round(gain_w1, 4),   # 供日线确认使用
+                "daily_ok":       "是",    # 由 process_one 在拉日线后覆盖
+            }
+
+        # ── age≥1：W2 已收盘，验证确认周条件 ──
+        w2 = w1 + 1
+        if w2 > last:
+            continue
+
+        # W2 收盘 > W1 收盘
+        if closes[w2] <= closes[w1]:
+            continue
+
+        # W2 收红
+        if closes[w2] < opens[w2]:
+            continue
+
+        # W2 涨幅 < 12%
+        gain_w2 = (closes[w2] - closes[w1]) / closes[w1]
+        if gain_w2 >= CFG["bp1_confirm_gain_max"]:
+            continue
+
+        # W2 量能三档判断
+        if amounts[w1] <= 0:
+            continue
+        w2_vol_ratio = amounts[w2] / amounts[w1]
+        if w2_vol_ratio > CFG["bp1_confirm_warm_max"]:   # >1.3 明显放量，不做
+            continue
+
+        is_shrink = w2_vol_ratio <= CFG["bp1_confirm_shrink"]  # ≤0.8 缩量，优先
+
+        # ── 评分 ──
+        vol_score   = 20 if is_shrink else 10
+        age_score   = 20 if age == 1 else 10
+        ratio_score = min(w1_vol_ratio * 3, 12)
+        score = round(vol_score + age_score + ratio_score, 1)
+
+        entry_week   = age + 1                        # age=1→W2已过/W3入场, age=2→W3已过/W4…
+        confirm_type = "缩量" if is_shrink else "温和"
+
         return {
-            "signal":         "买点1" + ("✓" if confirm_ok else "（待确认）"),
+            "signal":         f"买点1-W{entry_week}({confirm_type})",
             "score":          score,
-            "breakout_date":  bp["date"].strftime("%Y-%m-%d"),
-            "breakout_price": round(bp["close"], 2),
-            "current_price":  round(cur, 2),
-            "chg_since":      f"{(cur/bp['close']-1)*100:+.1f}%",
-            "vol_ratio":      bp["vol_ratio"],
-            "shrink_score":   shrink_score,
+            "breakout_date":  df["date"].iloc[w1].strftime("%Y-%m-%d"),
+            "breakout_price": round(closes[w1], 2),
+            "current_price":  round(closes[last], 2),
+            "chg_since":      f"{(closes[last]/closes[w1]-1)*100:+.1f}%",
+            "vol_ratio":      round(w1_vol_ratio, 2),
+            "w2_vol_ratio":   round(w2_vol_ratio, 2),
             "weeks_ago":      age,
-            "confirm_weeks":  len(after),
+            "gain_w1":        round(gain_w1, 4),   # 供日线确认使用
+            "daily_ok":       True,   # 由 process_one 在拉日线后覆盖
         }
 
     return None
 
 
 # ─────────────────────────────────────────────
-#  买点2
+#  买点2：回踩反包型（优先级次之）
 # ─────────────────────────────────────────────
 
 def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
-    """历史倍量突破 → 回踩洗盘 → 重新启动"""
-    MIN_AGE    = CFG["bp2_breakout_min_age"]
-    MAX_AGE    = CFG["bp2_breakout_max_age"]
-    PB_MIN     = CFG["pullback_min"]
-    PB_MAX     = CFG["pullback_max"]
-    CONSOL_MIN = CFG["consolidation_min_weeks"]
-    RESTART_R  = CFG["restart_vol_ratio"]
-    last_idx   = len(df) - 1
+    """
+    当前周：反包突破20周新高 + 收红 + 量能不明显放量（≤上周×1.3）
+    5周线走平或向上
+    近4周（不含当前）内必须有一周倍量（成交额≥上周×2）
+    回踩前：连续收红≥2周（回踩前筹码锁定）
+    回踩质量：短(1-2周)缩量不破5MA；长(3-4周)无放量大阴不破20MA
+    """
+    MA_L = CFG["ma_long"]   # 20
+    MA_S = CFG["ma_short"]  # 5
+    last = len(df) - 1
+    if last < MA_L + 6:
+        return None
 
     closes  = df["close"].values
-    volumes = df["volume"].values
+    opens   = df["open"].values
+    highs   = df["high"].values
+    lows    = df["low"].values
+    amounts = df["amount"].values
 
-    for bp in _find_volume_breakouts(df):
-        age = last_idx - bp["idx"]
-        if age < MIN_AGE:
-            continue
-        if age > MAX_AGE:
-            break
+    # ── 当前周：反包突破20周新高 ──
+    prior_20_high = closes[last - MA_L: last].max()
+    if closes[last] <= prior_20_high:
+        return None
 
-        after = df.iloc[bp["idx"]+1:]
-        if len(after) < CONSOL_MIN:
-            continue
+    # 当前周收红
+    if closes[last] < opens[last]:
+        return None
 
-        # 突破后最低点（回踩低点）
-        low_rel  = after["low"].values.argmin()
-        low_px   = after["low"].values[low_rel]
-        low_abs  = bp["idx"] + 1 + low_rel
+    # 当前周量能不明显放量
+    if amounts[last - 1] > 0 and amounts[last] > amounts[last - 1] * CFG["bp2_confirm_vol_max"]:
+        return None
 
-        # 基于突破后最高点计算回踩幅度
-        high_after = after["high"].values[:low_rel+1].max()
-        pullback   = (high_after - low_px) / high_after
-        if not (PB_MIN <= pullback <= PB_MAX):
-            continue
+    # ── 5周线走平或向上 ──
+    if last >= MA_S + 1:
+        ma5_now  = closes[last - MA_S + 1: last + 1].mean()
+        ma5_prev = closes[last - MA_S: last].mean()
+        if ma5_now < ma5_prev * 0.998:
+            return None
 
-        # 盘整期（低点到现在）
-        consol_len = last_idx - low_abs
-        if consol_len < CONSOL_MIN:
-            continue
+    # ── 近4周（不含当前）必须有一周倍量 ──
+    near_n = min(CFG["bp2_near_double_weeks"], last)
+    double_vol_idx = None
+    for i in range(last - near_n, last):
+        if i >= 1 and amounts[i - 1] > 0 and amounts[i] >= amounts[i - 1] * 2.0:
+            double_vol_idx = i
+    if double_vol_idx is None:
+        return None
 
-        # 重启信号：近4周量能 vs 盘整期均量
-        recent_n   = min(4, consol_len)
-        rv         = volumes[last_idx - recent_n + 1: last_idx + 1]
-        cv         = volumes[low_abs: last_idx - recent_n + 1]
-        if len(cv) == 0:
-            continue
-        vol_r = round(float(rv.mean()) / float(cv.mean()), 2)
-        if vol_r < RESTART_R:
-            continue
+    # ── 找回踩底部：当前周前2-6周内最低收盘周 ──
+    search_lo = max(MA_L + 1, last - 6)
+    search_hi = last        # 不含当前
+    if search_lo >= search_hi:
+        return None
+    low_idx = int(np.argmin(closes[search_lo: search_hi])) + search_lo
+    pullback_len = last - low_idx - 1  # 底部之后、当前周之前的周数
 
-        # 价格须高于盘整中枢
-        cur = closes[last_idx]
-        mid = low_px * (1 + pullback * 0.5)
-        if cur < mid:
-            continue
+    # 回踩持续 1-4 周
+    if not (1 <= pullback_len <= CFG["bp2_pullback_max"]):
+        return None
 
-        # 恢复比例不能太高（已经跑完的不要）
-        # recovery_ratio = 当前价在 [低点, 回踩前高点] 区间的位置，0=低点，1=高点
-        chg_from_low  = (cur - low_px) / low_px
-        recovery      = (cur - low_px) / (high_after - low_px) if high_after > low_px else 1.0
-        if recovery > CFG.get("bp2_max_recovery_ratio", 0.75):
-            continue
+    # ── 底部前：连续收红 ≥ 2 周（pre-pullback strength）──
+    pre_green = _count_consec_green(closes, opens, low_idx - 1)
+    if pre_green < CFG["bp2_pre_green_min"]:
+        return None
 
-        # 评分：重启量比 + 原始倍量 + 回踩幅度适中（太小太大都减分）
-        pb_score  = 20 - abs(pullback - 0.25) * 40   # 回踩25%附近最优
-        age_decay = max(0, 1 - (age - MIN_AGE) / (MAX_AGE - MIN_AGE))
-        score     = round(vol_r * 10 + bp["vol_ratio"] * 5 + pb_score + age_decay * 10, 1)
-        return {
-            "signal":         "买点2",
-            "score":          score,
-            "breakout_date":  bp["date"].strftime("%Y-%m-%d"),
-            "breakout_price": round(bp["close"], 2),
-            "pullback_low":   round(low_px, 2),
-            "pullback_pct":   f"{pullback*100:.1f}%",
-            "current_price":  round(cur, 2),
-            "chg_from_low":   f"{(cur/low_px-1)*100:+.1f}%",
-            "vol_ratio_bp":   bp["vol_ratio"],
-            "vol_restart_r":  vol_r,
-            "consol_weeks":   consol_len,
-            "weeks_ago":      age,
-        }
+    # ── 回踩质量 ──
+    if pullback_len <= 2:
+        # 短回踩：每周不破5MA
+        for i in range(low_idx, last):
+            if i < MA_S:
+                continue
+            ma5_i = closes[i - MA_S + 1: i + 1].mean()
+            if closes[i] < ma5_i * 0.98:
+                return None
+    else:
+        # 长调整：不破20MA + 无放量大阴（量>上周1.3倍 且 收阴 且 振幅>5%）
+        for i in range(low_idx, last):
+            if i < MA_L:
+                continue
+            ma20_i = closes[i - MA_L: i].mean()
+            if closes[i] < ma20_i * 0.98:
+                return None
+            if (i >= 1 and amounts[i - 1] > 0
+                    and amounts[i] > amounts[i - 1] * 1.3
+                    and closes[i] < opens[i]
+                    and (highs[i] - lows[i]) / closes[i - 1] > 0.05):
+                return None
 
-    return None
+    # ── 评分 ──
+    is_shrink_now  = (amounts[last - 1] > 0
+                      and amounts[last] <= amounts[last - 1] * 0.8)
+    vol_score      = 15 if is_shrink_now else 5
+    recency_score  = max(0, near_n - (last - double_vol_idx)) * 3
+    green_score    = min(pre_green, 4) * 2
+    score = round(vol_score + recency_score + green_score, 1)
+
+    low_price = closes[low_idx]
+    pullback_pct = (prior_20_high - low_price) / prior_20_high if prior_20_high > 0 else 0
+
+    return {
+        "signal":          "买点2",
+        "score":           score,
+        "breakout_date":   df["date"].iloc[low_idx].strftime("%Y-%m-%d"),
+        "breakout_price":  round(prior_20_high, 2),
+        "pullback_low":    round(low_price, 2),
+        "pullback_pct":    f"{pullback_pct*100:.1f}%",
+        "current_price":   round(closes[last], 2),
+        "chg_from_low":    f"{(closes[last]/low_price-1)*100:+.1f}%",
+        "vol_ratio":       round(amounts[last] / max(amounts[last-1], 1), 2),
+        "consol_weeks":    pullback_len,
+        "weeks_ago":       pullback_len + 1,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -513,20 +679,67 @@ def process_one(row: tuple) -> Optional[dict]:
             if float_cap < min_cap:
                 return None
 
-    result = check_buy_point_1(df) or check_buy_point_2(df)
+    # ── 硬过滤（一票否决，先于信号检测）──
+    closes  = df["close"].values
+    opens   = df["open"].values
+    highs   = df["high"].values
+    lows    = df["low"].values
+    amounts = df["amount"].values
+    last    = len(df) - 1
+
+    # 1. 本周涨幅 ≥ 30%（过热）
+    if last >= 1 and closes[last - 1] > 0:
+        if (closes[last] - closes[last - 1]) / closes[last - 1] >= CFG["hard_gain_max"]:
+            return None
+
+    # 2. 放量 + 上影 ≥ 实体（冲高回落）
+    body     = abs(closes[last] - opens[last])
+    upper_sh = highs[last] - max(closes[last], opens[last])
+    if (last >= 1 and amounts[last - 1] > 0
+            and amounts[last] > amounts[last - 1]
+            and body > 0 and upper_sh >= body):
+        return None
+
+    # 3. 连红 ≥ 7 周
+    if _count_consec_green(closes, opens, last) >= CFG["hard_consec_green_max"]:
+        return None
+
+    # 4. 历史须有单周涨幅 ≥ 20%（辨识度验证：没有过暴涨记录的票弹性不够）
+    pct_changes = np.where(closes[:-1] > 0,
+                           (closes[1:] - closes[:-1]) / closes[:-1], 0)
+    if pct_changes.max() < CFG["hard_hist_spike_min"]:
+        return None
+
+    # 先用周线判断买点1（不带日线）
+    result = check_buy_point_1(df)
+    daily = None
+    if result is not None:
+        # 只对命中买点1的股票拉日线做力度周确认
+        daily = fetch_daily_recent(code, n=30)
+        if daily is not None:
+            fail_reasons = _check_daily_w1(daily, result["breakout_date"], result["gain_w1"])
+            daily_ok = len(fail_reasons) == 0
+            result["daily_ok"] = "是" if daily_ok else "/".join(fail_reasons)
+            if not daily_ok:
+                with _daily_fail_lock:
+                    for r in fail_reasons:
+                        _daily_fail_reasons[r] = _daily_fail_reasons.get(r, 0) + 1
+
+    if result is None:
+        result = check_buy_point_2(df)
+
     if result is None:
         return None
     if result.get("score", 0) < CFG["min_score"]:
         return None
 
-    # 突破时间过滤：仅保留最近半年（约26周）内的突破
-    if result.get("weeks_ago", 999) > 26:
-        return None
-
     result["code"]    = code
     result["name"]    = name
-    daily = fetch_daily_recent(code, n=30)
+    # ATR 复用已拉取的日线，否则补拉（买点2）
+    if daily is None:
+        daily = fetch_daily_recent(code, n=30)
     result["atr_pct"] = _calc_atr(daily, 14) if daily is not None else float("nan")
+    result["atr_limit"] = result["atr_pct"] * 1.2
     return result
 
 
@@ -549,26 +762,28 @@ def print_results(results: list):
 
     if bp1:
         print(f"\n{'─'*72}")
-        print(f"  ★ 买点1：倍量突破新高 + 缩量确认  共 {len(bp1)} 只")
+        print(f"  ★ 买点1：放量突破确认型  共 {len(bp1)} 只  （W2缩量最优→W2温和→W3）")
         print(f"{'─'*72}")
         for r in bp1:
-            print(f"\n  【{r['code']}  {r['name']}】  {r['signal']}  评分:{r['score']}")
-            print(f"    突破: {r['breakout_date']}  突破价:{r['breakout_price']}  "
+            daily_val  = r.get("daily_ok", "是")
+            daily_pass = (daily_val == "是")
+            daily_flag = "" if daily_pass else f"  ⚠ 日线未达标({daily_val})"
+            print(f"\n  【{r['code']}  {r['name']}】  {r['signal']}  评分:{r['score']}{daily_flag}")
+            print(f"    力度周: {r['breakout_date']}  突破价:{r['breakout_price']}  "
                   f"当前:{r['current_price']}({r['chg_since']})")
-            print(f"    倍量比:{r['vol_ratio']}x  "
-                  f"缩量比:{r.get('shrink_score','--')}  "
-                  f"距今:{r['weeks_ago']}周  已确认:{r['confirm_weeks']}周")
+            print(f"    W1倍量比:{r['vol_ratio']}x  W2量能比:{r.get('w2_vol_ratio','--')}x  "
+                  f"距今:{r['weeks_ago']}周  ATR:{r.get('atr_pct','--')}%")
 
     if bp2:
         print(f"\n{'─'*72}")
-        print(f"  ☆ 买点2：历史突破 → 回踩洗盘 → 重新启动  共 {len(bp2)} 只")
+        print(f"  ☆ 买点2：回踩反包型  共 {len(bp2)} 只")
         print(f"{'─'*72}")
         for r in bp2:
             print(f"\n  【{r['code']}  {r['name']}】  {r['signal']}  评分:{r['score']}")
-            print(f"    原始突破: {r['breakout_date']}  突破价:{r['breakout_price']}")
-            print(f"    回踩低点: {r['pullback_low']}  回踩幅:{r['pullback_pct']}")
-            print(f"    当前价:   {r['current_price']}  (距低点{r['chg_from_low']})")
-            print(f"    启动量比: {r['vol_restart_r']}x  盘整:{r['consol_weeks']}周  原倍量:{r['vol_ratio_bp']}x")
+            print(f"    前高: {r['breakout_price']}  回踩底({r['breakout_date']}): {r['pullback_low']}"
+                  f"  回踩幅:{r['pullback_pct']}")
+            print(f"    当前价:{r['current_price']}  距低点:{r['chg_from_low']}  "
+                  f"反包量比:{r['vol_ratio']}x  回踩:{r['consol_weeks']}周  ATR:{r.get('atr_pct','--')}%")
 
     print(f"\n{'='*72}")
 
@@ -578,21 +793,20 @@ _CN_COLUMNS = {
     "name":           "股票名称",
     "signal":         "信号类型",
     "score":          "评分",
-    "breakout_date":  "突破日期",
-    "breakout_price": "突破价",
+    "breakout_date":  "突破/底部日期",
+    "breakout_price": "突破价/前高",
     "current_price":  "当前价",
     "chg_since":      "突破后涨幅",
-    "vol_ratio":      "倍量比",
-    "shrink_score":   "缩量比",
-    "weeks_ago":      "突破距今(周)",
-    "confirm_weeks":  "缩量确认(周)",
+    "vol_ratio":      "成交额倍量比",
+    "w2_vol_ratio":   "W2量能比(vs W1)",
+    "weeks_ago":      "距今(周)",
     "pullback_low":   "回踩低点",
     "pullback_pct":   "回踩幅度",
     "chg_from_low":   "距低点涨幅",
-    "vol_ratio_bp":   "原始倍量比",
-    "vol_restart_r":  "启动量比",
-    "consol_weeks":   "盘整周数",
+    "consol_weeks":   "回踩周数",
     "atr_pct":        "ATR%",
+    "atr_limit":       "网格步长",
+    "daily_ok":       "日线确认",
 }
 
 
@@ -662,6 +876,9 @@ def main():
                     errors += 1
 
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
+    if _daily_fail_reasons:
+        total_fail = sum(_daily_fail_reasons.values())
+        print(f"日线未通过 {total_fail} 个，原因汇总：{_daily_fail_reasons}")
     if _stop_scan.is_set() and results:
         print(f"⚠️  注意：接口无最新数据（数据截止 {_last_known_date}），以下结果基于历史缓存，请勿直接操作！")
     print_results(results)
@@ -670,7 +887,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # daily = fetch_daily_recent('sz.300497', n=30)
+    # daily = fetch_daily_recent('sz.300657', n=30)
     # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
     # print(atr_pct)
     # print(atr_pct*1.2)
