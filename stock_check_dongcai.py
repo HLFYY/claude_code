@@ -2,39 +2,87 @@ import requests
 from datetime import datetime, timedelta
 
 
-def get_weekly_kdata(code: str):
-    headers = {"Referer": "https://finance.sina.com.cn"}
+def get_secid(code: str) -> str:
+    """sz→0, sh→1"""
+    if code.startswith("sz"):
+        return f"0.{code[2:]}"
+    elif code.startswith("sh"):
+        return f"1.{code[2:]}"
+    raise ValueError(f"未知市场前缀：{code}")
 
-    # 1. 实时数据
-    url_rt = f"https://hq.sinajs.cn/list={code}"
-    resp = requests.get(url_rt, headers=headers, timeout=5)
-    resp.encoding = "gbk"
-    fields = resp.text.split('"')[1].split(",")
 
-    today_open  = float(fields[1])
-    last_close  = float(fields[2])
-    current_p   = float(fields[3])
-    today_high  = float(fields[4])
-    today_low   = float(fields[5])
-    today_vol   = float(fields[8])   # ✅ 成交量（手）
-    today_amt   = float(fields[9])   # ✅ 成交额（元）
-    today_date  = fields[30]
-
-    # print(f"=== 实时 ===")
-    # print(f"  当前价={current_p}, 今日成交量={today_vol}手, 今日成交额={today_amt/1e8:.4f}亿")
-
-    # 2. 获取近40日日线
-    url_hist = (
-        f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php"
-        f"/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen=40"
+def get_realtime_eastmoney(code: str) -> dict:
+    """东财实时行情"""
+    secid = get_secid(code)
+    url = (
+        f"https://push2.eastmoney.com/api/qt/stock/get"
+        f"?secid={secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60"
     )
-    resp2 = requests.get(url_hist, headers=headers, timeout=5)
-    daily = resp2.json()
+    resp = requests.get(url, timeout=5)
+    d = resp.json()["data"]
+    # f43=当前价 f44=最高 f45=最低 f46=开盘 f47=成交量(手) f48=成交额(元)
+    # f60=昨收
+    factor = d.get("f59", 100)  # 小数位数因子，一般是100
+    return {
+        "current_p":  d["f43"] / factor,
+        "today_high": d["f44"] / factor,
+        "today_low":  d["f45"] / factor,
+        "today_open": d["f46"] / factor,
+        "today_amt":  d["f48"],           # 成交额（元），直接精确值
+        "last_close": d["f60"] / factor,  # 昨收（非上周收盘）
+    }
 
-    # print(f"\n=== 日线原始字段示例（最新一条）===")
-    # print(daily[-1])
 
-    today      = datetime.strptime(today_date, "%Y-%m-%d")
+def get_daily_klines_eastmoney(code: str, count: int = 40) -> list:
+    """
+    东财日线K线，直接返回 amount 字段，无需估算
+    返回列表：[{"day", "open", "close", "high", "low", "volume", "amount"}, ...]
+    """
+    secid = get_secid(code)
+    url = (
+        f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={secid}"
+        f"&fields1=f1,f2,f3,f4,f5,f6"
+        f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+        f"&klt=101&fqt=0&lmt={count}&end=20991231"
+    )
+    resp = requests.get(url, timeout=5)
+    raw = resp.json()["data"]["klines"]
+
+    result = []
+    for item in raw:
+        # 格式: "日期,开,收,高,低,成交量(手),成交额(元),振幅,涨跌幅,涨跌额,换手率"
+        parts = item.split(",")
+        result.append({
+            "day":    parts[0],
+            "open":   float(parts[1]),
+            "close":  float(parts[2]),
+            "high":   float(parts[3]),
+            "low":    float(parts[4]),
+            "volume": float(parts[5]),
+            "amount": float(parts[6]),  # ✅ 直接精确成交额（元）
+        })
+    return result
+
+
+def get_weekly_kdata(code: str):
+    # 1. 实时数据
+    rt = get_realtime_eastmoney(code)
+    current_p   = rt["current_p"]
+    today_high  = rt["today_high"]
+    today_low   = rt["today_low"]
+    today_open  = rt["today_open"]
+    today_amt   = rt["today_amt"]   # ✅ 精确今日成交额
+
+    # 2. 历史日线（含精确 amount）
+    daily = get_daily_klines_eastmoney(code, count=40)
+
+    today_date  = daily[-1]["day"] if daily else datetime.now().strftime("%Y-%m-%d")
+    # 判断最后一条是否是今天（盘中时最后一条可能是昨天）
+    today       = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    last_bar_dt = datetime.strptime(daily[-1]["day"], "%Y-%m-%d")
+    last_bar_is_today = (last_bar_dt.date() == today.date())
+
     this_monday = today - timedelta(days=today.weekday())
     last_monday = this_monday - timedelta(days=7)
     last_sunday = this_monday - timedelta(days=1)
@@ -43,20 +91,19 @@ def get_weekly_kdata(code: str):
     week_map = {}
     for bar in daily:
         d = datetime.strptime(bar["day"], "%Y-%m-%d")
+        # 盘中时最后一条是昨天，不需要排除；收盘后最后一条是今天，排除避免重复
+        if last_bar_is_today and bar["day"] == daily[-1]["day"]:
+            continue
         wk_key = (d - timedelta(days=d.weekday())).strftime("%Y-%m-%d")
         week_map.setdefault(wk_key, []).append(bar)
 
-    def bar_amount(bar):
-        # 新浪日线 volume 单位是【股】，成交额 = 成交量(股) * 均价 ≈ volume * close
-        return float(bar["volume"]) * float(bar["close"])
-
     def week_summary(bars):
         return {
-            "open":   float(bars[0]["open"]),
-            "close":  float(bars[-1]["close"]),
-            "high":   max(float(b["high"]) for b in bars),
-            "low":    min(float(b["low"])  for b in bars),
-            "amount": sum(bar_amount(b) for b in bars),
+            "open":   bars[0]["open"],
+            "close":  bars[-1]["close"],
+            "high":   max(b["high"] for b in bars),
+            "low":    min(b["low"]  for b in bars),
+            "amount": sum(b["amount"] for b in bars),  # ✅ 精确
         }
 
     # 4. 本周数据
@@ -64,18 +111,17 @@ def get_weekly_kdata(code: str):
     hist_bars   = week_map.get(this_wk_key, [])
 
     if hist_bars:
-        week_open = float(hist_bars[0]["open"])
-        week_high = max([float(b["high"]) for b in hist_bars] + [today_high])
-        week_low  = min([float(b["low"])  for b in hist_bars] + [today_low])
-        # ✅ 历史日线成交额（股*收盘估算）+ 今日实时成交额（直接用fields[9]）
-        hist_amt  = sum(bar_amount(b) for b in hist_bars)
+        week_open = hist_bars[0]["open"]
+        week_high = max([b["high"] for b in hist_bars] + [today_high])
+        week_low  = min([b["low"]  for b in hist_bars] + [today_low])
+        hist_amt  = sum(b["amount"] for b in hist_bars)  # ✅ 精确
     else:
         week_open = today_open
         week_high = today_high
         week_low  = today_low
         hist_amt  = 0
 
-    week_amt = hist_amt + today_amt  # ✅ 今日直接用实时成交额字段
+    week_amt = hist_amt + today_amt  # ✅ 历史精确 + 今日实时精确
 
     this_week = {
         "open":   week_open,
@@ -84,11 +130,6 @@ def get_weekly_kdata(code: str):
         "low":    week_low,
         "amount": week_amt,
     }
-
-    # print(f"\n=== 本周成交额构成 ===")
-    # print(f"  历史日线累计（估算）= {hist_amt/1e8:.4f}亿")
-    # print(f"  今日实时成交额       = {today_amt/1e8:.4f}亿")
-    # print(f"  本周合计             = {week_amt/1e8:.4f}亿")
 
     # 5. 上周数据
     last_wk_key = last_monday.strftime("%Y-%m-%d")
@@ -99,30 +140,21 @@ def get_weekly_kdata(code: str):
             if last_monday <= datetime.strptime(b["day"], "%Y-%m-%d") <= last_sunday
         ]
     last_week = week_summary(last_bars) if last_bars else {
-        "open": 0, "close": last_close, "high": 0, "low": 0, "amount": 0
+        "open": 0, "close": rt["last_close"], "high": 0, "low": 0, "amount": 0
     }
-
-    # print(f"\n=== 上周成交额 ===")
-    # print(f"  上周合计（估算）= {last_week['amount']/1e8:.4f}亿")
-    # print(f"  上周收盘        = {last_week['close']}")
 
     # 6. 实时5周线 = 当前价 + 前4周收盘 均值
     sorted_wk_keys  = sorted(week_map.keys())
     past_wk_keys    = [w for w in sorted_wk_keys if w != this_wk_key]
     recent_4_keys   = past_wk_keys[-4:]
-    recent_4_prices = [float(week_map[w][-1]["close"]) for w in recent_4_keys]
+    recent_4_prices = [week_map[w][-1]["close"] for w in recent_4_keys]
     ma5_realtime    = (current_p + sum(recent_4_prices)) / 5
-
-    prev_5_keys   = past_wk_keys[-5:]
-    prev_5_prices = [float(week_map[w][-1]["close"]) for w in prev_5_keys]
-    ma5_last_week = sum(prev_5_prices) / len(prev_5_prices) if prev_5_prices else ma5_realtime
 
     return {
         "this_week":       this_week,
         "last_week":       last_week,
         "last_week_close": last_week["close"],
         "ma5_realtime":    round(ma5_realtime, 3),
-        "ma5_last_week":   round(ma5_last_week, 3),
     }
 
 
@@ -191,11 +223,10 @@ def _print_result(code, reason):
     action = "保留" if not reason else "清仓"
     print(f"\n  {'✅ 保留' if action == '保留' else '❌ 清仓'}")
     print(f"  代码：{code}")
-    # print(f"  结果：{action}")
     print(f"  原因：{reason if reason else '—'}")
 
 
 if __name__ == "__main__":
-    # check_stock("sh688253")
-    for code in ['sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz300696', 'sz002810', 'sh603906', 'sh688253', 'sz002947', 'sz002348']:
+    for code in ['sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081',
+                 'sz300696', 'sz002810', 'sh603906', 'sh688253', 'sz002947', 'sz002348']:
         check_stock(code)
