@@ -739,7 +739,7 @@ def process_one(row: tuple) -> Optional[dict]:
     if daily is None:
         daily = fetch_daily_recent(code, n=30)
     result["atr_pct"] = _calc_atr(daily, 14) if daily is not None else float("nan")
-    result["atr_limit"] = result["atr_pct"] * 1.2
+    result["atr_limit"] = round(result["atr_pct"] * 1.2, 2)
     return result
 
 
@@ -886,8 +886,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    # daily = fetch_daily_recent('sz.300657', n=30)
-    # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
-    # print(atr_pct)
-    # print(atr_pct*1.2)
+    # main()
+    daily = fetch_daily_recent('sz.300657', n=30)
+    atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+    print(atr_pct)
+    print(atr_pct*1.2)
+    last_price, min_p, start_p, end_p, max_p
