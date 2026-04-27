@@ -65,9 +65,9 @@ CFG = {
     "min_price":        3.0,
     "min_turnover":     0.5,   # 最低周换手率%
     "min_market_cap":   50,    # 最低流通市值估算（亿）
-    "min_weeks_data":   78,    # 最少历史周数
+    "min_weeks_data":   56,    # 最少历史周数
     "exclude_st":       True,
-    "min_score":        5,
+    "min_score":        -1,
 }
 
 # ─────────────────────────────────────────────
@@ -535,119 +535,143 @@ def check_buy_point_1(df: pd.DataFrame) -> Optional[dict]:
 
 def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
     """
-    当前周：反包突破20周新高 + 收红 + 量能不明显放量（≤上周×1.3）
+    当前周：反包突破20周新高 + 收红 + 量能不明显放量（≤突破周×1.3）
+    突破周：前面5周至少有1周突破之前的20周新高，突破周之前必须连续收红≥1周
+    回踩周：当前周和突破周之间，至少1周，收盘价低于当前周和突破周收盘价
+    回踩1-2周：每周成交额 < 突破周成交额，且周收盘价 ≥ 当时5MA
+    回踩3-4周：每周成交额 < 突破周成交额×1.3，且周收盘价 ≥ 当时20MA
     5周线走平或向上
     近4周（不含当前）内必须有一周倍量（成交额≥上周×2）
-    回踩前：连续收红≥2周（回踩前筹码锁定）
-    回踩质量：短(1-2周)缩量不破5MA；长(3-4周)无放量大阴不破20MA
     """
+    is_test = False
     MA_L = CFG["ma_long"]   # 20
     MA_S = CFG["ma_short"]  # 5
     last = len(df) - 1
     if last < MA_L + 6:
         return None
-
+    if is_test:
+        print('111')
     closes  = df["close"].values
     opens   = df["open"].values
-    highs   = df["high"].values
-    lows    = df["low"].values
     amounts = df["amount"].values
 
     # ── 当前周：反包突破20周新高 ──
-    prior_20_high = closes[last - MA_L: last].max()
-    if closes[last] <= prior_20_high:
+    prior_20_high_cur = closes[last - MA_L: last].max()
+    if closes[last] <= prior_20_high_cur:
         return None
 
     # 当前周收红
     if closes[last] < opens[last]:
         return None
-
-    # 当前周量能不明显放量
-    if amounts[last - 1] > 0 and amounts[last] > amounts[last - 1] * CFG["bp2_confirm_vol_max"]:
-        return None
-
+    if is_test:
+        print(222)
     # ── 5周线走平或向上 ──
     if last >= MA_S + 1:
         ma5_now  = closes[last - MA_S + 1: last + 1].mean()
         ma5_prev = closes[last - MA_S: last].mean()
         if ma5_now < ma5_prev * 0.998:
             return None
-
+    if is_test:
+        print(333)
     # ── 近4周（不含当前）必须有一周倍量 ──
-    near_n = min(CFG["bp2_near_double_weeks"], last)
-    double_vol_idx = None
-    for i in range(last - near_n, last):
-        if i >= 1 and amounts[i - 1] > 0 and amounts[i] >= amounts[i - 1] * 2.0:
-            double_vol_idx = i
-    if double_vol_idx is None:
+    # near_n = min(CFG["bp2_near_double_weeks"], last)
+    # double_vol_idx = None
+    # for i in range(last - near_n, last):
+    #     if i >= 1 and amounts[i - 1] > 0 and amounts[i] >= amounts[i - 1] * 2.0:
+    #         double_vol_idx = i
+    # if double_vol_idx is None:
+    #     return None
+
+    # ── 寻找突破周：当前周前5周内，找最近一周突破当时20周新高的周 ──
+    breakout_idx = None
+    search_start = max(MA_L + 1, last - 5)
+    for i in range(last - 1, search_start - 1, -1):
+        prior_20_high_i = closes[i - MA_L: i].max()
+        if closes[i] > prior_20_high_i:
+            breakout_idx = i
+            break
+
+    if breakout_idx is None:
         return None
 
-    # ── 找回踩底部：当前周前2-6周内最低收盘周 ──
-    search_lo = max(MA_L + 1, last - 6)
-    search_hi = last        # 不含当前
-    if search_lo >= search_hi:
+    # 当前周量能不明显放量（≤ 突破周×1.3）
+    breakout_amt = amounts[breakout_idx]
+    if breakout_amt > 0 and amounts[last] > breakout_amt * CFG["bp2_confirm_vol_max"]:
         return None
-    low_idx = int(np.argmin(closes[search_lo: search_hi])) + search_lo
-    pullback_len = last - low_idx - 1  # 底部之后、当前周之前的周数
+    if is_test:
+        print(444)
+    # ── 突破周之前连续收红 ≥ 1 周 ──
+    pre_green = _count_consec_green(closes, opens, breakout_idx - 1)
+    if pre_green < 1:
+        return None
 
-    # 回踩持续 1-4 周
+    # ── 回踩周：突破周和当前周之间的所有周 ──
+    pullback_indices = list(range(breakout_idx + 1, last))  # 不含突破周和当前周
+    pullback_len = len(pullback_indices)
+
+    # # 至少1周，最多4周
     if not (1 <= pullback_len <= CFG["bp2_pullback_max"]):
         return None
+    if is_test:
+        print(555)
+    # 回踩周收盘价必须同时低于突破周和当前周收盘价
+    breakout_close = closes[breakout_idx]
+    current_close  = closes[last]
+    for i in pullback_indices:
+        if closes[i] >= breakout_close or closes[i] >= current_close:
+            return None
 
-    # ── 底部前：连续收红 ≥ 2 周（pre-pullback strength）──
-    pre_green = _count_consec_green(closes, opens, low_idx - 1)
-    if pre_green < CFG["bp2_pre_green_min"]:
-        return None
+    if is_test:
+        print(666)
+    # ── 回踩质量检查 ──
+    breakout_amt = amounts[breakout_idx]
 
-    # ── 回踩质量 ──
     if pullback_len <= 2:
-        # 短回踩：每周不破5MA
-        for i in range(low_idx, last):
+        # 短回踩：成交额 < 突破周成交额，收盘价 ≥ 当时5MA
+        for i in pullback_indices:
+            if breakout_amt > 0 and amounts[i] >= breakout_amt:
+                return None
             if i < MA_S:
                 continue
             ma5_i = closes[i - MA_S + 1: i + 1].mean()
             if closes[i] < ma5_i * 0.98:
                 return None
     else:
-        # 长调整：不破20MA + 无放量大阴（量>上周1.3倍 且 收阴 且 振幅>5%）
-        for i in range(low_idx, last):
+        # 长回踩（3-4周）：成交额 < 突破周成交额×1.3，收盘价 ≥ 当时20MA
+        for i in pullback_indices:
+            if breakout_amt > 0 and amounts[i] >= breakout_amt * 1.3:
+                return None
             if i < MA_L:
                 continue
             ma20_i = closes[i - MA_L: i].mean()
             if closes[i] < ma20_i * 0.98:
                 return None
-            if (i >= 1 and amounts[i - 1] > 0
-                    and amounts[i] > amounts[i - 1] * 1.3
-                    and closes[i] < opens[i]
-                    and (highs[i] - lows[i]) / closes[i - 1] > 0.05):
-                return None
-
+    if is_test:
+        print(777)
     # ── 评分 ──
-    is_shrink_now  = (amounts[last - 1] > 0
-                      and amounts[last] <= amounts[last - 1] * 0.8)
-    vol_score      = 15 if is_shrink_now else 5
-    recency_score  = max(0, near_n - (last - double_vol_idx)) * 3
-    green_score    = min(pre_green, 4) * 2
-    score = round(vol_score + recency_score + green_score, 1)
+    is_shrink_now = (amounts[last - 1] > 0
+                     and amounts[last] <= amounts[last - 1] * 0.8)
+    vol_score     = 15 if is_shrink_now else 5
+    # recency_score = max(0, near_n - (last - double_vol_idx)) * 3
+    green_score   = min(pre_green, 4) * 2
+    # score         = round(vol_score + recency_score + green_score, 1)
 
-    low_price = closes[low_idx]
-    pullback_pct = (prior_20_high - low_price) / prior_20_high if prior_20_high > 0 else 0
+    pullback_low = min(closes[i] for i in pullback_indices)
+    pullback_pct = (breakout_close - pullback_low) / breakout_close if breakout_close > 0 else 0
 
     return {
-        "signal":          "买点2",
-        "score":           score,
-        "breakout_date":   df["date"].iloc[low_idx].strftime("%Y-%m-%d"),
-        "breakout_price":  round(prior_20_high, 2),
-        "pullback_low":    round(low_price, 2),
-        "pullback_pct":    f"{pullback_pct*100:.1f}%",
-        "current_price":   round(closes[last], 2),
-        "chg_from_low":    f"{(closes[last]/low_price-1)*100:+.1f}%",
-        "vol_ratio":       round(amounts[last] / max(amounts[last-1], 1), 2),
-        "consol_weeks":    pullback_len,
-        "weeks_ago":       pullback_len + 1,
+        "signal":         "买点2",
+        "score":          5,
+        "breakout_date":  df["date"].iloc[breakout_idx].strftime("%Y-%m-%d"),
+        "breakout_price": round(breakout_close, 2),
+        "pullback_low":   round(pullback_low, 2),
+        "pullback_pct":   f"{pullback_pct*100:.1f}%",
+        "current_price":  round(current_close, 2),
+        "chg_from_low":   f"{(current_close/pullback_low-1)*100:+.1f}%",
+        "vol_ratio":      round(amounts[last] / max(amounts[last - 1], 1), 2),
+        "consol_weeks":   pullback_len,
+        "weeks_ago":      pullback_len + 1,
     }
-
-
 # ─────────────────────────────────────────────
 #  单只股票处理
 # ─────────────────────────────────────────────
@@ -817,7 +841,7 @@ def save_results(results: list):
     df = df.rename(columns=_CN_COLUMNS)
     fname = f"result_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
-        f.write(f"数据更新时间,{_last_known_date}\n")
+        # f.write(f"数据更新时间,{_last_known_date}\n")
         df.to_csv(f, index=False)
     print(f"结果已保存: {fname}")
 
@@ -884,11 +908,90 @@ def main():
     print_results(results)
     save_results(results)
 
+def backtest_single(code: str, as_of_date: str, action: int = 2) -> Optional[dict]:
+    """
+    回测：以 as_of_date 所在周作为"当前周"，判断该股票是否满足买点1或买点2。
+    code: baostock格式，如 'sz.300657'
+    as_of_date: 'YYYY-MM-DD'，会自动对齐到所在周的周五
+    action: 1=买点1, 2=买点2
+    """
+    df = fetch_weekly(code)
+    if df is None or df.empty:
+        print(f"[{code}] 无数据")
+        return None
+
+    target_dt = pd.Timestamp(as_of_date)
+    mask = df["date"] <= target_dt
+    if not mask.any():
+        print(f"[{code}] {as_of_date} 早于数据起始日期 {df['date'].iloc[0].date()}")
+        return None
+
+    last = int(mask[::-1].idxmax())
+    actual_week_date = df["date"].iloc[last].strftime("%Y-%m-%d")
+    print(f"[{code}] 回测日期={as_of_date}，对齐到周线={actual_week_date}，索引={last}，共{len(df)}周数据")
+
+    df_slice = df.iloc[: last + 1].reset_index(drop=True)
+
+    if action == 1:
+        result = check_buy_point_1(df_slice)
+        if result:
+            print(f"[{code}] ✅ 买点1命中  信号={result['signal']}  "
+                  f"突破日={result['breakout_date']}  突破价={result['breakout_price']}  "
+                  f"W1倍量={result['vol_ratio']}x  评分={result['score']}")
+        else:
+            print(f"[{code}] ❌ 买点1未命中")
+    elif action == 2:
+        result = check_buy_point_2(df_slice)
+        if result:
+            print(f"[{code}] ✅ 买点2命中  突破周={result['breakout_date']}  "
+                  f"突破价={result['breakout_price']}  回踩低={result['pullback_low']}  "
+                  f"回踩幅={result['pullback_pct']}  回踩周数={result['consol_weeks']}")
+        else:
+            print(f"[{code}] ❌ 买点2未命中")
+    else:
+        print(f"action 参数错误，只支持 1 或 2")
+        return None
+
+    return result
+
+
+def backtest_batch(tests: list, action: int = 2):
+    """
+    批量回测
+    tests: [(code, date), ...]  如 [("sz.300657", "2024-03-15"), ...]
+    action: 1=买点1, 2=买点2
+    """
+    print(f"\n{'='*60}")
+    print(f"  买点{action} 批量回测  共 {len(tests)} 条")
+    print(f"{'='*60}")
+    hit, miss = 0, 0
+    for code, date in tests:
+        print(f"\n─ {code}  {date} ─")
+        result = backtest_single(code, date, action=action)
+        if result:
+            hit += 1
+        else:
+            miss += 1
+    print(f"\n{'='*60}")
+    print(f"  命中 {hit} 条  未命中 {miss} 条  命中率 {hit/(hit+miss)*100:.1f}%")
+    print(f"{'='*60}")
+
 
 if __name__ == "__main__":
-    # main()
-    daily = fetch_daily_recent('sz.300657', n=30)
-    atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
-    print(atr_pct)
-    print(atr_pct*1.2)
-    last_price, min_p, start_p, end_p, max_p
+    # 周五5点半后出当前周数据
+    main()
+    # daily = fetch_daily_recent('sz.300657', n=30)
+    # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+    # print(atr_pct)
+    # print(atr_pct*1.2)
+
+    # 单只回测-是否满足买点2
+    # backtest_single("sh.688629", "2026-02-16")
+    # backtest_single("sz.002001", "2026-02-28")
+
+    # 批量回测
+    # backtest_single([
+    #     ("sz.300657", "2024-03-15"),
+    #     ("sh.600519", "2023-11-10"),
+    #     ("sz.002436", "2024-01-05"),
+    # ])

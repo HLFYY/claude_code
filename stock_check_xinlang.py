@@ -127,38 +127,33 @@ def get_weekly_kdata(code: str):
         "ma5_last_week":   round(ma5_last_week, 3),
     }
 
-
-def check_stock(code: str):
-    data            = get_weekly_kdata(code)
-    this_week       = data["this_week"]
-    last_week       = data["last_week"]
-    last_week_close = data["last_week_close"]
-    ma5             = data["ma5_realtime"]
-
-    o        = this_week["open"]
-    c        = this_week["close"]
-    h        = this_week["high"]
-    l        = this_week["low"]
-    this_amt = this_week["amount"]
-    last_amt = last_week["amount"]
-
-    is_green     = c < o
-    is_expand    = this_amt > last_amt
-    gain         = (c - last_week_close) / last_week_close * 100
-    mid          = (h + l) / 2
+def get_reason(o, c, h, l, last_week_close, this_amt, last_amt, ma5):
+    """
+    :param o: 开盘价
+    :param c: 收盘价
+    :param h: 最高价
+    :param l: 最低价
+    :param last_week_close: 上周收盘价
+    :param this_amt: 本周交易额
+    :param last_amt: 上周交易额
+    :param ma5: 实时5周线
+    :return:
+    """
+    print((o, c, h, l, last_week_close, this_amt, last_amt, ma5))
+    is_green = c < o
+    is_expand = this_amt > last_amt
+    gain = (c - last_week_close) / last_week_close * 100
+    mid = (h + l) / 2
     upper_shadow = h - c
-    body         = abs(c - o)
+    body = abs(c - o)
     shrink_ratio = this_amt / last_amt if last_amt else 1
 
-    print(f"\n{'='*58}")
-    print(f"  代码：{code}   检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*58}")
     print(f"  本周：开={o}  收={c}  高={h}  低={l}")
     print(f"  上周收盘：{last_week_close}")
     print(f"  涨跌幅：{gain:+.2f}%   {'📈 放量' if is_expand else '📉 缩量'}（本周/上周={shrink_ratio:.2f}）")
-    print(f"  本周成交额={this_amt/1e8:.2f}亿   上周成交额={last_amt/1e8:.2f}亿")
+    print(f"  本周成交额={this_amt / 1e8:.2f}亿   上周成交额={last_amt / 1e8:.2f}亿")
     print(f"  实时5周线={ma5}   {'收盘在5周线上方 ✅' if c > ma5 else '收盘在5周线下方 ❌'}")
-    print(f"{'='*58}")
+    print(f"{'=' * 58}")
 
     reason = ""
 
@@ -184,10 +179,28 @@ def check_stock(code: str):
             if gain < -5:
                 reasons.append(f"跌幅{gain:.2f}%超5%")
             reason = "；".join(reasons)
+    return reason
+
+def check_stock(code: str):
+    data            = get_weekly_kdata(code)
+    this_week       = data["this_week"]
+    last_week       = data["last_week"]
+    last_week_close = data["last_week_close"]
+    ma5             = data["ma5_realtime"]
+
+    o        = this_week["open"]
+    c        = this_week["close"]
+    h        = this_week["high"]
+    l        = this_week["low"]
+    this_amt = this_week["amount"]
+    last_amt = last_week["amount"]
+    print(f"\n{'=' * 58}")
+    print(f"  代码：{code}   检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 58}")
+    reason = get_reason(o, c, h, l, last_week_close, this_amt, last_amt, ma5)
 
     _print_result(code, reason)
     return reason == ""
-
 
 def _print_result(code, reason):
     action = "保留" if not reason else "清仓"
@@ -199,6 +212,9 @@ def _print_result(code, reason):
 
 if __name__ == "__main__":
     # 新浪的数据成交额是计算的，有偏差；东方财富的是直接取的，准确些
-    # check_stock("sh688253")
-    for code in ['sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz300696', 'sz002810', 'sh603906', 'sh688253', 'sz002947', 'sz002348']:
-        check_stock(code)
+    check_stock("sh603256")
+    # for code in ['sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz300696', 'sz002810', 'sh603906', 'sh688253', 'sz002947', 'sz002348']:
+    # for code in 'sz000404,sh603060,sh688667,sh600105,sh603390,sz002240,sh688227,sz300137,sz300390,sz002297,sz300438,sh600338,sz001314,sh688020,sh600773,sh603268,sh603002,sz301607,sh688401,sh603256,sh605389,sh603399,sh688661,sh600510,sh688508,sz000829,sz300613,sh603826,sh605298,sh600206,sh600683,sh688381,sz000811,sh688081,sz002290,sh600330,sz002436,sz002497,sz300051,sz300657,sz300696,sh600641,sh603203,sh603655,sh688001,sz002947,sh688628'.split(','):
+    #     check_stock(code)
+    # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
+    # print(reason)
