@@ -227,6 +227,5 @@ def _print_result(code, reason):
 
 
 if __name__ == "__main__":
-    for code in ['sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081',
-                 'sz300696', 'sz002810', 'sh603906', 'sh688253', 'sz002947', 'sz002348']:
+    for code in ['sz300438', 'sh603256', 'sh603906', 'sz002240', 'sh688667', '', '', '', '', '', '', '', '']:
         check_stock(code)
