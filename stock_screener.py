@@ -93,6 +93,8 @@ _no_new_count        = 0              # 连续无新数据的拉取次数
 _first_new_logged    = False          # 是否已打印第一条拉取日期
 _stop_scan           = threading.Event()  # 触发后 process_one 直接跳过
 _last_known_date     = None           # 最近一次缓存/拉取的数据日期
+_weekly_all_fresh = False   # True = 全量缓存命中，False = 接口无新数据
+
 
 _daily_fail_reasons  = {}             # 日线确认失败原因计数 {"原因": N}
 _daily_fail_lock     = threading.Lock()
@@ -704,27 +706,28 @@ def _daily_cache_is_fresh(path: str) -> bool:
     return False
 
 
-def _fetch_daily_for_rps(code: str) -> None:
+def _fetch_daily_for_rps(code: str, force: bool = False) -> None:
     """
     为全市场 RPS 计算补拉日线数据。
-    用文件修改时间判断新鲜度，避免因节假日导致数据日期落后而误判为过期。
+    force=False 且周线无更新（_stop_scan 已触发）时，直接使用缓存，不发起网络请求。
     """
     path = _cache_path_daily(code)
-    need_rows = CFG["rps_days"] + 15   # 留节假日余量
+    need_rows = CFG["rps_days"] + 15
+
+    # ── 周线无更新 → 日线也不会有新数据，直接跳过 ──
+    if not force and _stop_scan.is_set():
+        return
 
     if _daily_cache_is_fresh(path):
-        # 还需确认行数足够（首次拉取可能 n 较小）
         try:
             with open(path, "rb") as f:
                 cached = pickle.load(f)
             if cached is not None and len(cached) >= need_rows:
-                return   # 新鲜且够用，跳过
+                return
         except Exception:
             pass
 
-    # ── 需要拉取 ──
-    fetch_daily_recent(code, n=need_rows)   # 内部已处理缓存写入
-
+    fetch_daily_recent(code, n=need_rows)
 
 def collect_market_gains(rows: list):
     """
@@ -735,17 +738,19 @@ def collect_market_gains(rows: list):
     days120 = CFG["rps_days"]       # 120
     days10  = CFG["gain_rank_days"] # 10
 
-    # ── Step1：并行补拉日线（主扫描用的8线程，这里共享同一 baostock 锁）──
-    print("补拉全市场日线数据（RPS计算用）...")
-    with ThreadPoolExecutor(max_workers=CFG["max_workers"]) as executor:
-        futs = {executor.submit(_fetch_daily_for_rps, code): code for code, _ in rows}
-        with tqdm(total=len(rows), desc="日线补拉", unit="只") as pbar:
-            for fut in as_completed(futs):
-                pbar.update(1)
-                try:
-                    fut.result(timeout=30)
-                except Exception:
-                    pass
+    if _stop_scan.is_set():
+        print("周线无更新，跳过日线补拉，直接读取缓存计算 RPS...")
+    else:
+        print("补拉全市场日线数据（RPS计算用）...")
+        with ThreadPoolExecutor(max_workers=CFG["max_workers"]) as executor:
+            futs = {executor.submit(_fetch_daily_for_rps, code): code for code, _ in rows}
+            with tqdm(total=len(rows), desc="日线补拉", unit="只") as pbar:
+                for fut in as_completed(futs):
+                    pbar.update(1)
+                    try:
+                        fut.result(timeout=30)
+                    except Exception:
+                        pass
 
     # ── Step2：读取缓存，计算涨幅 ──
     gains = {}
@@ -1058,11 +1063,20 @@ def main():
                 except Exception:
                     errors += 1
 
+    need_update = cached_count - fresh_count
+    no_cache = total - cached_count
+    stale_rate = (need_update + no_cache) / total if total > 0 else 0
+    if stale_rate < 0.01:  # 过期+无缓存 < 1%，视为全量新鲜
+        global _weekly_all_fresh
+        _weekly_all_fresh = True
+        _stop_scan.set()
+        print("全部周线均为最新缓存，跳过日线补拉。")
+
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
     if _daily_fail_reasons:
         total_fail = sum(_daily_fail_reasons.values())
         print(f"日线未通过 {total_fail} 个，原因汇总：{_daily_fail_reasons}")
-    if _stop_scan.is_set() and results:
+    if _stop_scan.is_set() and not _weekly_all_fresh and results:
         print(f"⚠️  注意：接口无最新数据（数据截止 {_last_known_date}），以下结果基于历史缓存，请勿直接操作！")
 
     # ── 计算全市场涨幅数据：先补拉全市场日线，再计算 RPS / 排名 ──
@@ -1077,6 +1091,7 @@ def main():
 
     print_results(results)
     save_results(results, total)
+
 
 
 # ─────────────────────────────────────────────
@@ -1155,6 +1170,9 @@ def backtest_batch(tests: list, action: int = 2):
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
+    # daily = fetch_daily_recent('sz.300861', n=max(CFG["rps_days"] + 10, 30))
+    # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+    # print(atr_pct)
 
     # 单只回测-是否满足买点2
     # backtest_single("sh.688629", "2026-02-16")

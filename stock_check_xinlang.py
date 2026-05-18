@@ -139,8 +139,10 @@ def get_reason(o, c, h, l, last_week_close, this_amt, last_amt, ma5):
     :param ma5: 实时5周线
     :return:
     """
-    print((o, c, h, l, last_week_close, this_amt, last_amt, ma5))
+    # print((o, c, h, l, last_week_close, this_amt, last_amt, ma5))
     is_green = c < o
+    # todo 节假日导致前后两周天数不一样，做归一化处理
+    # last_amt = last_amt / 3 * 4
     is_expand = this_amt > last_amt
     gain = (c - last_week_close) / last_week_close * 100
     mid = (h + l) / 2
@@ -216,7 +218,9 @@ if __name__ == "__main__":
     # 260430
     # for code in ['sh600791', 'sh603256', 'sz300438', 'sz002240', 'sz002730', 'sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz002810', 'sz002947']:
     # 260508
-    for code in ['sh600234', 'sh600330', 'sh603268', 'sh688661', 'sh600510', 'sz002859', 'sz301196', 'sh600791', 'sz002240', 'sz002730', 'sh600773']:
+    # for code in ['sh600234', 'sh600330', 'sh603268', 'sh688661', 'sh600510', 'sz002859', 'sz301196', 'sh600791', 'sz002240', 'sz002730', 'sh600773']:
+    # 260515
+    for code in ['sz300769', 'sh600105', 'sz301176', 'sz300861', 'sz002785', 'sz300201', 'sz300668', 'sh600330', 'sh603268', 'sh688661', 'sh600791', 'sz002730']:
         check_stock(code)
     # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
     # print(reason)
