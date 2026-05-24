@@ -980,17 +980,44 @@ _CN_COLUMNS = {
     "chg_from_low":   "距低点涨幅",
     "consol_weeks":   "回踩周数",
     "atr_pct":        "ATR%",
-    "atr_limit":       "网格步长",
+    "atr_limit":      "网格步长",
     "daily_ok":       "日线确认",
+    "level":          "辨识度级别",
     "rps120":         "RPS120(百分位)",
     "gain10_rank":    "10日涨幅排名",
 }
 
+def _calc_level(row) -> int:
+    """根据 rps120 和 gain10_rank 计算分级 1-5"""
+    signal = str(row.get("signal", ""))
+    if not ("买点2" in signal or "买点1-W2" in signal):
+        return ""  # 不符合信号类型，不参与分级
+
+    try:
+        rps120 = float(row.get("rps120", float("nan")))
+    except:
+        rps120 = float("nan")
+
+    try:
+        rank_num = float(row.get("gain10_rank", float("nan")))
+    except:
+        rank_num = float("nan")
+
+    for i in range(4):
+        level_num = i + 1
+        rps_ok   = (not np.isnan(rps120))   and rps120   >= (100 - level_num * 5)
+        rank_ok  = (not np.isnan(rank_num)) and rank_num <= level_num * 100
+        if rps_ok or rank_ok:
+            return level_num
+
+    return 5
 
 def save_results(results: list, total_stocks: int):
     if not results:
         return
     df = pd.DataFrame(results)
+
+    df["level"] = df.apply(_calc_level, axis=1)
 
     # 格式化 gain10_rank（纯整数，nan→空）
     if "gain10_rank" in df.columns:
@@ -1066,7 +1093,8 @@ def main():
     need_update = cached_count - fresh_count
     no_cache = total - cached_count
     stale_rate = (need_update + no_cache) / total if total > 0 else 0
-    if stale_rate < 0.01:  # 过期+无缓存 < 1%，视为全量新鲜
+    # 过期+无缓存 < 1%，视为全量新鲜
+    if stale_rate < 0.01 and datetime.now().weekday() not in [4,5,6]:
         global _weekly_all_fresh
         _weekly_all_fresh = True
         _stop_scan.set()
@@ -1170,7 +1198,7 @@ def backtest_batch(tests: list, action: int = 2):
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
-    # daily = fetch_daily_recent('sz.300861', n=max(CFG["rps_days"] + 10, 30))
+    # daily = fetch_daily_recent('sz.002730', n=max(CFG["rps_days"] + 10, 30))
     # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
     # print(atr_pct)
 
