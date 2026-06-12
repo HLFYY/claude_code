@@ -1,6 +1,8 @@
 import requests
 from datetime import datetime, timedelta
 
+from stock_screener import fetch_daily_recent, _calc_atr
+
 
 def get_weekly_kdata(code: str):
     headers = {"Referer": "https://finance.sina.com.cn"}
@@ -208,8 +210,13 @@ def _print_result(code, reason):
     action = "保留" if not reason else "清仓"
     print(f"\n  {'✅ 保留' if action == '保留' else '❌ 清仓'}")
     print(f"  代码：{code}")
+    # if action == '保留':
+    daily = fetch_daily_recent(f'{code[:2]}.{code[2:]}', n=30)
+    atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+    print(f"  最新步长：{atr_pct * 1.2}")
     # print(f"  结果：{action}")
     print(f"  原因：{reason if reason else '—'}")
+
 
 
 if __name__ == "__main__":
@@ -222,7 +229,13 @@ if __name__ == "__main__":
     # 260515
     # for code in ['sz300769', 'sh600105', 'sz301176', 'sz300861', 'sz002785', 'sz300201', 'sz300668', 'sh600330', 'sh603268', 'sh688661', 'sh600791', 'sz002730']:
     # 260522
-    for code in ['sz002730', 'sh688268', 'sz300161', 'sz300502', 'sz002832', 'sz003018', 'sz300821', 'sh603520', 'sh688390', 'sh688548', 'sh603268', 'sh600791']:
+    # for code in ['sz002730', 'sh688268', 'sz300161', 'sz300502', 'sz002832', 'sz003018', 'sz300821', 'sh603520', 'sh688390', 'sh688548', 'sh603268', 'sh600791']:
+    # 260528
+    # for code in ['sz002273', 'sh688328', 'sh688383', 'sh603269', 'sh688700', 'sz300001', 'sz300776', 'sh688300', 'sz003018', 'sh688390', 'sh600791']:
+    # 260605
+    # for code in ['sz300679', 'sz002281', 'sz300757', 'sh601016', 'sz300825', 'sz300502', 'sh600869', 'sh688328', 'sh688300']:
+    # 260612
+    for code in 'sh600869,sz300825,sz300700,sz301568,sz300234,sz300398,sh603663,sh600226,sz300706,sh688096,sh688432,sh688126,sh688757,sz301188'.split(','):
         check_stock(code)
     # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
     # print(reason)
