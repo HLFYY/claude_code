@@ -174,14 +174,16 @@ def get_reason(o, c, h, l, last_week_close, this_amt, last_amt, ma5):
     else:
         print("→ 【一级】缩量，检查收绿情况")
         if is_green:
+            daily = fetch_daily_recent(f'{code[:2]}.{code[2:]}', n=30)
+            atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
             print("   缩量且收绿，检查3个留仓条件")
             reasons = []
             if shrink_ratio > 0.8:
                 reasons.append(f"缩量不明显（本周/上周={shrink_ratio:.2f}>0.8）")
             if c <= ma5:
                 reasons.append(f"收盘{c}未在5周线{ma5}上方")
-            if gain < -5:
-                reasons.append(f"跌幅{gain:.2f}%超5%")
+            if gain < -atr_pct:
+                reasons.append(f"跌幅{gain:.2f}%超{atr_pct}%")
             reason = "；".join(reasons)
     return reason
 
@@ -224,18 +226,15 @@ if __name__ == "__main__":
     # check_stock("sh603256")
     # 260430
     # for code in ['sh600791', 'sh603256', 'sz300438', 'sz002240', 'sz002730', 'sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz002810', 'sz002947']:
-    # 260508
+    # 2605
     # for code in ['sh600234', 'sh600330', 'sh603268', 'sh688661', 'sh600510', 'sz002859', 'sz301196', 'sh600791', 'sz002240', 'sz002730', 'sh600773']:
-    # 260515
     # for code in ['sz300769', 'sh600105', 'sz301176', 'sz300861', 'sz002785', 'sz300201', 'sz300668', 'sh600330', 'sh603268', 'sh688661', 'sh600791', 'sz002730']:
-    # 260522
     # for code in ['sz002730', 'sh688268', 'sz300161', 'sz300502', 'sz002832', 'sz003018', 'sz300821', 'sh603520', 'sh688390', 'sh688548', 'sh603268', 'sh600791']:
-    # 260528
     # for code in ['sz002273', 'sh688328', 'sh688383', 'sh603269', 'sh688700', 'sz300001', 'sz300776', 'sh688300', 'sz003018', 'sh688390', 'sh600791']:
-    # 260605
+    # 2606
     # for code in ['sz300679', 'sz002281', 'sz300757', 'sh601016', 'sz300825', 'sz300502', 'sh600869', 'sh688328', 'sh688300']:
-    # 260612
-    for code in 'sh600869,sz300825,sz300700,sz301568,sz300234,sz300398,sh603663,sh600226,sz300706,sh688096,sh688432,sh688126,sh688757,sz301188'.split(','):
+    # for code in 'sh600869,sz300825,sz300700,sz301568,sz300234,sz300398,sh603663,sh600226,sz300706,sh688096,sh688432,sh688126,sh688757,sz301188'.split(','):
+    for code in 'sz300825,sz300700,sz300234,sh603663,sh600226,sz301188,sh603256,sz301389,sz002125,sh688379,sz300835,sz300567,sz300398,sz000608,sz301128'.split(','):
         check_stock(code)
     # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
     # print(reason)

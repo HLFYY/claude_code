@@ -10,4 +10,5 @@ cache/
 # 忽略特定文件
 *.log
 *.env
+*.apk
 config.py

@@ -46,7 +46,7 @@ CFG = {
     # ── 买点1：放量突破确认型 ──
     # todo 6.4调整
     # 力度周（W1）条件 bp1_vol_ratio：2->1.8   bp1_confirm_warm_max:1.3->1.5
-    #     bp1_confirm_gain_max:0.12->0.15   hard_hist_spike_min:0.2->0.1
+    #     bp1_confirm_gain_max:0.12->0.15   hard_hist_spike_min:0.2->0.1 bp2_confirm_vol_max:1.3->1.5
     "bp1_vol_ratio":         1.8,   # 成交额 ≥ 上周×2（倍量）
     "bp1_gain_min":          0.05,  # 周涨幅 ≥ 5%
     # 确认周（W2）条件
@@ -60,7 +60,7 @@ CFG = {
     "bp2_pre_green_min":     2,     # 回踩前连续收红 ≥ 2 周
     "bp2_pullback_max":      4,     # 回踩最大持续周数（1-4周）
     "bp2_near_double_weeks": 4,     # 近N周内必须有一周倍量
-    "bp2_confirm_vol_max":   1.3,   # 反包周量能上限（明显放量则不做）
+    "bp2_confirm_vol_max":   1.5,   # 反包周量能上限（明显放量则不做）
 
     # ── 硬过滤（一票否决）──
     "hard_gain_max":         0.30,  # 本周涨幅 ≥ 30% 过热
@@ -686,25 +686,56 @@ def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
 #  全市场涨幅收集（供 RPS 和涨幅排名计算）
 # ─────────────────────────────────────────────
 
+def _last_friday(ref: datetime = None) -> datetime.date:
+    """
+    返回距离 ref（默认今天）最近的周五（含今天）。
+    周一=0 … 周五=4 … 周日=6
+    """
+    if ref is None:
+        ref = datetime.now()
+    # 今天是周几
+    wd = ref.weekday()          # 0=周一 … 4=周五 … 6=周日
+    # 上一个（或当天）周五
+    days_back = (wd - 4) % 7   # 周五=0, 周六=1, 周日=2, 周一=3, …
+    return (ref - timedelta(days=days_back)).date()
+
+
 def _daily_cache_is_fresh(path: str) -> bool:
     """
-    判断日线缓存是否仍然有效：
-    用文件修改时间判断——当天15:00之前写入的缓存视为最新。
-    （交易日15:00收盘，收盘前数据不变；非交易日同理，
-      只要今天还没收盘就不需要重拉。）
+    判断日线缓存是否仍然有效。
+
+    优先策略（数据日期）：
+      读取缓存中最后一条数据的日期，若 >= 最近的周五，则认为日线数据
+      已覆盖本周，不需要重拉。这比文件修改时间更准确，不受节假日或
+      手动复制文件的干扰。
+
+    兜底策略（文件修改时间）：
+      如果读取缓存失败（文件损坏、格式不符），回退到原来的逻辑：
+      当天 15:00 之前写入的缓存视为最新。
     """
     if not os.path.exists(path):
         return False
+
+    # ── 优先：用数据内的最新日期判断 ──
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+        if cached is not None and not cached.empty and "date" in cached.columns:
+            last_data_date = pd.to_datetime(cached["date"].iloc[-1]).date()
+            if last_data_date >= _last_friday():
+                return True
+            # 数据日期早于最近周五 → 需要补拉，直接返回 False，无需再查文件时间
+            return False
+    except Exception:
+        pass
+
+    # ── 兜底：文件修改时间判断（缓存读取失败时） ──
     mtime = datetime.fromtimestamp(os.path.getmtime(path))
     today_close = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
-    # 文件是今天15:00之后写入 → 已包含今日收盘数据，绝对新鲜
     if mtime >= today_close:
         return True
-    # 文件是今天15:00之前写入，但今天还未到15:00 → 今天尚未收盘，仍然新鲜
     if datetime.now() < today_close and mtime.date() == datetime.now().date():
         return True
-    # 今天已过15:00但文件是今天15:00前写的 → 缺今日数据，需重拉
-    # 今天已过15:00但文件是昨天或更早写的 → 同上
     return False
 
 
@@ -1007,8 +1038,8 @@ def _calc_level(row) -> int:
 
     for i in range(4):
         level_num = i + 1
-        rps_ok   = (not np.isnan(rps120))   and rps120   >= (100 - level_num * 5)
-        rank_ok  = (not np.isnan(rank_num)) and rank_num <= level_num * 100
+        rps_ok   = (not np.isnan(rps120))   and rps120   >= (100 - level_num * 5) and rank_num <= min(level_num*700, 2000)
+        rank_ok  = (not np.isnan(rank_num)) and rank_num <= level_num * 100 and rps120  >= max(100 - level_num * 15, 60)
         if rps_ok or rank_ok:
             return level_num
 
@@ -1092,15 +1123,32 @@ def main():
                 except Exception:
                     errors += 1
 
-    need_update = cached_count - fresh_count
-    no_cache = total - cached_count
-    stale_rate = (need_update + no_cache) / total if total > 0 else 0
-    # 过期+无缓存 < 1%，视为全量新鲜
-    if stale_rate < 0.01 and datetime.now().weekday() not in [4,5,6]:
+    # ── 用日线缓存数据日期判断是否需要补拉 ──
+    # 抽样检查最多 100 只有日线缓存的股票，
+    # 若其中 >= 95% 的数据日期 >= 最近周五，则认为日线全量新鲜，跳过补拉。
+    last_fri = _last_friday()
+    sample_fresh = 0
+    sample_total = 0
+    for code, _ in rows[:min(len(rows), 100)]:
+        p = _cache_path_daily(code)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "rb") as f:
+                df_tmp = pickle.load(f)
+            if df_tmp is not None and not df_tmp.empty and "date" in df_tmp.columns:
+                sample_total += 1
+                last_d = pd.to_datetime(df_tmp["date"].iloc[-1]).date()
+                if last_d >= last_fri:
+                    sample_fresh += 1
+        except Exception:
+            pass
+
+    if sample_total >= 20 and sample_fresh / sample_total >= 0.95:
         global _weekly_all_fresh
         _weekly_all_fresh = True
         _stop_scan.set()
-        print("全部周线均为最新缓存，跳过日线补拉。")
+        print(f"日线数据已是最新（抽样 {sample_total} 只，{sample_fresh} 只 >= 最近周五 {last_fri}），跳过日线补拉。")
 
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
     if _daily_fail_reasons:
@@ -1200,7 +1248,7 @@ def backtest_batch(tests: list, action: int = 2):
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
-    # daily = fetch_daily_recent('sz.301188', n=max(CFG["rps_days"] + 10, 30))
+    # daily = fetch_daily_recent('sz.301369', n=max(CFG["rps_days"] + 10, 30))
     # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
     # print(atr_pct*1.2)
 
