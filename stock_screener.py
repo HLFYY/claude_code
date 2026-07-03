@@ -18,9 +18,10 @@ import sys
 import time
 import pickle
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+import chinese_calendar as cc
 
 import numpy as np
 import pandas as pd
@@ -45,9 +46,9 @@ CFG = {
 
     # ── 买点1：放量突破确认型 ──
     # todo 6.4调整
-    # 力度周（W1）条件 bp1_vol_ratio：2->1.8   bp1_confirm_warm_max:1.3->1.5
+    # 力度周（W1）条件 bp1_vol_ratio：2->1.6   bp1_confirm_warm_max:1.3->1.5
     #     bp1_confirm_gain_max:0.12->0.15   hard_hist_spike_min:0.2->0.1 bp2_confirm_vol_max:1.3->1.5
-    "bp1_vol_ratio":         1.8,   # 成交额 ≥ 上周×2（倍量）
+    "bp1_vol_ratio":         1.6,   # 成交额 ≥ 上周×2（倍量）
     "bp1_gain_min":          0.05,  # 周涨幅 ≥ 5%
     # 确认周（W2）条件
     "bp1_confirm_shrink":    0.8,   # 缩量：成交额 ≤ W1×0.8 → 优先做
@@ -70,8 +71,8 @@ CFG = {
     # ── 通用过滤 ──
     "min_price":        3.0,
     "min_turnover":     0.5,   # 最低周换手率%
-    "min_market_cap":   30,    # 最低流通市值估算（亿）
-    "min_weeks_data":   52,    # 最少历史周数
+    "min_market_cap":   20,    # 最低流通市值估算（亿）
+    "min_weeks_data":   40,    # 最少历史周数 52
     "exclude_st":       True,
     "min_score":        -1,
 
@@ -259,14 +260,14 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
             return df
 
 
-def fetch_daily_recent(code: str, n: int = 30) -> Optional[pd.DataFrame]:
+def fetch_daily_recent(code: str, n: int = 30, is_new: bool = False) -> Optional[pd.DataFrame]:
     """
     获取最近 n 个交易日的日线数据，用于计算 ATR(14)。
     用文件修改时间判断新鲜度，避免节假日/周末因数据日期落后而误判为过期。
     """
     path = _cache_path_daily(code)
 
-    if _daily_cache_is_fresh(path):
+    if _daily_cache_is_fresh(path, is_new=is_new):
         with open(path, "rb") as f:
             cached = pickle.load(f)
         if cached is not None and not cached.empty:
@@ -275,7 +276,7 @@ def fetch_daily_recent(code: str, n: int = 30) -> Optional[pd.DataFrame]:
     start = (datetime.now() - timedelta(days=n * 2)).strftime("%Y-%m-%d")  # 留足节假日余量
     with _bs_lock:
         # 双重检查
-        if _daily_cache_is_fresh(path):
+        if _daily_cache_is_fresh(path, is_new=is_new):
             with open(path, "rb") as f:
                 cached = pickle.load(f)
             if cached is not None and not cached.empty:
@@ -700,7 +701,7 @@ def _last_friday(ref: datetime = None) -> datetime.date:
     return (ref - timedelta(days=days_back)).date()
 
 
-def _daily_cache_is_fresh(path: str) -> bool:
+def _daily_cache_is_fresh(path: str, is_new: bool) -> bool:
     """
     判断日线缓存是否仍然有效。
 
@@ -722,7 +723,7 @@ def _daily_cache_is_fresh(path: str) -> bool:
             cached = pickle.load(f)
         if cached is not None and not cached.empty and "date" in cached.columns:
             last_data_date = pd.to_datetime(cached["date"].iloc[-1]).date()
-            if last_data_date >= _last_friday():
+            if (last_data_date >= _last_friday() and not is_new) or last_data_date == time.strftime('%Y-%m-%d'):
                 return True
             # 数据日期早于最近周五 → 需要补拉，直接返回 False，无需再查文件时间
             return False
@@ -751,7 +752,7 @@ def _fetch_daily_for_rps(code: str, force: bool = False) -> None:
     if not force and _stop_scan.is_set():
         return
 
-    if _daily_cache_is_fresh(path):
+    if _daily_cache_is_fresh(path, is_new=False):
         try:
             with open(path, "rb") as f:
                 cached = pickle.load(f)
@@ -1070,6 +1071,19 @@ def save_results(results: list, total_stocks: int):
     print(f"结果已保存: {fname}")
 
 
+def check_day(d):
+    # 判断是否是节假日或节假日前一天
+    if d is None:
+        d = date.today()
+
+    is_holiday = cc.is_holiday(d)
+    is_holiday_eve = cc.is_holiday(d + timedelta(days=1))  # 明天是节假日，今天是前一天
+    print(f'节假日:{is_holiday}, 节假日前一天:{is_holiday_eve}')
+    return is_holiday or is_holiday_eve
+
+
+
+
 # ─────────────────────────────────────────────
 #  主流程
 # ─────────────────────────────────────────────
@@ -1144,9 +1158,12 @@ def main():
         except Exception:
             pass
 
-    if sample_total >= 20 and sample_fresh / sample_total >= 0.95:
+    today = date.today()
+    is_holiday = check_day(today)
+    if sample_total >= 20 and sample_fresh / sample_total >= 0.95 and not is_holiday:
         global _weekly_all_fresh
         _weekly_all_fresh = True
+        # todo 需要重扫日线时注释
         _stop_scan.set()
         print(f"日线数据已是最新（抽样 {sample_total} 只，{sample_fresh} 只 >= 最近周五 {last_fri}），跳过日线补拉。")
 
@@ -1248,7 +1265,9 @@ def backtest_batch(tests: list, action: int = 2):
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
-    # daily = fetch_daily_recent('sz.301369', n=max(CFG["rps_days"] + 10, 30))
+    # 当日5点半后更新日线
+    # daily = fetch_daily_recent('sh.603259', n=max(CFG["rps_days"] + 10, 30), is_new=True)
+    # print(f'数据最新日期:{daily["date"].values[-1]}')
     # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
     # print(atr_pct*1.2)
 
