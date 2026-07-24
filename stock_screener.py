@@ -34,14 +34,15 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 CFG = {
     # ── 数据 ──
-    "start_date": (datetime.now() - timedelta(weeks=104)).strftime("%Y-%m-%d"),
+    "start_date": (datetime.now() - timedelta(weeks=156)).strftime("%Y-%m-%d"),
     "cache_dir":        "./cache",
     # 周线新鲜度：以"下一个周五 15:00 收盘"为界，收盘前不重拉（见 _weekly_is_fresh）
     "max_workers":      8,
     "request_delay":    0.05,
 
     # ── 均线（周） ──
-    "ma_long":          20,   # 20周线：判断方向 + 新高基准
+    "ma_long":          20,   # 20周线：判断方向 + MA支撑（不影响新高判断）
+    "ma_new_high":      20,   # N周新高判断窗口（买点1/买点2均用它，独立于ma_long）
     "ma_short":         5,    # 5周线：买点2回踩支撑
 
     # ── 买点1：放量突破确认型 ──
@@ -81,6 +82,7 @@ CFG = {
     "gain_rank_days":   10,    # 短期涨幅排名天数
 }
 
+print(f'start_date:{CFG["start_date"]}')
 # ─────────────────────────────────────────────
 #  全局 baostock session
 #  baostock 使用自定义 socket 协议，不支持并发，
@@ -451,6 +453,7 @@ def check_buy_point_1(df: pd.DataFrame) -> Optional[dict]:
     日线确认由 process_one 在命中后单独拉取并调用 _check_daily_w1。
     """
     MA_L    = CFG["ma_long"]
+    MA_NH   = CFG["ma_new_high"]
     last    = len(df) - 1
     closes  = df["close"].values
     opens   = df["open"].values
@@ -459,12 +462,12 @@ def check_buy_point_1(df: pd.DataFrame) -> Optional[dict]:
 
     for age in range(0, MAX_AGE + 1):   # age=0 表示 W1 = 本周
         w1 = last - age
-        if w1 < MA_L + 2:
+        if w1 < max(MA_L, MA_NH) + 2:
             continue
 
         # ── W1 条件 ──
-        # 1. 20周新高（收盘 > 前20周最高收盘）
-        prior_20_high = closes[w1 - MA_L: w1].max()
+        # 1. N周新高（收盘 > 前N周最高收盘）
+        prior_20_high = closes[w1 - MA_NH: w1].max()
         if closes[w1] <= prior_20_high:
             continue
 
@@ -577,10 +580,11 @@ def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
     近4周（不含当前）内必须有一周倍量（成交额≥上周×2）
     """
     is_test = False
-    MA_L = CFG["ma_long"]   # 20
-    MA_S = CFG["ma_short"]  # 5
+    MA_L  = CFG["ma_long"]      # 20
+    MA_NH = CFG["ma_new_high"]  # 20
+    MA_S  = CFG["ma_short"]     # 5
     last = len(df) - 1
-    if last < MA_L + 6:
+    if last < max(MA_L, MA_NH) + 6:
         return None
     if is_test:
         print('111')
@@ -588,8 +592,8 @@ def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
     opens   = df["open"].values
     amounts = df["amount"].values
 
-    # ── 当前周：反包突破20周新高 ──
-    prior_20_high_cur = closes[last - MA_L: last].max()
+    # ── 当前周：反包突破N周新高 ──
+    prior_20_high_cur = closes[last - MA_NH: last].max()
     if closes[last] <= prior_20_high_cur:
         return None
 
@@ -609,9 +613,9 @@ def check_buy_point_2(df: pd.DataFrame) -> Optional[dict]:
 
     # ── 寻找突破周：当前周前5周内，找最近一周突破当时20周新高的周 ──
     breakout_idx = None
-    search_start = max(MA_L + 1, last - 5)
+    search_start = max(MA_NH + 1, last - 5)
     for i in range(last - 1, search_start - 1, -1):
-        prior_20_high_i = closes[i - MA_L: i].max()
+        prior_20_high_i = closes[i - MA_NH: i].max()
         if closes[i] > prior_20_high_i:
             breakout_idx = i
             break
@@ -1181,7 +1185,6 @@ def main():
         # todo 需要重扫日线时注释
         _stop_scan.set()
         print(f"日线数据已是最新（抽样 {sample_total} 只，{sample_fresh} 只 >= 最近周五 {last_fri}），跳过日线补拉。")
-    _stop_scan.set()
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
     if _daily_fail_reasons:
         total_fail = sum(_daily_fail_reasons.values())
