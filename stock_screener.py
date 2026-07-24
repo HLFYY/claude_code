@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 CFG = {
     # ── 数据 ──
-    "start_date":       "2023-01-01",
+    "start_date": (datetime.now() - timedelta(weeks=104)).strftime("%Y-%m-%d"),
     "cache_dir":        "./cache",
     # 周线新鲜度：以"下一个周五 15:00 收盘"为界，收盘前不重拉（见 _weekly_is_fresh）
     "max_workers":      8,
@@ -66,7 +66,7 @@ CFG = {
     # ── 硬过滤（一票否决）──
     "hard_gain_max":         0.30,  # 本周涨幅 ≥ 30% 过热
     "hard_consec_green_max": 7,     # 连红 ≥ 7 周
-    "hard_hist_spike_min":   0.10,  # 历史须有单周涨幅 ≥ 20%（辨识度验证）
+    "hard_hist_spike_min":   0.15,  # 历史须有单周涨幅 ≥ 20%（辨识度验证）
 
     # ── 通用过滤 ──
     "min_price":        3.0,
@@ -183,7 +183,10 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
     获取周线数据，支持增量更新：
       - 无缓存        → 全量下载
       - 有缓存且已是本周最新  → 直接返回缓存
-      - 有缓存但有新周数据    → 只补拉缺少的部分，追加后保存
+      - 有缓存但可能需要更新  → 先轻量探测是否有新数据：
+          · 探测无新数据 → 沿用旧缓存，不做额外请求
+          · 探测有新数据 → 触发全量历史重新拉取并整体覆盖
+                          （修正半成品周数据、以及前复权基准漂移问题）
     """
     path = _cache_path(code)
 
@@ -201,7 +204,9 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
             return cached                  # 下一根周线尚未收盘，直接返回
 
     # 已确认无新数据，跳过网络请求直接用缓存
-    if _stop_scan.is_set():
+    # 注意：只有"确实有缓存"的股票才允许被这条跳过，
+    # 无缓存的新股票必须走下面的全量下载，不能被误伤
+    if _stop_scan.is_set() and cached is not None:
         return cached
 
     # ── 需要网络请求（串行） ──
@@ -217,15 +222,36 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
         global _no_new_count, _first_new_logged, _last_known_date
 
         if cached is not None and not cached.empty:
-            # ── 增量模式：只拉最后日期之后的数据 ──
-            last_date  = cached["date"].iloc[-1]
-            start      = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            new_df     = _bs_fetch(code, start)
+            # ── 第一步：轻量探测，只问"最后一天之后"有没有新数据 ──
+            last_date    = cached["date"].iloc[-1]
+            probe_start  = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            probe_df     = _bs_fetch(code, probe_start)
 
-            if new_df is not None and not new_df.empty:
+            if probe_df is None or probe_df.empty:
+                # 确实没有新数据，沿用旧缓存，不做全量下载
+                _last_known_date = cached["date"].iloc[-1].date()
+                _no_new_count += 1
+                if _no_new_count >= 10 and not _stop_scan.is_set():
+                    _stop_scan.set()
+                    tqdm.write(f"无新数据，停止扫描，接口数据时间:{_last_known_date}")
+                return cached
+
+            # ── 第二步：确认有新数据，做全量历史重新拉取并整体覆盖 ──
+            df = _bs_fetch(code, CFG["start_date"])
+            if df is not None and not df.empty:
+                with open(path, "wb") as f:
+                    pickle.dump(df, f)
+                _no_new_count = 0
+                _last_known_date = df["date"].iloc[-1].date()
+                if not _first_new_logged:
+                    _first_new_logged = True
+                    tqdm.write(f"拉取后数据日期: {_last_known_date}")
+                return df
+            else:
+                # 探测有数据但全量拉取失败（网络抖动等），退回用探测结果拼接
                 merged = (
-                    pd.concat([cached, new_df], ignore_index=True)
-                    .drop_duplicates("date")
+                    pd.concat([cached, probe_df], ignore_index=True)
+                    .drop_duplicates("date", keep="last")
                     .sort_values("date")
                     .reset_index(drop=True)
                 )
@@ -233,18 +259,7 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                     pickle.dump(merged, f)
                 _no_new_count = 0
                 _last_known_date = merged["date"].iloc[-1].date()
-                if not _first_new_logged:
-                    _first_new_logged = True
-                    tqdm.write(f"拉取后数据日期: {_last_known_date}")
                 return merged
-            else:
-                # 无新数据（本周未收盘或停牌）
-                _last_known_date = cached["date"].iloc[-1].date()
-                _no_new_count += 1
-                if _no_new_count >= 10 and not _stop_scan.is_set():
-                    _stop_scan.set()
-                    tqdm.write(f"无新数据，停止扫描，接口数据时间:{_last_known_date}")
-                return cached
         else:
             # ── 全量模式：首次下载 ──
             df = _bs_fetch(code, CFG["start_date"])
@@ -258,7 +273,6 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                 _first_new_logged = True
                 tqdm.write(f"拉取后数据日期: {_last_known_date}")
             return df
-
 
 def fetch_daily_recent(code: str, n: int = 30, is_new: bool = False) -> Optional[pd.DataFrame]:
     """
@@ -1019,13 +1033,17 @@ _CN_COLUMNS = {
     "level":          "辨识度级别",
     "rps120":         "RPS120(百分位)",
     "gain10_rank":    "10日涨幅排名",
+    "high_date":      "100日新高日期",   # 新增
+    "high_price":     "新高收盘价",       # 新增
+    "chg_pct":        "较新高涨跌幅",  # 新增
 }
 
-def _calc_level(row) -> int:
+def _calc_level(row, require_signal_type: bool = True) -> int:
     """根据 rps120 和 gain10_rank 计算分级 1-5"""
-    signal = str(row.get("signal", ""))
-    if not ("买点2" in signal or "买点1-W2" in signal):
-        return ""  # 不符合信号类型，不参与分级
+    if require_signal_type:
+        signal = str(row.get("signal", ""))
+        if not ("买点2" in signal or "买点1-W2" in signal):
+            return ""  # 不符合信号类型，不参与分级
 
     try:
         rps120 = float(row.get("rps120", float("nan")))
@@ -1046,14 +1064,13 @@ def _calc_level(row) -> int:
 
     return 5
 
-def save_results(results: list, total_stocks: int):
+def save_results(results: list, total_stocks: int, fname_prefix: str = "result", require_signal_type: bool = True):
     if not results:
         return
     df = pd.DataFrame(results)
 
-    df["level"] = df.apply(_calc_level, axis=1)
+    df["level"] = df.apply(lambda row: _calc_level(row, require_signal_type=require_signal_type), axis=1)
 
-    # 格式化 gain10_rank（纯整数，nan→空）
     if "gain10_rank" in df.columns:
         df["gain10_rank"] = df["gain10_rank"].apply(
             lambda v: int(v) if not (isinstance(v, float) and np.isnan(v)) else ""
@@ -1065,12 +1082,10 @@ def save_results(results: list, total_stocks: int):
         )
 
     df = df.rename(columns=_CN_COLUMNS)
-    fname = f"result_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    fname = f"{fname_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
         df.to_csv(f, index=False)
     print(f"结果已保存: {fname}")
-
-
 def check_day(d):
     # 判断是否是节假日或节假日前一天
     if d is None:
@@ -1166,7 +1181,7 @@ def main():
         # todo 需要重扫日线时注释
         _stop_scan.set()
         print(f"日线数据已是最新（抽样 {sample_total} 只，{sample_fresh} 只 >= 最近周五 {last_fri}），跳过日线补拉。")
-
+    _stop_scan.set()
     print(f"\n扫描完成：命中 {len(results)} 只，失败/跳过 {errors} 只")
     if _daily_fail_reasons:
         total_fail = sum(_daily_fail_reasons.values())
@@ -1262,15 +1277,202 @@ def backtest_batch(tests: list, action: int = 2):
     print(f"{'='*60}")
 
 
+# ─────────────────────────────────────────────
+#  近N日创100日新高检测
+# ─────────────────────────────────────────────
+
+def _last_trading_day_on_or_before(d: date, max_back: int = 10) -> date:
+    """
+    返回 <= d 的最近一个交易日（用 chinese_calendar 判断，
+    自动处理周末和法定节假日，包括调休上班日——调休周末 A股是正常开市的，
+    这与 chinese_calendar 的 is_workday 语义一致）。
+    max_back 防止极端情况下死循环（比如某年有超长假期）。
+    """
+    cur = d
+    for _ in range(max_back):
+        if cc.is_workday(cur):
+            return cur
+        cur -= timedelta(days=1)
+    return cur  # 兜底：超出回溯范围仍未找到，返回最后尝试的日期
+
+def _fetch_daily_custom(code: str, n: int, required_date: date) -> Optional[pd.DataFrame]:
+    """
+    按自定义新鲜度要求获取日线数据：缓存最新日期 >= required_date 才算新鲜，
+    不满足则强制发起网络请求补拉。
+
+    与 fetch_daily_recent 逻辑类似，但新鲜度判断标准不同（后者固定按"最近周五"
+    或"严格等于今天"判断，服务于 ATR/RPS 场景），这里单独实现，避免互相干扰。
+    """
+    path = _cache_path_daily(code)
+
+    cached = None
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                cached = pickle.load(f)
+        except Exception:
+            cached = None
+
+    if (cached is not None and not cached.empty and "date" in cached.columns
+            and len(cached) >= n):
+        last_data_date = pd.to_datetime(cached["date"].iloc[-1]).date()
+        if last_data_date >= required_date:
+            return cached
+
+    start = (datetime.now() - timedelta(days=n * 2)).strftime("%Y-%m-%d")
+    with _bs_lock:
+        # 双重检查（另一线程可能刚更新过同一股票）
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    cached = pickle.load(f)
+                if (cached is not None and not cached.empty and "date" in cached.columns
+                        and len(cached) >= n):
+                    last_data_date = pd.to_datetime(cached["date"].iloc[-1]).date()
+                    if last_data_date >= required_date:
+                        return cached
+            except Exception:
+                pass
+        try:
+            _ensure_login()
+            time.sleep(CFG["request_delay"])
+            rs = _bs_global.query_history_k_data_plus(
+                code,
+                "date,open,high,low,close,volume,turn",
+                start_date=start,
+                frequency="d",
+                adjustflag="2",
+            )
+            df = rs.get_data()
+            if df is None or df.empty:
+                return cached  # 网络拉取失败，退回旧缓存（可能是 None）
+            df = _parse_raw(df).tail(n).reset_index(drop=True)
+            with open(path, "wb") as f:
+                pickle.dump(df, f)
+            return df
+        except Exception:
+            return cached
+
+
+def check_recent_100d_high(day: int = 5) -> list:
+    """
+    检查最近 `day` 个交易日内，是否有某一天的收盘价创出（截至当天，不含当天的
+    前100个交易日）新高。每只股票只返回距今最近的一次命中（如果有多次）。
+
+    新鲜度规则（日线约每天17:30更新完成）：
+      当前时间 hour>=18 → 要求日线最新数据日期 == 今天，不满足则强制补拉
+      当前时间 hour<18  → 要求日线最新数据日期 == 昨天，不满足则强制补拉
+
+    返回列表，每项包含：
+      code, name, high_date（创新高的收盘日）, high_price（当日收盘价）,
+      current_price（最新收盘价）, chg_pct（当前价较创新高收盘价的涨跌幅）
+    """
+    HIGH_WINDOW = 100
+    now = datetime.now()
+    today = now.date()
+    if now.hour >= 18:
+        # 18点后：期望有"今天"的数据；若今天不是交易日（周末/节假日），
+        # 回退到今天之前最近的一个交易日
+        required_date = _last_trading_day_on_or_before(today)
+    else:
+        # 18点前：期望有"上一个交易日"的数据（不是单纯的昨天，
+        # 避免周一早上误判为需要"周日"的数据）
+        required_date = _last_trading_day_on_or_before(today - timedelta(days=1))
+    print(f"获取A股列表, 预期最新数据日期: {required_date}")
+    stock_list = get_stock_list()
+    rows = list(zip(stock_list["code"], stock_list["name"]))
+
+    need_rows = HIGH_WINDOW + day + 20  # 留出余量应对停牌/数据缺口
+
+    def _process(row):
+        code, name = row
+        df = _fetch_daily_custom(code, n=need_rows, required_date=required_date)
+        if df is None or len(df) < HIGH_WINDOW + 1:
+            return None
+
+        closes = df["close"].values
+        dates = df["date"].values
+        n_total = len(closes)
+        current_price = closes[-1]
+
+        for offset in range(1, day + 1):
+            idx = n_total - offset
+            if idx < HIGH_WINDOW:
+                continue
+            window_high = closes[idx - HIGH_WINDOW: idx].max()
+            if closes[idx] > window_high:
+                high_date = pd.to_datetime(dates[idx]).strftime("%Y-%m-%d")
+                high_price = round(float(closes[idx]), 2)
+                chg_pct = (
+                    (current_price - high_price) / high_price * 100
+                    if high_price > 0 else float("nan")
+                )
+                atr_pct = _calc_atr(df, 14)
+                return {
+                    "code": code,
+                    "name": name,
+                    "high_date": high_date,
+                    "high_price": high_price,
+                    "current_price": round(float(current_price), 2),
+                    "chg_pct": f"{chg_pct:+.2f}%",
+                    "atr_pct": atr_pct,
+                    "atr_limit": round(atr_pct * 1.2, 2) if not np.isnan(atr_pct) else float("nan"),
+                    "rps120": float("nan"),  # 占位，后面统一计算
+                    "gain10_rank": float("nan"),  # 占位，后面统一计算
+                }
+        return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=CFG["max_workers"]) as executor:
+        futures = {executor.submit(_process, r): r for r in rows}
+        with tqdm(total=len(rows), desc="扫描100日新高", unit="只") as pbar:
+            for fut in as_completed(futures):
+                pbar.update(1)
+                try:
+                    res = fut.result(timeout=30)
+                    if res:
+                        results.append(res)
+                except Exception:
+                    pass
+
+    results.sort(key=lambda r: r["high_date"], reverse=True)
+
+    # ── 补充 RPS120 / 10日涨幅排名（复用 main() 里同一套计算逻辑）──
+    if results:
+        print("补拉全市场日线数据，计算 RPS120 / 10日涨幅排名...")
+        collect_market_gains(rows)
+        for r in results:
+            rps120, gain10_rank = _calc_rps_and_rank(r["code"])
+            r["rps120"] = rps120
+            r["gain10_rank"] = gain10_rank
+
+    print(f"\n{'=' * 72}")
+    print(f"  近{day}个交易日内创近{HIGH_WINDOW}日新高个股  共 {len(results)} 只")
+    print(f"{'=' * 72}")
+    for r in results:
+        rps_str = f"{r['rps120']:.1f}" if not np.isnan(r.get("rps120", float("nan"))) else "--"
+        rank_str = str(int(r["gain10_rank"])) if not np.isnan(r.get("gain10_rank", float("nan"))) else "--"
+        level = _calc_level(r, require_signal_type=False)
+        print(f"  【{r['code']}  {r['name']}】  新高日:{r['high_date']}  "
+              f"新高收盘:{r['high_price']}  当前:{r['current_price']}  较新高:{r['chg_pct']}  "
+              f"ATR:{r.get('atr_pct', '--')}%  RPS120:{rps_str}  10日排名:第{rank_str}名  级别:{level}")
+    print(f"{'=' * 72}")
+
+    save_results(results, len(results), fname_prefix=f"100日新高", require_signal_type=False)
+
+    return results
+
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
+    # check_recent_100d_high(day=7)
     # 当日5点半后更新日线
-    # daily = fetch_daily_recent('sh.603259', n=max(CFG["rps_days"] + 10, 30), is_new=True)
-    # print(f'数据最新日期:{daily["date"].values[-1]}')
-    # atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
-    # print(atr_pct*1.2)
-
+    # for code in 'sh.600177,sh.603259,sh.603127,sh.601995,sh.603823'.split(','):
+    #     daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)
+    #     print(f'数据最新日期:{daily["date"].values[-1]}')
+    #     atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+    #     print(code, atr_pct*1.2)
+    #
     # 单只回测-是否满足买点2
     # backtest_single("sh.688629", "2026-02-16")
     # backtest_single("sz.002001", "2026-02-28")
