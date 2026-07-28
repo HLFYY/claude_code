@@ -260,13 +260,15 @@ if __name__ == "__main__":
     client = WkinfoCaptcha(captcha_type="blockPuzzle")
     result = client.full_registration_flow(
         telephone=input("手机号: ").strip(),
-        user_email="1565655612@qq.com",
+        # user_email="1565655612@qq.com",
+        user_email=input("邮箱: ").strip(),
         password="123456abc",
         company_name="北京",
         province="北京",
         last_name="晓",
         first_name="张",
     )
+    print(result)
     print("check:", result["check"]["repData"]["result"])
     print("verify:", result["verify"])
     print("sms_request:", result["sms_request"])
