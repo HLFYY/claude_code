@@ -1,45 +1,46 @@
-# wkinfo_captcha 交接文档
+# wkinfo 平台交接文档
 
-目标网站：`https://law.wkinfo.com.cn`（威科先行法律数据库）。目标是脱离浏览器、纯 Node.js/Python 算法还原其验证码、注册、登录相关接口，最终能稳定拿到已登录 session 去访问数据接口。
+目标网站：`https://law.wkinfo.com.cn`（威科先行法律数据库）。目标是脱离浏览器、纯 Node.js/Python 算法还原其验证码、注册、登录相关接口，最终能稳定拿到已登录 session 去访问数据接口，并且是**多平台通用采集框架**（`crawler/`）里的第一个、也是目前唯一的平台实现。
 
-本文档面向"接着做风控/反爬处理"的后续工作，先说清楚**现在做到了什么**、**怎么做到的**、**踩过哪些坑**，最后列出**还没做、值得优先看的风控相关点**。逐条细节证据见同目录 `请求链路.md`（抓包记录+踩坑原始记录），这里是提炼总结。
+本文档面向"接着做风控/反爬处理"的后续工作，先说清楚**现在做到了什么**、**怎么做到的**、**踩过哪些坑**，最后列出**还没做、值得优先看的风控相关点**。逐条细节证据见同目录 `请求链路.md`（抓包记录+踩坑原始记录），这里是提炼总结。多平台框架本身（`core/` 那一层）的说明见 `crawler/README.md`。
 
-## 目录结构
+## 目录结构（本平台部分；`core/` 见 `crawler/README.md`）
 
 ```
-wkinfo_captcha/
-├── aes_encrypt.js         # Node，唯一职责：AES-128-ECB/PKCS7 加密（生成加密参数）
-├── recognize.py           # Python(ddddocr)，验证码图像识别
-├── captcha_client.py      # Python，验证码全流程编排 + 注册全流程编排
-├── login.py               # Python，登录 + session 缓存(存 Redis)
-│
-├── config.py              # Redis连接 + 配额限制(40/20) + 6个indexId + 3天试用期，集中配置
-├── redis_client.py        # 单例 Redis 连接
-├── sms_provider.py        # 验证码获取方法(现在 input()，接口可替换)
-├── random_profile.py      # 随机生成注册字段(company/姓名/省份/职位/密码)，除手机号邮箱外全随机
-├── account_registry.py    # 账号 CRUD (Redis Hash + ZSET 按过期时间索引)
-├── registration_worker.py # 编排单个账号的注册：随机资料 + captcha_client 全流程 + 存入 registry
-├── quota_tracker.py       # 配额计数器 (Redis INCR+EXPIRE 做滚动24h窗口)
-├── scheduler.py           # (indexId, action) -> 挑一个有效期内+有配额的账号，保证已登录
-├── search_client.py       # 真实 search/detail 调用，自动走 scheduler+quota+MongoDB缓存+日志
-├── request_logger.py      # 请求流水日志 (JSONL，不进 Redis) + 按天/账号统计聚合
-├── logs/                  # request_logger.py 的 JSONL 日志目录
-│
-├── mongo_client.py        # 单例 MongoDB 连接
-├── document_store.py      # 采集到的文档详情存储 + 缓存查询 (MongoDB)
-│
-├── proxy_pool.py          # 固定代理池：账号级绑定 + 按平台隔离的负载/上限
-│
-└── 请求链路.md             # 详细抓包证据 + 踩坑记录（按时间线，本文档是它的摘要+索引）
+crawler/
+├── core/                       # 平台无关公共层，见 crawler/README.md
+└── platforms/wkinfo/
+    ├── aes_encrypt.js          # Node，唯一职责：AES-128-ECB/PKCS7 加密（生成加密参数）
+    ├── recognize.py            # Python(ddddocr)，验证码图像识别
+    ├── captcha_client.py       # Python，验证码全流程编排 + 注册全流程编排
+    ├── login.py                # Python，登录 + session 缓存(存 Redis) + 自动应用绑定代理
+    ├── config.py                # 本平台策略配置：PLATFORM名/配额限制(40/20)/6个indexId/3天试用期/代理上限
+    ├── sms_provider.py         # 验证码获取方法(现在 input()，接口可替换)
+    ├── random_profile.py       # 随机生成注册字段(company/姓名/省份/职位/密码)，除手机号邮箱外全随机
+    ├── registration_worker.py  # 编排单个账号的注册：挑代理 + 随机资料 + captcha_client 全流程 + 存入 registry
+    ├── search_client.py        # 真实 search/detail 调用，自动走 core.scheduler+quota+MongoDB缓存+日志
+    ├── document_store.py       # wkinfo 的 _id 命名规则(category_docId)，包一层 core.document_store
+    ├── maintenance.py          # 定期维护入口：过期账号清理 + 代理槽位释放
+    ├── platform.py             # core.platform_base.Platform 协议的 wkinfo 实现（外部统一调用入口）
+    ├── HANDOFF.md               # 本文档
+    └── 请求链路.md              # 详细抓包证据 + 踩坑记录（按时间线，本文档是它的摘要+索引）
+```
+
+运行方式（**必须用 `-m` 从 `crawler/` 目录跑，不能直接 `python login.py`**——因为现在是包结构，相对导入需要包上下文）：
+```bash
+cd /Users/houjie/Desktop/ai_code/mcp_js/claude_code/crawler
+/Users/houjie/venv/python3-forcrawl/bin/python -m platforms.wkinfo.login
+/Users/houjie/venv/python3-forcrawl/bin/python -m platforms.wkinfo.registration_worker
+/Users/houjie/venv/python3-forcrawl/bin/python -m platforms.wkinfo.maintenance
 ```
 
 运行环境：
-- Node：系统自带即可，`aes_encrypt.js` 只用内置 `crypto` 模块，**没有任何 npm 依赖**（之前装过 pngjs 后来废弃删了，不要再装）。
+- Node：系统自带即可，`aes_encrypt.js` 只用内置 `crypto` 模块，**没有任何 npm 依赖**。
 - Python：必须用 `/Users/houjie/venv/python3-forcrawl/bin/python`（已装 ddddocr/opencv/numpy/pillow/redis/pymongo），不是系统 python3。
-- 本地 Redis 服务，`redis-cli ping` 能通即可。**注意服务器版本是 5.0.5**，不支持 `EXPIRE ... NX`/`SET ... KEEPTTL`（Redis 6.0+ 才有），`quota_tracker.py` 里手动实现了等价逻辑（先 GET/TTL 读出来，SET 之后再手动 EXPIRE 回去），升级 Redis 服务器版本后可以简化成原生的 NX/KEEPTTL 写法。
+- 本地 Redis 服务，`redis-cli ping` 能通即可。**注意服务器版本是 5.0.5**，不支持 `EXPIRE ... NX`/`SET ... KEEPTTL`（Redis 6.0+ 才有），`core/quota_tracker.py` 里手动实现了等价逻辑（先 GET/TTL 读出来，SET 之后再手动 EXPIRE 回去），升级 Redis 服务器版本后可以简化成原生的 NX/KEEPTTL 写法。
 - redis-py 版本是 3.2.1（老版本），`hset(..., mapping=...)` 这种新语法不支持，得用 `hmset()`。
-- 本地 MongoDB 服务（默认 `mongodb://localhost:27017`，库名 `wkinfo`），`pymongo` 4.4.1。
-- `captcha_client.py`/`login.py`/`search_client.py` 全是同步阻塞的 `requests` 调用，没有做异步/并发，调度也是单进程顺序调用（`scheduler.py` 里 email 选取的 shuffle 只是分散负载，不是真并发）。
+- 本地 MongoDB 服务（默认 `mongodb://localhost:27017`）。**每个平台一个 collection**，wkinfo 的数据在库 `crawler`、collection `wkinfo` 里（`core.mongo_client.get_collection("wkinfo")`）。`pymongo` 4.4.1。
+- `captcha_client.py`/`login.py`/`search_client.py` 全是同步阻塞的 `requests` 调用，没有做异步/并发，调度也是单进程顺序调用（`core.scheduler.dispatch()` 里 email 选取的 shuffle 只是分散负载，不是真并发）。
 
 ## 已实现能力
 
@@ -63,7 +64,7 @@ wkinfo_captcha/
 
 `captcha/verify` 成功后：
 - `GET /csi/user/captcha?telephone=&password=&email=` —— 这一步才是真正触发发短信的调用
-- 用户输入手机收到的真实验证码（`sms_code=None` 时会 `input()` 提示，不要瞎填）
+- 用户输入手机收到的真实验证码（`sms_provider.get_sms_code()`，现在是 `input()`，接口可替换）
 - `POST /csi/user` —— 最终提交注册，body 里 `code` 字段固定值 `"01BE01"`（观察到两次抓包都一样，像是这个"law"分组试用渠道的固定值，不是动态生成的）
 
 ### 3. 登录 + Session 缓存（`login.py`）
@@ -73,27 +74,13 @@ wkinfo_captcha/
 - **登出**：`GET /api/logout`
 - **session 有效性检查**：`GET /api/autoLogin`，返回 `{"login":false}` 说明当前 cookie 已失效；返回 `{"login":true}` 时服务端还会顺带补发一批 cookie（`userInfo`/`autologin`/`cinfo` 等）
 
-`get_session(username, password)` 逻辑：先读 `sessions/<username>.json` 缓存 → 检查本地记的 cookie 过期时间 → 用 `/api/autoLogin` 二次确认真的还有效 → 都过才复用；否则才真正调登录接口并覆盖缓存。**二次确认这一步是必须的**，因为服务端有单并发限制（见下），别处一登录可能直接把老 session 踢了，光看 cookie 自带的 Expires 不可靠。
+`get_session(username, password)` 逻辑：先读 Redis `session:wkinfo:{email}` 缓存 → 检查本地记的 cookie 过期时间 → 用 `/api/autoLogin` 二次确认真的还有效 → 都过才复用；否则才真正调登录接口并覆盖缓存。**二次确认这一步是必须的**，因为服务端有单并发限制（见下），别处一登录可能直接把老 session 踢了，光看 cookie 自带的 Expires 不可靠。
 
 已验证账号：`1558109546@qq.com` / `315128abc`。**注意** `18356966159` 是这个账号的手机号，不是登录用户名，登录必须用邮箱。
 
-### 4. 多账号池 (Redis)：注册/存储/登录调度/配额/统计
+### 4. 多账号池：注册/存储/登录调度/配额/统计
 
-这是最新加的一层，在上面 1-3 的基础上做多账号管理和配额调度。
-
-**数据结构**（都在 Redis，`config.py` 里配置连接和 key 前缀）：
-```
-account:{email}          Hash：password/telephone/companyName/province/postId/lastName/
-                          firstName/created_at/expires_at/status
-accounts:by_expiry        ZSET：score=expires_at(时间戳)，member=email
-                          → list_active_emails()/list_expired_emails() 靠这个高效查询，
-                            不用扫全部账号
-session:{email}          Hash：cookies(json字符串)/expires_at/profile(json字符串)/saved_at
-                          （login.py 原来存本地 sessions/*.json，现在全搬进这里了）
-quota:{email}:{indexId}:{search|detail}
-                          INCR 计数器，第一次 INCR 时顺带 EXPIRE 86400（滚动24h窗口）
-                          → TTL 本身就是"还要多久恢复"，不用额外记时间戳算
-```
+在上面 1-3 的基础上，通过 `core/` 的通用层做多账号管理和配额调度（详细数据结构见 `crawler/README.md`，这里只讲 wkinfo 特有的部分）。
 
 **6 个栏目 indexId**（浏览器抓包确认，`config.py` 里的 `INDEX_IDS`）：
 `law.legislation`(法律法规) / `law.case`(裁判文书) / `law.administrativeSupervision`(行政监管) /
@@ -106,8 +93,9 @@ quota:{email}:{indexId}:{search|detail}
 
 **配额判定用真实响应同步，不完全信本地计数**：`try_consume()` 是"乐观预占"（调用前先 INCR），
 一旦服务端真的返回配额用尽的响应（见下面确认的错误码），`mark_exhausted()` 会把本地计数强制打满，
-`scheduler.py` 立刻换下一个账号重试——这样即使本地计数和服务端有偏差（比如账号被别处手工测试用掉了配额），
-也不会白白浪费请求去撞墙。
+`search_client.py` 的 `_dispatch_and_call` 立刻换下一个账号重试——这样即使本地计数和服务端有偏差
+（比如账号被别处手工测试用掉了配额），也不会白白浪费请求去撞墙。限额数值：搜索40次/浏览20次，每个
+(账号, indexId) 独立计数。
 
 **配额超限的真实响应格式（已抓包确认）**：
 ```json
@@ -120,25 +108,17 @@ i18n 文件里确认了消息文本 `"已达该栏目当日搜索最大量，请
 **滚动窗口 vs 自然日重置：已确认是滚动 24 小时，不是自然日重置**（2026-07-29 验证）——一个账号昨天
 下午1点多被限流，今天上午10点多还是无法访问（超过21小时但不到24小时），跟"从首次触发限流开始算24小时"
 完全吻合，如果是自然日重置早该在今天0点后恢复了。另外接口的错误文案里"24小时之后"是固定文案，**不会显示
-真实剩余时间**，不要指望从消息文本里解析出准确的恢复时间——`quota_tracker.py` 里 Redis key 自身的 TTL
-才是准确的剩余时间来源（`quota_tracker.remaining()` 返回的 `ttl_seconds`）。这条已经是最终实现，不用再改。
-
-**验证码接收方法可替换**：`sms_provider.py` 里 `get_sms_code(telephone)` 现在就是 `input()`，
-以后有别的收码方式了，直接换这个函数体，`captcha_client.py`/`registration_worker.py` 都不用改。
-
-**请求流水日志不进 Redis**：`request_logger.py` 写本地 JSONL（`logs/requests.jsonl`），
-`stats_by_day()` 读出来聚合成 `{日期: {账号: {total, ok, fail}}}`，用于"统计每天各账号请求次数、
-成功失败数量"这个需求。之所以没放 Redis：这是历史审计数据，不是要频繁读写的实时状态，本地文件更简单，
-也不用操心 Redis 内存增长。
+真实剩余时间**，不要指望从消息文本里解析出准确的恢复时间——`core/quota_tracker.py` 里 Redis key 自身的
+TTL 才是准确的剩余时间来源（`remaining()` 返回的 `ttl_seconds`）。这条已经是最终实现，不用再改。
 
 ### 5. 详情页采集 + MongoDB 缓存（`document_store.py` + `search_client.py`）
 
 `search_client.view_detail(index_id, doc_id, search_id)` 现在是"缓存优先"：先查 MongoDB
 (`document_store.get_cached`)，命中直接返回——**不发 HTTP 请求、不消耗配额**；没命中才走
-`scheduler`+`quota_tracker` 真实请求，请求成功后存进 MongoDB (`document_store.save`) 再返回。
+`core.scheduler`+`core.quota_tracker` 真实请求，请求成功后存进 MongoDB (`document_store.save`) 再返回。
 需要强制重新抓取时传 `force_refresh=True`。
 
-存储结构（`config.MONGO_DB_NAME`="wkinfo"，collection="documents"）：
+存储结构（库 `crawler`，collection `wkinfo`）：
 ```
 _id: "{category}_{docId}"          例如 "legislation_MTAxMDA1MDY0MzE="  (category+docId 天然去重)
 ...                                  # /csi/document/{docId}/html 原始响应的所有字段，原样铺开
@@ -150,35 +130,33 @@ crawl_time: "2026-07-29 10:23:27"   # 同一时刻，人类可读格式
 已用真实请求测试过：第一次调用消耗配额+落库，第二次调用同一个 (index_id, doc_id) 直接命中缓存、
 配额计数没有变化。
 
-### 6. 固定代理池 + 账号级绑定（`proxy_pool.py`）
+### 6. 固定代理池 + 账号级绑定，按"有效账号数"计负载（`registration_worker.py` + `core/proxy_pool.py`）
 
-采纳了"账号绑定一个固定代理"的方案（不是"一个IP绑多个账号"那种反过来的颗粒度，理由见上一版讨论：
-`connect.sid` session 要跨多次请求持续用，中途换IP既是风控信号也可能直接搞断 WAF 的 cookie 流程）。
+"账号绑定一个固定代理"（不是"一个IP绑多个账号"那种反过来的颗粒度——`connect.sid` session 要跨多次
+请求持续用，中途换IP既是风控信号也可能直接搞断 WAF 的 cookie 流程）。数据结构和挑选逻辑是 `core/`
+通用层的（见 `crawler/README.md`），这里记 wkinfo 侧接入方式：
 
-**数据结构**（都在 Redis，key 全部按 `platform` 隔离，同一个物理代理未来可以被多个平台共用，
-但各平台的绑定数量/上限互不影响，`config.PLATFORM` 现在是 `"wkinfo"`）：
-```
-proxy:{proxy_id}                    Hash：host/port/username/password（代理资源本身，不分平台）
-proxies_by_load:{platform}          ZSET：score=该代理在这个平台上绑的账号数，member=proxy_id
-                                     → 挑"绑定最少的代理"就是一次 ZRANGEBYSCORE(-inf, 上限-1, LIMIT 1)
-account_proxy:{platform}:{email}    String：这个账号在这个平台绑的是哪个 proxy_id
-```
-
-**用法**：
-- `proxy_pool.add_proxy(proxy_id, host, port, username=None, password=None)` 往池子里加真实代理，
+- `core.proxy_pool.add_proxy(host, port, username=None, password=None)` 往池子里加真实代理，
+  按 host+port 去重、proxy_id 自动分配（自增计数器），不用自己起名字，返回这次生效的 proxy_id。
   **这一步需要你提供真实代理信息**，现在池子是空的，加了代理之后 `registration_worker.py` 才能实际用起来。
-- `registration_worker.register_one()` 现在会先挑代理（`pick_for_new_account`，选绑定数最少且没超
-  `config.MAX_ACCOUNTS_PER_IP` 的），**整个注册流程（含验证码）都通过这个代理的 session 发出**，
-  注册成功后立刻绑定（`bind_account`），然后才做确认登录——如果代理池是空的或者全满了，直接抛异常，
-  不会静默地不走代理去注册（那样会破坏"账号从出生就固定IP"这条约束）。
-- `login.py` 改成会自动查账号绑定的代理并用上（`_proxied_session()`），`scheduler.py`/`search_client.py`
-  完全不用改，因为它们都是通过 `login.get_session()` 拿 session，代理是在 `login.py` 内部自动应用的。
+- `registration_worker.register_one()` 会先挑代理（`pick_for_new_account(config.PLATFORM, config.MAX_ACCOUNTS_PER_IP)`，
+  选绑定数最少且没超上限的），**整个注册流程（含验证码）都通过这个代理的 session 发出**，注册成功后
+  立刻绑定，然后才做确认登录——如果代理池是空的或者全满了，直接抛异常，不会静默地不走代理去注册。
+- `login.py` 自动查账号绑定的代理并用上（`_proxied_session()`），`search_client.py` 完全不用管代理的事，
+  因为都是通过 `login.get_session()` 拿 session，代理是在 `login.py` 内部自动应用的。
 - **向后兼容**：已经用旧版代码注册的账号（比如 `1558109546@qq.com`）没有代理绑定记录，`login.py`
   查不到绑定时就直接用空 `proxies`（直连），已经测过不会报错，只是这些老账号没有走代理。
 
-已用假代理（本地端口）测过挑选逻辑本身：负载均衡（轮流挑最闲的）和封顶（超过 `MAX_ACCOUNTS_PER_IP`
-返回 `None`）都符合预期。**没用真实代理测过完整注册流程**，因为现在池子里没有真实代理——这个需要你
-提供实际的代理服务商信息（host/port/账密）之后再联调一次。
+**"绑定账号数"只按有效账号算，不是所有历史注册过的账号**——`core.account_registry.sweep(platform)`
+是个周期性维护任务（不是实时的，"可能一天或几天跑一次"，入口是 `maintenance.py`）：扫一遍这个平台
+所有账号，把过期的（`expires_at` 已过）标记成 `expired`，然后对**所有非 active 状态**的账号（刚过期的、
+之前已经过期的、或者被封的）检查有没有还占着代理槽位，占着就释放（`proxy_pool.unbind_account`）。
+不是实时扣减的原因：账号一过期就想着去释放，等于每次挑代理前都要检查一遍所有账号是不是刚好过期，
+没必要这么频繁，定期跑一次批量清理更简单也够用。
+
+已用假代理（本地端口）测过挑选逻辑本身（负载均衡、封顶）和 sweep 逻辑（模拟一个过期账号，跑
+`sweep` 后代理负载正确减1、账号状态变 expired、代理绑定记录被删）。**没用真实代理测过完整注册流程**，
+因为现在池子里没有真实代理——这个需要你提供实际的代理服务商信息（host/port/账密）之后再联调一次。
 
 ## 关键踩坑（后续加风控逻辑时容易踩到同样的坑）
 
@@ -187,6 +165,7 @@ account_proxy:{platform}:{email}    String：这个账号在这个平台绑的�
 3. **默认 `python-requests` 的 User-Agent 会被 WAF 拦**：早期测试中直接用 `requests` 默认 UA 打接口，收到过 `403 Forbidden ... denied by UA ACL = blacklist`（Tengine 层的 UA 黑名单）。所有代码里都已经固定用真实 Chrome UA 字符串，没有再复现过，但这是**目前唯一实锤过的、纯 UA 层面的风控拦截**，说明至少有一层基于 UA 的黑名单存在。
 4. **验证码背景图里的干扰缺口**：blockPuzzle 有 2 个假缺口专门用来骗自动化识别，clickWord 的字符也是刻意做了旋转/变色/自然照片背景来干扰 OCR。这两个本身就是这个站点风控体系的一部分（AJ-Captcha 的"干扰"配置项），已经用相关系数模板匹配 + 多模型 OCR 取并集的方式绕过。
 5. **账号单并发登录限制**：同一账号同时只能有一个有效 session，重复登录会收到 `{"code":"C_002_001","message":"用户并发超标"}`。不是 bug，是业务规则，但如果后续要做"多账号池轮换"之类的风控对抗，这个限制要考虑进去。
+6. **相对导入要求包结构**：这一层全是 `crawler/` 下的包（`core`、`platforms.wkinfo`），文件之间用 `from . import xxx` / `from core import xxx` 这种写法，**不能再像以前那样 `python login.py` 直接跑**，必须 `cd crawler && python -m platforms.wkinfo.login`，否则会报"attempted relative import with no known parent package"。
 
 ## 观察到但还没处理的风控信号（后续重点）
 
@@ -218,8 +197,8 @@ CURRENT_GATEWAY_IS_RESTRICTED_ACCESS / _1 / ALL_THE_CURRENT_GATEWAY     网关�
 `CURRENT_IP_BY_MANUAL_LIMIT_ACCESS`(当前ip被管理员限制访问)——这两个大概率是人工拉黑，不是自动风控。
 
 **这套体系意味着**：多账号池光轮换账号还不够，如果调度器请求太密集，**IP 维度和网关维度的限制会跨账号生效**
-（不管换多少个账号，同一个 IP/同一个网关打太快照样会被限）。这是目前最需要通过压测搞清楚阈值的地方
-——每秒/每分钟具体是多少次，会决定 `scheduler.py`/`search_client.py` 要不要加请求间隔控制。
+（不管换多少个账号，同一个 IP/同一个网关打太快照样会被限）。这也是现在做固定代理池的另一层价值——不同
+账号用不同代理IP，天然把IP维度的限流风险摊开了，但具体每秒/每分钟能打多少次还是要通过压测搞清楚阈值。
 
 **另外两个顺手发现，不是这次要做的配额但记录一下**：
 - `COLUMN_HAS_REACHED`：`"已达该栏目当日下载最大量，请24小时之后再进行下载。"`——每个栏目居然还有独立的
@@ -236,8 +215,8 @@ CURRENT_GATEWAY_IS_RESTRICTED_ACCESS / _1 / ALL_THE_CURRENT_GATEWAY     网关�
 ### 建议的下一步
 
 1. 针对上面挖到的 `G_*` 频率限制错误码，做一次**可控的压测**——用 `search_client.search()`/`view_detail()` 连续快速调用（比如 1 秒内打 10+次），观察触发的是哪个维度（会话/用户/IP/网关）、具体在第几次触发、返回的确切错误码和 JSON 结构，这是目前最大的未知项。压测时**只用一个测试账号，别拿正式账号池里的账号去试**，触发了"警告两次"级别不确定会不会伤到账号本身。
-2. 根据压测结果，在 `search_client.py`/`scheduler.py` 里加对应的识别 + 退避处理（不只是现在 `_dispatch_and_call` 里"换账号重试"这一种策略——如果是 IP/网关维度限制，换账号没用，得加请求间隔或者暂停）。
+2. 根据压测结果，在 `search_client.py`/`core/scheduler.py` 里加对应的识别 + 退避处理（不只是现在 `_dispatch_and_call` 里"换账号重试"这一种策略——如果是 IP/网关维度限制，换账号没用，得加请求间隔或者暂停）。
 3. `COLUMN_HAS_REACHED`（下载限额）和 `REGISTER_TIP_PHONE_COUNT_LIMIT`（手机号注册次数限额）目前完全没处理，等真的要用到下载接口/批量注册规模上去了再补。
 4. 评估要不要伪造 `uber-trace-id`/`traceparent`/`b3` 和配套的 `boldrum-trace` 埋点流量，让请求"看起来"更完整——但先确认服务端是否真的关联校验这些，不要没验证就加复杂度。
 5. `acw_tc`/`acw_sc__v2` 和 `x-alicdn-da-ups-status` 这两个阿里云 WAF 相关的信号，建议跟第1点的压测一起做，因为触发条件很可能也是高频请求。
-6. IP 代理池方案定下来之后实现（见上面"IP 代理池"小节的取舍讨论），这会是账号池能不能真正规模化运行的关键一环。
+6. **真实代理接进来**：`core.proxy_pool.add_proxy(...)` 加真实代理信息，然后完整跑一遍 `registration_worker.register_one()`，确认真实代理下注册+登录+采集全链路没问题（现在只用本地假端口测过挑选逻辑，没测过真代理下的实际网络请求）。

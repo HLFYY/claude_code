@@ -16,22 +16,35 @@ Session caching: this account enforces a single concurrent session
 server-side -- logging in again while an earlier session is still alive gets
 rejected with {"code":"C_002_001","message":"用户并发超标"}. So rather than
 logging in every run, get_session() caches cookies + connect.sid's own
-Expires to sessions/<username>.json and reuses them; it only hits the real
-login endpoint when there's no cache, the cached cookie's stated expiry has
-passed, or GET /api/autoLogin says the cookie isn't actually valid anymore
-(server can invalidate a session before its cookie's Expires, e.g. someone
-else logging in and kicking it, so the stated expiry alone isn't trustworthy).
+Expires in Redis (session:{username}, see redis_client.py) and reuses them;
+it only hits the real login endpoint when there's no cache, the cached
+cookie's stated expiry has passed, or GET /api/autoLogin says the cookie
+isn't actually valid anymore (server can invalidate a session before its
+cookie's Expires, e.g. someone else logging in and kicking it, so the stated
+expiry alone isn't trustworthy). Same Redis instance as account_registry.py /
+quota_tracker.py -- see config.py for connection settings.
+
+Proxy: every account is bound to one fixed proxy for life (proxy_pool.py, set
+at registration). Whenever this module builds a session itself (no explicit
+`session=` passed in), it looks up that binding and routes through it --
+callers never need to think about proxies, they just call get_session(email,
+password) and get back a session that's already on the right IP. The one
+exception is registration itself: at that point the account doesn't exist
+yet, so registration_worker.py builds the proxied session and passes it in
+explicitly before any binding exists to look up.
 """
 from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import requests
 
+import config
+import proxy_pool
+from redis_client import get_client, k
+
 BASE = "https://law.wkinfo.com.cn"
-SESSIONS_DIR = Path(__file__).parent / "sessions"
 
 HEADERS = {
     "content-type": "application/json;charset=UTF-8",
@@ -45,10 +58,6 @@ HEADERS = {
 }
 
 
-def _cache_path(username: str) -> Path:
-    return SESSIONS_DIR / f"{username}.json"
-
-
 def _cookie_expiry(session: requests.Session) -> float | None:
     """Earliest Expires among the session's cookies (unix timestamp), or None
     if any cookie has no expiry (session cookie)."""
@@ -56,12 +65,23 @@ def _cookie_expiry(session: requests.Session) -> float | None:
     return min(expirations) if expirations else None
 
 
+def _proxied_session(username: str) -> requests.Session:
+    """A fresh session, routed through this account's bound proxy if it has
+    one. No binding yet (account not registered through this pool, or
+    registration hasn't bound it yet) just means a direct connection."""
+    session = requests.Session()
+    proxy_id = proxy_pool.get_account_proxy_id(config.PLATFORM, username)
+    if proxy_id:
+        session.proxies = proxy_pool.requests_proxies(proxy_id)
+    return session
+
+
 def login(username: str, password: str, session: requests.Session | None = None) -> tuple[requests.Session, dict]:
     """POST /csi/account/validate/ex. Returns (session, profile) on success;
     raises RuntimeError with the server's own error body on failure (wrong
     password, or C_002_001 if a previous session on this account is still alive).
     """
-    session = session or requests.Session()
+    session = session or _proxied_session(username)
     resp = session.post(
         f"{BASE}/csi/account/validate/ex",
         headers=HEADERS,
@@ -86,28 +106,26 @@ def is_session_valid(session: requests.Session) -> bool:
 
 
 def save_session(username: str, session: requests.Session, profile: dict) -> None:
-    SESSIONS_DIR.mkdir(exist_ok=True)
     data = {
-        "cookies": requests.utils.dict_from_cookiejar(session.cookies),
-        "expires_at": _cookie_expiry(session),
-        "profile": profile,
+        "cookies": json.dumps(requests.utils.dict_from_cookiejar(session.cookies), ensure_ascii=False),
+        "expires_at": _cookie_expiry(session) or "",
+        "profile": json.dumps(profile, ensure_ascii=False),
         "saved_at": time.time(),
     }
-    _cache_path(username).write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    get_client().hmset(k("session", username), data)
 
 
 def load_cached_session(username: str) -> tuple[requests.Session, dict] | None:
-    path = _cache_path(username)
-    if not path.exists():
+    data = get_client().hgetall(k("session", username))
+    if not data:
         return None
-    data = json.loads(path.read_text())
-    if data.get("expires_at") and data["expires_at"] < time.time():
+    if data.get("expires_at") and float(data["expires_at"]) < time.time():
         return None  # cookie's own Expires has passed
-    session = requests.Session()
-    session.cookies.update(data["cookies"])
+    session = _proxied_session(username)
+    session.cookies.update(json.loads(data["cookies"]))
     if not is_session_valid(session):
         return None  # server invalidated it before the cookie's stated expiry
-    return session, data["profile"]
+    return session, json.loads(data["profile"])
 
 
 def get_session(username: str, password: str, force: bool = False) -> tuple[requests.Session, dict]:

@@ -1,0 +1,1 @@
+window.location.href = 'https://www.pkulaw.com/VerificationCode/Index?IsBlack=true&blacktype=2&blackrediskey=Blacklist:Info-180.165.38.183,,';

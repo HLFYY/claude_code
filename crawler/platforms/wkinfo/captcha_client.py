@@ -1,22 +1,22 @@
 """
-Pure-algorithm reproduction of law.wkinfo.com.cn's AJ-Captcha (blockPuzzle /
-clickWord): generates valid pointJson / token / captchaVerification and drives
-the full get -> check -> verify chain. No browser, no environment patching.
+纯算法还原 law.wkinfo.com.cn 的 AJ-Captcha（blockPuzzle / clickWord）：
+生成有效的 pointJson / token / captchaVerification，驱动完整的
+get -> check -> verify 链路。不依赖浏览器，不做环境补全。
 
-Split by responsibility (per instruction: JS only generates the encrypted
-params, Python does the recognition since it has the right libraries):
-- aes_encrypt.js (Node): AES-128-ECB/PKCS7 encryption only. Invoked as a
-  subprocess for every pointJson / captchaVerification value.
-- recognize.py (Python, ddddocr): blockPuzzle gap position and clickWord
-  click coordinates. See that module's docstring for accuracy notes and why
-  a retry loop is used instead of trying to be smarter about a single image.
+按职责拆分（按之前的分工：JS 只负责生成加密参数，Python 因为有现成的合适库
+所以做识别）：
+- aes_encrypt.js（Node）：只负责 AES-128-ECB/PKCS7 加密。每次需要
+  pointJson / captchaVerification 时作为子进程调用。
+- recognize.py（Python, ddddocr）：blockPuzzle 缺口位置和 clickWord 点击
+  坐标。准确率相关说明和为什么用重试循环而不是在单张图片上死磕，见那个
+  模块自己的 docstring。
 
-Source of the algorithm (confirmed against the site's own JS, not guessed):
-  assets/js/verify-slipping/ase.js -- aesEncrypt() -- AES-128-ECB/PKCS7,
-  key = raw UTF-8 bytes of secretKey.
-  assets/js/verify-slipping/verify.js -- Slide.prototype.end / Points click
-  handler -- pointJson = aesEncrypt(JSON.stringify(point_or_points), secretKey);
-  captchaVerification = aesEncrypt(token + '---' + JSON.stringify(...), secretKey).
+算法来源（对照网站自己的 JS 确认过，不是猜的）：
+  assets/js/verify-slipping/ase.js —— aesEncrypt() —— AES-128-ECB/PKCS7，
+  key = secretKey 的原始 UTF-8 字节。
+  assets/js/verify-slipping/verify.js —— Slide.prototype.end / 点选处理函数——
+  pointJson = aesEncrypt(JSON.stringify(point_or_points), secretKey)；
+  captchaVerification = aesEncrypt(token + '---' + JSON.stringify(...), secretKey)。
 """
 from __future__ import annotations
 
@@ -27,21 +27,20 @@ from pathlib import Path
 
 import requests
 
-from recognize import detect_gap_x, detect_click_points
+from .recognize import detect_gap_x, detect_click_points
 
 BASE = "https://law.wkinfo.com.cn"
 AES_ENCRYPT_JS = Path(__file__).parent / "aes_encrypt.js"
 
-# One header set for every endpoint used here (captcha/get|check|verify AND
-# user/captcha + user). Real browser traffic sends a fuller set on the latter
-# two (identification/module/ucv/appversion, mirroring the Angular app's HTTP
-# interceptor) but that turned out to be a red herring: reproducing it caused
-# "E_000_003 注册验证码校验失败" on user/captcha, while this plain set -- the
-# same one verify.js's raw jQuery $.ajax calls use -- passes cleanly on every
-# endpoint. Simplest explanation: those extra headers aren't required, and the
-# specific "identification" value this client made up just didn't match
-# whatever loose validation the extra header set triggers server-side. Not
-# worth chasing further since the plain set is proven to work end to end.
+# 这里用的所有接口（captcha/get|check|verify 以及 user/captcha + user）都用
+# 同一套请求头。真实浏览器流量在后两个接口上会带更全的一套头
+# （identification/module/ucv/appversion，对应 Angular 应用的 HTTP
+# 拦截器加的那些），但实测这是个误导：照着还原反而在 user/captcha 上触发了
+# "E_000_003 注册验证码校验失败"；换回这套简单的头——跟 verify.js 里原生
+# jQuery $.ajax 调用用的一样——在所有接口上都能干净通过。最简单的解释是：
+# 那些额外的头本来就不是必需的，而且这边自己编的那个 "identification" 值
+# 恰好没对上服务端某种宽松校验的期望。既然这套简单头已经验证端到端可用，
+# 就没必要继续深挖了。
 HEADERS = {
     "content-type": "application/json;charset=UTF-8",
     "x-requested-with": "XMLHttpRequest",
@@ -56,10 +55,10 @@ HEADERS = {
 
 
 def _js_num(n) -> str:
-    """JSON.stringify-equivalent number formatting: whole floats drop the
-    trailing '.0' (5.0 -> "5"). The server's decrypt/parse step turned out to
-    be strict about this -- a stray "5.0" instead of "5" produced a server
-    side NullPointerException instead of a clean 'wrong position' reply."""
+    """跟 JSON.stringify 等价的数字格式化：整数值的浮点数去掉末尾的 '.0'
+    （5.0 -> "5"）。服务端的解密/解析步骤对这个很严格——多一个 "5.0" 而不是
+    "5" 会导致服务端抛 NullPointerException，而不是正常返回"位置错误"的
+    干净响应。"""
     if isinstance(n, float) and n.is_integer():
         return str(int(n))
     return str(n)
@@ -119,7 +118,8 @@ class WkinfoCaptcha:
         return resp.json()
 
     def verify_captcha(self, secret_key: str, token: str, plaintext: str, verify_type: str, **extra) -> dict:
-        """POST /csi/captcha/verify. extra: phoneNumber=... or email=... depending on verify_type."""
+        """POST /csi/captcha/verify。extra 参数：根据 verify_type 传
+        phoneNumber=... 或 email=...。"""
         captcha_verification = aes_encrypt(f"{token}---{plaintext}", secret_key)
         body = {"captchaVO": {"captchaVerification": captcha_verification}, "verifyType": verify_type}
         body.update(extra)
@@ -127,9 +127,9 @@ class WkinfoCaptcha:
         return resp.json()
 
     def _recognize(self, cap: dict) -> str | None:
-        """Return the JS-JSON.stringify-equivalent plaintext for this challenge,
-        or None if recognition wasn't confident enough (caller should retry
-        with a fresh challenge rather than submit a low-confidence guess)."""
+        """返回这道验证码题目对应的、跟 JS 的 JSON.stringify 等价的明文，
+        如果识别置信度不够就返回 None（调用方应该换一道新题重试，而不是
+        提交一个不靠谱的猜测）。"""
         if self.captcha_type == "blockPuzzle":
             bg = base64.b64decode(cap["originalImageBase64"])
             piece = base64.b64decode(cap["jigsawImageBase64"])
@@ -141,9 +141,9 @@ class WkinfoCaptcha:
             return points_plaintext(points) if points is not None else None
 
     def solve(self, max_attempts: int = 6) -> dict:
-        """get -> recognize -> check, retrying with a fresh challenge whenever
-        recognition isn't confident or the server rejects the position.
-        Returns {"secretKey", "token", "plaintext", "check": <check response>}.
+        """get -> recognize -> check，只要识别不够置信或者服务端拒绝了这个
+        位置，就换一道新题重试。
+        返回 {"secretKey", "token", "plaintext", "check": <check接口响应>}。
         """
         last_err = None
         for _ in range(max_attempts):
@@ -160,15 +160,16 @@ class WkinfoCaptcha:
         raise RuntimeError(f"captcha check kept failing after {max_attempts} attempts: {last_err}")
 
     def solve_and_verify(self, verify_type: str, max_attempts: int = 6, **extra) -> dict:
-        """Full chain: get -> check -> verify (e.g. verify_type='register', phoneNumber='...')."""
+        """完整链路：get -> check -> verify（比如 verify_type='register',
+        phoneNumber='...'）。"""
         solved = self.solve(max_attempts=max_attempts)
         verify_resp = self.verify_captcha(solved["secretKey"], solved["token"], solved["plaintext"], verify_type, **extra)
         solved["verify"] = verify_resp
         return solved
 
     def request_sms_code(self, telephone: str, password: str, email: str) -> dict:
-        """GET /csi/user/captcha -- this is the call that actually triggers the
-        SMS send (observed immediately after captcha/verify in real traffic)."""
+        """GET /csi/user/captcha —— 这一步才是真正触发发送短信的调用
+        （在真实抓包里观察到它紧跟在 captcha/verify 之后）。"""
         resp = self.session.get(
             f"{BASE}/csi/user/captcha",
             headers=HEADERS,
@@ -193,10 +194,9 @@ class WkinfoCaptcha:
         code: str = "01BE01",
         client_source: str = "自主注册",
     ) -> dict:
-        """POST /csi/user -- the final registration submit. `code` defaults to
-        "01BE01", the fixed value observed in both captured registrations
-        (looks like a static channel/invite code for this trial form, not
-        something generated per-session)."""
+        """POST /csi/user —— 最终提交注册。`code` 默认值 "01BE01"，是两次
+        抓包注册中都观察到的固定值（看起来像是这个试用表单的静态渠道/邀请码，
+        不是按 session 动态生成的）。"""
         body = {
             "userEmail": user_email,
             "password": password,
@@ -229,20 +229,20 @@ class WkinfoCaptcha:
         max_attempts: int = 6,
         **register_extra,
     ) -> dict:
-        """The entire chain end to end:
+        """端到端完整链路：
         captcha/get -> recognize -> captcha/check -> captcha/verify(verifyType=register)
-        -> user/captcha (sends the real SMS) -> user (final submit with sms_code).
+        -> user/captcha（触发真实发短信）-> user（带 sms_code 最终提交）。
 
-        sms_code is a real OTP -- nothing to reverse-engineer there. If left as
-        None (the default), this calls sms_provider.get_sms_code() *after*
-        request_sms_code() has actually triggered the SMS send -- that's a
-        swappable function (input() today, something else later) rather than
-        a hardcoded prompt, see sms_provider.py.
+        sms_code 是真实的短信验证码——这一步没有什么可以逆向的。如果留空
+        （默认 None），会在 request_sms_code() 真正触发发短信*之后*调用
+        sms_provider.get_sms_code()——这是一个可替换的函数（现在是
+        input()，以后可以换成别的），而不是写死在这里的 prompt，见
+        sms_provider.py。
         """
         solved = self.solve_and_verify(verify_type="register", max_attempts=max_attempts, phoneNumber=telephone)
         solved["sms_request"] = self.request_sms_code(telephone, password, user_email)
         if sms_code is None:
-            import sms_provider
+            from . import sms_provider
             sms_code = sms_provider.get_sms_code(telephone)
         solved["register"] = self.register(
             user_email=user_email,
@@ -262,7 +262,6 @@ if __name__ == "__main__":
     client = WkinfoCaptcha(captcha_type="blockPuzzle")
     result = client.full_registration_flow(
         telephone=input("手机号: ").strip(),
-        # user_email="1565655612@qq.com",
         user_email=input("邮箱: ").strip(),
         password="123456abc",
         company_name="北京",

@@ -42,7 +42,7 @@ CFG = {
 
     # ── 均线（周） ──
     "ma_long":          20,   # 20周线：判断方向 + MA支撑（不影响新高判断）
-    "ma_new_high":      20,   # N周新高判断窗口（买点1/买点2均用它，独立于ma_long）
+    "ma_new_high":      16,   # N周新高判断窗口（买点1/买点2均用它，独立于ma_long）
     "ma_short":         5,    # 5周线：买点2回踩支撑
 
     # ── 买点1：放量突破确认型 ──
@@ -1086,7 +1086,7 @@ def save_results(results: list, total_stocks: int, fname_prefix: str = "result",
         )
 
     df = df.rename(columns=_CN_COLUMNS)
-    fname = f"{fname_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    fname = f"stock_result/{fname_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
         df.to_csv(f, index=False)
     print(f"结果已保存: {fname}")
@@ -1467,14 +1467,14 @@ def check_recent_100d_high(day: int = 5) -> list:
 
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
-    main()
+    # main()
     # check_recent_100d_high(day=7)
     # 当日5点半后更新日线
-    # for code in 'sh.600177,sh.603259,sh.603127,sh.601995,sh.603823'.split(','):
-    #     daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)
-    #     print(f'数据最新日期:{daily["date"].values[-1]}')
-    #     atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
-    #     print(code, atr_pct*1.2)
+    for code in 'sh.603268,sz.002821,sh.688057,sz.300759,sh.600521,sz.301376,sz.300985,sz.301045,sz.301188,sz.300398'.split(','):
+        daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)
+        print(f'数据最新日期:{daily["date"].values[-1]}')
+        atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
+        print(code, atr_pct*1.2)
     #
     # 单只回测-是否满足买点2
     # backtest_single("sh.688629", "2026-02-16")
