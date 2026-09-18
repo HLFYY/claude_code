@@ -216,6 +216,23 @@ def view_detail_pooled(category: str, doc_id: str, force_refresh: bool = False, 
 
     raise RuntimeError(f"view_detail_pooled: 尝试 {max_account_attempts} 个账号后仍失败 -- {last_error}")
 
+def cate_account_sesion(resource, action, max_account_attempts: int = 5):
+    """通用调度账号获取session的函数
+    不指定账号，从账号池里自动挑一个还有配额的账号（core.scheduler.dispatch），
+    配额是"每个账号每天最多跑 config.DETAIL_LIMIT_PER_DAY 次"，超了就换下一个账号，
+    每次请求成功与否都记进 core.request_logger 的流水。缓存优先，命中不消耗配额、
+    不发请求。"""
+    for _ in range(max_account_attempts):
+        try:
+            identifier, session = scheduler.dispatch(
+                config.PLATFORM, resource, action, config.DETAIL_LIMIT_PER_DAY, _dispatch_login,
+                min_interval_seconds=config.DETAIL_REQUEST_MIN_INTERVAL_SECONDS,
+            )
+        except scheduler.NoAccountAvailable as e:
+            raise RuntimeError(f"view_detail_pooled: 账号池里没有账号还有配额了 -- {e}") from e
+        quota_tracker.try_consume(config.PLATFORM, identifier, resource, action,
+                                   config.DETAIL_LIMIT_PER_DAY, config.QUOTA_WINDOW_SECONDS)
+        return identifier, session
 
 def view_detail_pooled_by_url(url: str, force_refresh: bool = False, max_account_attempts: int = 5, is_login=True) -> dict:
     category, doc_id = document_store.parse_url(url)

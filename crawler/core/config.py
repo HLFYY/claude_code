@@ -42,8 +42,8 @@ LOCAL_DB = {
     "log_root": Path(__file__).parent.parent / "logs",
 }
 ONLINE_DB = {
-    "redis_host": "db.selfmediaai.cn",
-    "redis_port": 26379,
+    "redis_host": "47.109.103.223",
+    "redis_port": 6379,
     "redis_db": 0,
     "redis_password": "123.456.",
     # 密码非空时连接串按 user:pwd@host:port/{认证库} 拼，实际读写用的库由

@@ -34,6 +34,7 @@ core.proxy_pool 挑一个负载最少的绑上，之后这个账号所有请求�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 
@@ -94,6 +95,7 @@ def _ensure_proxy_bound(identifier: str) -> None:
     """确保这个账号绑定了一个代理——已经绑过就什么都不做；没绑过就从代理池挑一个
     负载最少的绑上。代理池为空或都满了会直接抛异常，不会静默地在没有固定 IP 的
     情况下继续（跟 wkinfo 平台 registration_worker.py 是同一个设计原则）。"""
+    # todo 代理到期了，先删除代理
     if proxy_pool.get_account_proxy_id(config.PLATFORM, identifier):
         return
     proxy_id = proxy_pool.pick_for_new_account(config.PLATFORM, config.MAX_ACCOUNTS_PER_IP)
@@ -103,6 +105,7 @@ def _ensure_proxy_bound(identifier: str) -> None:
             f"MAX_ACCOUNTS_PER_IP={config.MAX_ACCOUNTS_PER_IP} 个账号）。"
         )
     proxy_pool.bind_account(config.PLATFORM, identifier, proxy_id)
+    return None
 
 
 def _session_from_cookies(identifier: str, cookies: dict) -> requests.Session:
@@ -126,8 +129,13 @@ def load_cached_session(identifier: str) -> requests.Session | None:
     if not data:
         return None
     session = _session_from_cookies(identifier, json.loads(data["cookies"]))
+    cookie_key = hashlib.md5(data["cookies"].encode()).hexdigest()
+    rkey = k("cookieValid", config.PLATFORM, cookie_key)
+    if get_client().exists(rkey):
+        return session
     if not auth.is_logged_in(session):
         return None  # 缓存的 cookie 已经失效了
+    get_client().setex(rkey, value=1, time=1200)
     return session
 
 

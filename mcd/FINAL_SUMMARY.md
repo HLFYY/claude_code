@@ -132,28 +132,40 @@ String encrypted = MD5.sign("16752934813", salt);
 
 ## 📂 涉及的 SO 库
 
-### 可能的位置
+### ✅ 已确认（2026-09-18）
 
-1. **libcsiipowerenter.so** (5.8MB, Bangcle 加固)
-   - 已知包含 HMAC 签名逻辑
-   - 可能也包含所有密钥
+通过 Java 代码分析，确定了密钥所在的 SO 库：
 
-2. **libandjni.so** (JniLib0 对应的库)
+**1. libdexjni.so** (2.5MB, 混淆/加固) - **JNI 入口**
    - `JniLib0.cV()` 的实现
-   - 负责初始化 `SecBox` 的密钥
+   - 负责调用 `SecBox` 的密钥初始化
+   - 状态：字符串被混淆（`yyy`、`xyy` 模式）
+   - 代码被虚拟化混淆（控制流混淆）
+   - Java 加载代码：
+     ```java
+     static {
+         System.loadLibrary("dexjni");  // ← libdexjni.so
+     }
+     ```
 
-3. **其他可能的库**
-   - 需要检查 APK 中的所有 SO 库
+**2. libcsiipowerenter.so** (5.8MB, Bangcle 加固) - **可能的密钥存储**
+   - 包含加密相关符号（EC_KEY、des3_set_2keys 等）
+   - 可能包含 HMAC 签名和 AES 加密的实现
+   - 可能是 `libdexjni.so` 调用的底层库
 
-### 查找方法
-
-```bash
-# 列出 APK 中的所有 SO 库
-unzip -l mcd_base.apk | grep "\.so$"
-
-# 或从脱壳目录查看
-ls -lh mcd_decorticate/lib/arm64-v8a/
+**调用链**：
 ```
+Java: SecBox.init()
+  → JniLib0.cV()
+    → libdexjni.so (JNI 入口，混淆)
+      → libcsiipowerenter.so? (底层加密库，Bangcle 加固)
+```
+
+### 下一步
+
+两个 SO 库都需要脱壳：
+- **libdexjni.so**: 需要去混淆，找到真实的 JNI 函数
+- **libcsiipowerenter.so**: 需要 Bangcle 脱壳，可能包含密钥
 
 ---
 
@@ -261,8 +273,9 @@ Java.perform(function() {
 1. **signKey 的具体值**：需要从 SO 提取
 2. **aesKey 的具体值**：需要从 SO 提取
 3. **authorization 消息格式**：3 种格式待验证
-4. **JniLib0 对应的 SO 库名称**
-5. **Token 生成的具体算法**：需在 jadx 中搜索 `AppInfoUtil.getToken()`
+4. ~~**JniLib0 对应的 SO 库名称**~~ ✅ **已确认：libdexjni.so**（2026-09-18）
+5. **Token 生成的具体算法**：已确认为 UUID.randomUUID().hex（2026-09-18）
+6. **libdexjni.so 是否调用 libcsiipowerenter.so**：需要动态分析确认
 
 ### ❌ 无法通过现有手段获取
 1. **所有密钥的明文值**：被 Bangcle 加固保护

@@ -1,14 +1,24 @@
 import copy
+import hashlib
 import json
+import os
+import random
 import re
+import sys
 import time
+import traceback
 import urllib
+from urllib.parse import quote
 
 from lxml import etree
 
+from core.logger import log
+from core.proxi_ip import get_proxy_dict
 from core.redis_client import get_client
 from platforms.pkulaw import detail_client
+from platforms.pkulaw.detail_client import cate_account_sesion
 
+plat_name = 'pkulaw'
 
 def tb_share():
     import requests
@@ -197,7 +207,7 @@ def parse_cates(section, type_pass=None):
         result.append(tmp)
     return result
 
-def req_cate_arts(cate1, cate2, show_type, params):
+def req_cate_arts(cate1, cate2, show_type, params, is_login=False):
     # cate1 菜单 一级栏目
     # cate2 二级栏目
     # OrderByIndex 0-发布时间倒序 1-发布时间顺序
@@ -216,7 +226,7 @@ def req_cate_arts(cate1, cate2, show_type, params):
         ('PreviousLib', cate2),
         ('pdfStr', ''),
         ('pdfTitle', ''),
-        ('IsSynonymSearch', 'true'),
+        ('IsSynonymSearch', 'False'),
         ('RequestFrom', ''),
         ('LastLibForChangeColumn', cate2),
         ('IsSearchProvision', 'False'),
@@ -248,7 +258,24 @@ def req_cate_arts(cate1, cate2, show_type, params):
     ]
     data = dict(data)
     data.update(params)
-    response = requests.post(f'https://www.pkulaw.com/{cate1}/search/RecordSearch', headers=headers, data=data, proxies={'http': None, 'https': None})
+    # proxy_url = 'http://127.0.0.1:11153'
+    # proxies = {
+    #     "http": proxy_url,
+    #     "https": proxy_url,
+    # }
+    now = time.time()
+    if is_login:
+        proxies = {'http': None, 'https': None}
+        identifier, session = cate_account_sesion('cate', 'list')
+        log(plat_name, f'acc:{identifier}')
+    else:
+        # session会优先读取环境变量的代理，次优先级才是session.proxies设置的代理，故禁止 session 读取任何环境变量代理配置
+        session = requests.Session()
+        session.trust_env = False
+        proxies = get_proxy_dict()
+    # print(f'获取代理，准备请求:{time.time() - now}')
+    response = session.post(f'https://www.pkulaw.com/{cate1}/search/RecordSearch', headers=headers, data=data, proxies=proxies, timeout=15)
+    # print(f'请求完成:{time.time() - now}')
     return response
 
 def pick_best(lst, threshold):
@@ -260,32 +287,45 @@ def pick_best(lst, threshold):
     return candidates
 
 def cate_all_reqs(cate1, cate2, show_type):
-    data = {
-        'Menu': cate1,
-        'Keywords': '',
-        'SearchKeywordType': show_type,
-        'MatchType': 'Exact',
-        'RangeType': 'Piece',
-        'Library': cate2,
-        'ClassFlag': cate2,
-        'GroupLibraries': '',
-        'IsSynonymSearch': 'true',
-        'LastLibForChangeColumn': '',
-        'ClassCodeKey': '',
-        'IsClink': '',
-        'IsAdv': 'False',
-        'GroupValue': '',
-        'QueryBase64Request': '',
-        'RecordShowType': 'List',
-        'FirstQueryKeywords': '',
-        'FirstQueryKeywordType': show_type,
-        'X-Requested-With': 'XMLHttpRequest'
-    }
-    response = requests.post('https://www.pkulaw.com/law/search/ClassSearch', headers=headers, cookies=cookies, data=data)
-    html_res = etree.HTML(response.text)
-    aggs_keys = [agg_name.replace("Aggs.", "") for agg_name in html_res.xpath('//*[@class="clearFilterItems"]//*[contains(@name, "Aggs")]/@name')]
-    print(f'类目类型数:{len(aggs_keys)}, {aggs_keys}')
+    cate_aggs = {
+        'specialtopic': {
+            "Subject":"",
+            "Category":"",
+            "AuthorUnAnalyzed":"",
+            "PublishDate":""
+        }
 
+    }
+    if cate2 in cate_aggs:
+        aggs_keys = cate2
+    else:
+        data = {
+            'Menu': cate1,
+            'Keywords': '',
+            'SearchKeywordType': show_type,
+            'MatchType': 'Exact',
+            'RangeType': 'Piece',
+            'Library': cate2,
+            'ClassFlag': cate2,
+            'GroupLibraries': '',
+            'IsSynonymSearch': 'true',
+            'LastLibForChangeColumn': '',
+            'ClassCodeKey': '',
+            'IsClink': '',
+            'IsAdv': 'False',
+            'GroupValue': '',
+            'QueryBase64Request': '',
+            'RecordShowType': 'List',
+            'FirstQueryKeywords': '',
+            'FirstQueryKeywordType': show_type,
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        response = requests.post('https://www.pkulaw.com/law/search/ClassSearch', headers=headers, cookies=cookies, data=data, proxies=get_proxy_dict())
+        html_res = etree.HTML(response.text)
+        aggs_names = html_res.xpath('//*[@class="classtitle"]/text()')
+        aggs_raws = html_res.xpath('//*[@class="clearFilterItems"]//*[contains(@name, "Aggs")]/@name')
+        aggs_keys = {aggs_raw.replace("Aggs.", ""): aggs_names[aggs_raws.index(aggs_raw)] for aggs_raw in aggs_raws}
+    print(f'类目类型数:{len(aggs_keys)}, {aggs_keys}')
     aggs = {aggs_key: "" for aggs_key in aggs_keys}
     pdata = {
         'library': cate2,
@@ -300,10 +340,12 @@ def cate_all_reqs(cate1, cate2, show_type):
         'MatchType': 'Exact'
     }
 
-    response = requests.post('https://www.pkulaw.com/Aggregate/ClusterResult', headers=headers, data=pdata)
+    response = requests.post('https://www.pkulaw.com/Aggregate/ClusterResult', headers=headers, data=pdata, proxies=get_proxy_dict())
     result = parse_cates(response.json())
     # 最大数据量、最少需要采集下级类目的文章数、最少需要采集下级类目的类目数、最少需要采集文章列表的类目数
     cur_cate = max(result, key=lambda x: (x["total_num"], -x["more_num"], -x["more_cate_count"], -x["leave_count"]))
+    print([[x["type_name"], x["total_num"], -x["more_num"], -x["more_cate_count"], -x["leave_count"]] for x in result])
+    log(plat_name, f'数量最多且溢出数量最少的一级筛选:{aggs_keys[cur_cate["type_name"]]}, 文章数量:{cur_cate["total_num"]}, 类目数量:{cur_cate["leave_count"]}, 溢出类目:{cur_cate["more_cate_count"]}, 溢出数量:{cur_cate["more_num"]}')
     type_name = cur_cate["type_name"]
     req_cates = []
     req_more = []
@@ -315,7 +357,7 @@ def cate_all_reqs(cate1, cate2, show_type):
             req_cate = dict(
                 aggs={type_name: cate_id},
                 aggs_count=1,
-                cate_cur=cur_cate,
+                cur_cate=cur_cate,
                 cur_count=cur_count
             )
             req_cates.append(req_cate)
@@ -323,13 +365,12 @@ def cate_all_reqs(cate1, cate2, show_type):
             aggs_data = copy.deepcopy(aggs)
             aggs_data[type_name] = cate_id
             pdata['Aggs'] = json.dumps(aggs_data)
-            print(pdata)
-            response2 = requests.post('https://www.pkulaw.com/Aggregate/ClusterResult', headers=headers, data=pdata)
+            response2 = requests.post('https://www.pkulaw.com/Aggregate/ClusterResult', headers=headers, data=pdata, proxies=get_proxy_dict())
             result_2 = parse_cates(response2.json(), type_pass=type_name)
-            print(result_2)
             resul_parse2 = pick_best(result_2, parse_cate_num(cate_name))
             cur_cate2 = max(resul_parse2, key=lambda x: (-x["more_num"], -x["more_cate_count"], -x["leave_count"]))
-            print(cur_cate2)
+            print([[x["type_name"], x["total_num"], -x["more_num"], -x["more_cate_count"], -x["leave_count"]] for x in result_2])
+            log(plat_name, f'数量最多且溢出数量最少的二级筛选:{cate_name}, {aggs_keys[cur_cate2["type_name"]]}, 文章数量:{cur_cate2["total_num"]}, 类目数量:{cur_cate2["leave_count"]}, 溢出类目:{cur_cate2["more_cate_count"]}, 溢出数量:{cur_cate2["more_num"]}')
             type_name2 = cur_cate2["type_name"]
             for cur_cate2 in cur_cate2["leaves"]:
                 cate2_id = cur_cate2["id"]
@@ -345,85 +386,201 @@ def cate_all_reqs(cate1, cate2, show_type):
                 req_cates.append(req_cate2)
                 if cur_count2 > 4000:
                     req_more.append(req_cate2)
-    return req_cates, aggs_keys
+    return req_cates, aggs_keys, req_more
 
-def cate_art_all():
-    # 1、获取栏目下的类目分类
-    cate1, cate2 = 'law', 'news'
-    show_type = 'Title'  # FullText-全文， Title-标题
-    fname = f'pkulaw_{cate1}_{cate2}_all.txt'
-    with open(fname) as f:
-        req_cates = json.loads(f.read().strip())
-    aggs_keys = ['SubjectWord', 'Provinces', 'NCID', 'SubmitDate']
-    # req_cates, aggs_keys = cate_all_reqs(cate1, cate2, show_type)
-    # with open(fname, 'w') as f:
-    #     f.write(json.dumps(req_cates))
-    print(req_cates)
-    print(len(req_cates))
-    api_url = 'https://www.pkulaw.com/case/search/RecordSearch'
+def run(tname, tcates):
+    chan_name = plat_name + f':{tname}'
+    login_map = {
+        'case_pfnl': True,
+    }
+    # 1、获取栏目下的类目分类, FullText-全文， Title-标题
+    cate1, cate2, show_type = tcates
+    page_max_num = 100
+    is_login = login_map.get(f'{cate1}_{cate2}', False)
+    cate_key = f'pkulaw_{cate1}_{cate2}'
+    fname = f'{cate_key}_all.txt'
+    if os.path.exists(fname):
+        with open(fname) as f:
+            req_datas = json.loads(f.read().strip())
+        req_cates = req_datas['req_cates']
+        aggs_keys = req_datas['aggs_keys']
+        req_more = req_datas['req_more']
+    else:
+        req_cates, aggs_keys, req_more = cate_all_reqs(cate1, cate2, show_type)
+        with open(fname, 'w') as f:
+            f.write(json.dumps({'req_cates': req_cates, 'aggs_keys': aggs_keys, 'req_more': req_more}))
+        # print(req_cates)
     r = get_client()
-
+    cate_over_key = f'{cate_key}_cate_over'
+    cate_failed_key = f'{cate_key}_cate_failed'
+    detail_task_key = f'{cate_key}_detail_task'
+    total_can_crawl, total_num = 0, 0
     for req_cate in req_cates:
-        print(req_cate)
+        total_can_crawl += min(4000, req_cate['cur_count'])
+        total_num += req_cate['cur_count']
+    log(chan_name, f'is_login:{is_login}, 类目总数:{len(req_cates)}, 类目已完成:{r.hlen(cate_over_key)}, 溢出类目:{len(req_more)}, 文章总数:{total_num}, 可采集文章数:{total_can_crawl}')
+    if len(req_cates) == r.hlen(cate_over_key):
+        cache_arts = r.scard(detail_task_key)
+        log(chan_name, f'已完成, cate1:{cate1}, cate2:{cate2}, 采集文章数:{cache_arts}')
+        return
+    api_url = 'https://www.pkulaw.com/case/search/RecordSearch'
+    err_count = 0
+    for req_cate in req_cates:
+        cate_index = req_cates.index(req_cate)
         total_count = req_cate["cur_count"]
-        cate_cur = req_cate["cate_cur"]
+        cur_cate = req_cate["cur_cate"]
         aggs = req_cate["aggs"]
-        cate_over_key = f'pkulaw_cate_over_{cate1}_{cate2}'
         cate_key = ",".join([f"{key}:{aggs[key]}" for key in sorted(aggs.keys())])
-        if r.sismember(cate_over_key, cate_key):
-            print(f'已完成类目抓取:{req_cate}')
+        over_data = r.hget(cate_over_key, cate_key)
+        if over_data:
+            r.hdel(cate_failed_key, cate_key)
+            over_data = json.loads(over_data)
+            # log(chan_name, f'【{cate_index}】已完成类目抓取:{aggs}, over_data:{over_data}')
+            # if over_data["crawl_rate"] == 0:
+            #     print('删除失败的', over_data)
+            #     r.hdel(cate_over_key, cate_key)
             continue
-        total_page = total_count // 100 + 3
+        failed_data = r.hget(cate_failed_key, cate_key)
+        if failed_data:
+            failed_data = json.loads(failed_data)
+            if failed_data['crawl_count'] >= 1900:
+                log(chan_name, f'抓取失败先过滤:{failed_data}')
+                continue
+        total_page = total_count // page_max_num + 5
         url_set = set()
-        for i in range(min(40, total_page)):
-            if i < 20:
+        last_total = 0
+        last_simple = 0
+        log(chan_name, f'【{cate_index}】类目抓取开始:{cur_cate}')
+        max_page = 44
+        for i in range(min(max_page, total_page)):
+            if i < max_page // 2:
                 page = i
-                OrderByIndex = 0
+                OrderByIndex = '0'
             else:
-                page = i - 20
+                page = i - max_page // 2
                 OrderByIndex = '1'
             page_data = {
                 'Pager.PageIndex': str(page),
                 'OldPageIndex': '' if page == 0 else str(page - 1),
-                'Pager.PageSize': '100',
+                'Pager.PageSize': str(page_max_num),
                 'OrderByIndex': OrderByIndex
             }
             for aggs_key in aggs_keys:
                 page_data[f'Aggs.{aggs_key}'] = aggs.get(aggs_key, "")
-            response = req_cate_arts(cate1, cate2, show_type, page_data)
-            with open('cate_news_all.txt', 'w') as f:
-                f.write(response.text)
-            html_str = etree.HTML(response.text)
-            cate = html_str.xpath('//*[@class="search-condition-wrap"]//*[@class="crumb-select-item"]//text()')
-            cate_str = ''.join([x1.strip() for x1 in cate if x1.strip()])
-            list_items = html_str.xpath('//*[@class="list-wrap"]//*[@class="item"][.//input]|//*[@class="list-wrap"]//li[.//*[@title]]')
-            if not list_items:
-                print('异常', response.text)
-                return
-            for item in list_items:
-                url = item.xpath(f'.//h4/a[contains(@href, ".html")]/@href')[0]
-                url = urllib.parse.urljoin(api_url, url)
-                r.sadd(f'pkulaw_detail_task_{cate1}_{cate2}', url)
-                url_set.add(url)
-                res = detail_client.view_detail_pooled_by_url(url, is_login=False)
-                # print(res)
-                print(url, True if res else False)
-                break
+            for _ in range(2):
+                try:
+                    if not is_login:
+                        need_login = is_login
+                    else:
+                        need_login = True if total_count > 25 else False
+                    response = req_cate_arts(cate1, cate2, show_type, page_data, need_login)
+                    break
+                except:
+                    print(traceback.format_exc())
+                    response = ''
+                    time.sleep(3)
+            if not response:
+                err_count += 1
+                if err_count > 10:
+                    log(chan_name, f'连续失败:{err_count}次退出')
+                    return
+                continue
+            # with open('cate_news_all.txt', 'w') as f:
+            #     f.write(response.text)
+            try:
+                html_str = etree.HTML(response.text)
+                cate = html_str.xpath('//*[@class="search-condition-wrap"]//*[@class="crumb-select-item"]//text()')
+                cate_str = '|'.join([x1.strip() for x1 in cate if x1.strip()]).replace('：|', '：')
+                list_items = html_str.xpath('//*[@class="list-wrap"]//*[@class="item"][.//input]|//*[@class="list-wrap"]//li[.//*[@title]]')
+                if not list_items:
+                    print('异常无文章数据')
+                    # with open(f'{plat_name}_arts_err.txt', 'w') as f:
+                    #     f.write(response.text)
+                    err_count += 1
+                    if err_count > 10:
+                        log(chan_name, f'连续失败:{err_count}次退出')
+                        return
+                err_jiexi = 0
+                for item in list_items:
+                    url = item.xpath(f'.//h4/a[contains(@href, ".html")]/@href')[0]
+                    info = item.xpath(f'.//*[@class="info"]/*[@class="text"]/text()')
+                    # if list_items.index(item) == 0:
+                    #     print(info)
+                    url = urllib.parse.urljoin(api_url, url)
+                    r.sadd(detail_task_key, url)
+                    url_set.add(url)
+                    # if list_items.index(item) == 0:
+                    #     res = detail_client.view_detail_pooled_by_url(url, is_login=False)
+                    #     # print(res)
+                    #     print(url, True if res else False)
+            except Exception as e:
+                log(tname, f'解析异常:{e}')
+                cate_str = ''
+                list_items = []
 
-            print(f'类目:{cate_str}, 页码:{i}, 排序:{OrderByIndex}, 数量:{len(list_items)}, 总数:{len(url_set)}')
-            if len(url_set) >= total_count:
-                print(f'类目抓取完成:{req_cate}')
-                r.sadd(cate_over_key, cate_key)
+            log(chan_name, f'【{cate_index}】类目:{cate_str}, i:{i}, page:{page}, 排序:{OrderByIndex}, 数量:{len(list_items)}, 总数:{len(url_set)}')
             # print(list_items[-1].xpath('.//text()'))
-            if len(list_items) < 100:
-                break
-            time.sleep(2)
+            if last_total == len(url_set) or len(list_items) < page_max_num:
+                last_simple += 1
+                if last_simple > 2 or len(url_set) >= min(total_count * 0.99, total_count - 10) or len(list_items) < 15:
+                    break
+            else:
+                last_simple = 0
+            last_total = len(url_set)
+            # time.sleep(1)
+        crawl_rate = round(len(url_set) / total_count, 2) * 100
+        tmp = {'page': i, 'crawl_count': len(url_set), 'total_count': total_count, 'crawl_rate': crawl_rate}
+        cache_arts = r.scard(detail_task_key)
+        # if len(url_set) > 0 and (len(url_set) >= total_count * 0.95 or len(url_set) >= total_count - 5 or len(url_set) >= 3900):
+        if len(url_set) >= total_count * 0.95 or len(url_set) >= total_count - 5 or len(url_set) >= 3900:
+            log(chan_name, f'【{cate_index}】类目抓取完成:{cur_cate["name"]}, crawl_rate:{crawl_rate}, cache_arts:{cache_arts}')
+            r.hset(cate_over_key, cate_key, json.dumps(tmp, ensure_ascii=False))
+            r.hdel(cate_failed_key, cate_key)
+        elif total_count < 20 and len(url_set) > 0:
+            log(chan_name, f'【{cate_index}】类目抓取完成(少数量):{cur_cate["name"]}, crawl_rate:{crawl_rate}, cache_arts:{cache_arts}')
+            r.hset(cate_over_key, cate_key, json.dumps(tmp, ensure_ascii=False))
+            r.hdel(cate_failed_key, cate_key)
+        else:
+            log(chan_name, f'【{cate_index}】类目抓取失败:{cur_cate}, crawl_rate:{crawl_rate}, cache_arts:{cache_arts}')
+            r.hset(cate_failed_key, cate_key, json.dumps(tmp, ensure_ascii=False))
 
 
 if __name__ == '__main__':
     # pkulaw_行政执法()
     # pkulaw_检查文书()
-    cate_art_all()
+    # 法律动态、案例报道 无cookie+代理ip能拿到全部文章url
+    # 法律法规: 无cookie+普通账号 能抓取大部分 很多接口采集拿不到页面显示的数量，比如十几个接口只能拿到几条，可能需要付费账号访问才能看到部分文章
+
+    tasks = {
+        '法律动态': [['law', 'news', 'Title']],
+        '合同范本': [['law', 'contract', 'Title']],
+        '法律文书': [['law', 'fmt', 'Title']],
+        # '中央法规': [['law', 'chl', 'Title']],
+        # '地方法规': [['law', 'lar', 'Title']],
+        # '立法资料': [['law', 'protocol', 'Title']],
+        # '中外条约': [['law', 'eagn', 'Title']],
+        # '外国法规': [['law', 'iel', 'Title']],
+
+        '案例报道': [['case', 'pal', 'Fulltext']],
+        # '司法案例': [['case', 'pfnl', 'Fulltext']],
+        # '裁判规则': [['case', 'payz', 'Fulltext']],
+        '专题参考': [['', 'specialtopic', 'Title']],
+    }
+    if len(sys.argv) == 2:
+        tname = sys.argv[1]
+    else:
+        tname = ''
+    for name, cates_list in tasks.items():
+        if tname and name != tname:
+            continue
+        for cates in cates_list:
+            run(name, cates)
+            # page_data = {'Pager.PageIndex': '0', 'OldPageIndex': '', 'Pager.PageSize': 100, 'OrderByIndex': '0', 'Aggs.CategoryIntegration': '', 'Aggs.CaseGrade': '0302', 'Aggs.CaseClass': '', 'Aggs.SubjectClassSpecialType': '', 'Aggs.CourtGrade': '', 'Aggs.LastInstanceCourt': '', 'Aggs.TrialStep': '', 'Aggs.DocumentAttr': '', 'Aggs.LastInstanceDate': '', 'Aggs.TrialStepCount': '', 'Aggs.PenaltyCodes': '', 'Aggs.WordNum': '', 'Aggs.NoPublicReason': '', 'Aggs.AnocsInfoList': ''}
+            # res = req_cate_arts(cates[0], cates[1], cates[2], page_data, True)
+            # print(res)
+            # break
+    # print(get_proxy_dict())
+    # 4bc9ae92f2ca7f76c7b31acc580f9ea0
 #     datas = """刑事 (9873)
 # 民事 (31011)
 # 行政 (6454)
