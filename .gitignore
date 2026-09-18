@@ -19,7 +19,8 @@ cache/
 *.env
 *.apk
 *.zip
-*.imgmcd/mcd_traffic.mitm
+*.img
+*.mitm
 
 # 忽略带版本号后缀的 .so 文件，保留纯 .so
 **/*.so.*
