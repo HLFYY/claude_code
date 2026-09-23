@@ -948,9 +948,8 @@ def process_one(row: tuple) -> Optional[dict]:
         return None
     if result.get("score", 0) < CFG["min_score"]:
         return None
-
-    result["code"]    = code
     result["name"]    = name
+    result["code"]    = code
     # ATR 复用已拉取的日线，否则补拉（买点2）
     if daily is None:
         daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30))
@@ -1467,11 +1466,11 @@ def check_recent_100d_high(day: int = 5) -> list:
 
 if __name__ == "__main__":
     # 周五5点半后出当前周数据
-    main()
-    # check_recent_100d_high(day=7)
+    # main()
+    check_recent_100d_high(day=2)
     # 当日5点半后更新日线
     # for code in 'sz.300985,sz.301045,sh.603663,sz.002768,sz.301196,sh.600226,sh.603256,sz.002388,sz.300684,sh.603679,sh.603151,sh.603979'.split(','):
-    # for code in 'sz.300192,sz.300567'.split(','):
+    # for code in 'sh.603118,sz.000731'.split(','):
     #     daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)
     #     print(f'数据最新日期:{daily["date"].values[-1]}')
     #     atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
