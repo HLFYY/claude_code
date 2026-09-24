@@ -1,27 +1,47 @@
 # 麦当劳 API 项目
 
-一个完整的麦当劳 App API 逆向工程项目，支持登录、多账号管理、订单等功能。
+一个完整的麦当劳 App API 逆向工程项目，支持登录、多账号管理、店铺查询、商品浏览、购物车管理、订单流程等功能。
 
 ## 项目结构
 
 ```
 mcd_project/
-├── mcd_api.py              # 核心 API 功能（签名、加密、API 调用）
+├── mcd_api.py              # 核心 API 功能（签名、加密、所有业务接口、密钥配置）
 ├── login_manager.py        # 登录管理类（多账号、状态检查、凭证管理）
-├── test_login_manager.py   # 登录管理器测试脚本
+├── run.py                  # 店铺查找和下单流程测试脚本
+├── use_login_manager.py    # 登录管理器测试脚本（5个测试场景）
+├── demo.py                 # 清空购物车演示脚本
 ├── credentials.json        # 登录凭证存储（自动生成）
 └── README.md              # 项目文档
 ```
 
 ## 快速开始
 
-### 1. 基本用法
+### 使用测试脚本
+
+```bash
+# 测试登录管理器（包含5个测试场景）
+python3 use_login_manager.py
+
+# 清空购物车演示
+python3 demo.py
+```
+
+### 完整下单流程
+
+```bash
+# 第一步：选择店铺
+python run.py store
+
+# 第二步：测试下单流程（需要先执行 store）
+python run.py order
+```
 
 ```python
 from login_manager import LoginManager
 
 # 创建登录管理器
-manager = LoginManager(phone="16752934813")
+manager = LoginManager(phone="17717295039")
 
 # 检查登录状态（如果凭证有效直接返回，否则返回 None）
 token, sid, meddy_id = manager.ensure_login(auto_relogin=False)
@@ -29,8 +49,6 @@ token, sid, meddy_id = manager.ensure_login(auto_relogin=False)
 if token:
     print(f"登录成功")
     print(f"Token: {token}")
-    print(f"SID: {sid}")
-    print(f"MeddyId: {meddy_id}")
 else:
     print("需要重新登录")
 ```
@@ -101,6 +119,37 @@ if token and sid:
         print(f"昵称: {user_info['name']}")
         print(f"积分: {user_info['points']}")
 ```
+
+## mcd_api.py 已实现的接口
+
+### 登录相关
+- `generate_token()` - 生成设备 Token
+- `activate_token(token)` - 激活 Token 获取 tid
+- `send_verify_code(phone, token, sid)` - 发送验证码
+- `login_with_code(phone, code, token, sid)` - 验证码登录
+- `check_login_status(token, sid, meddy_id)` - 检查登录状态
+
+### 城市和店铺
+- `get_all_cities(token, sid, meddy_id)` - 获取所有城市信息
+- `get_current_city(latitude, longitude, token, sid, meddy_id)` - 通过经纬度获取当前城市
+- `search_stores(city_code, keyword, token, sid, meddy_id, page_no=1, page_size=10)` - 搜索店铺
+- `get_nearby_stores(latitude, longitude, token, sid, meddy_id, show_type=2, order_type=1)` - 获取附近店铺
+
+### 商品和菜单
+- `get_store_menu(store_code, token, sid, meddy_id, order_type=1, day_part_code="5")` - 获取店铺商品菜单
+- `get_product_detail(product_code, store_code, token, sid, meddy_id, ...)` - 获取商品详情
+
+### 购物车
+- `empty_cart(store_code, token, sid, meddy_id, ...)` - 清空购物车
+- `update_cart(products, store_code, token, sid, meddy_id, ...)` - 更新购物车（加入/删除商品）
+
+### 订单相关
+- `get_order_validation_info(store_code, token, sid, meddy_id, ...)` - 获取订单验证信息
+- `get_order_promotion(cart_items, store_code, token, sid, meddy_id, ...)` - 获取促销/优惠券信息
+- `get_nearest_store(store_code, latitude, longitude, token, sid, meddy_id)` - 获取门店信息
+- `get_payment_channels(order_id, pay_id, mcd_id, token, sid, meddy_id)` - 获取支付渠道
+- `submit_order(...)` - 提交订单（需要 v5 签名，暂不可用）
+- `preorder_payment(...)` - 预支付（需先完成提交订单）
 
 ## LoginManager 类 API
 
@@ -199,7 +248,7 @@ python3 use_login_manager.py
 }
 ```
 
-## 技术细节
+### 技术实现
 
 ### 签名算法
 
@@ -219,11 +268,11 @@ python3 use_login_manager.py
 <空行>
 ```
 
-### AES 加密
+#### AES 加密
 
 手机号和验证码使用 AES-128-ECB 加密：
 
-- **密钥**: `mcd20190909mcd20`
+- **密钥**: `w8ZJ4wrUl7dDB1A7`
 - **模式**: ECB
 - **填充**: PKCS7
 - **编码**: Base64

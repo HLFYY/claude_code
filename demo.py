@@ -166,4 +166,44 @@ def add_cart():
 if __name__ == '__main__':
     # menu()
     # menu_login()
-    add_cart()
+    # add_cart()
+    headers = {
+        'Host': 'api2.mcd.cn',
+        'biz_scenario': '102',
+        'biz_from': '1006',
+        'br_interactive_uuid': '91a7f41f-b702-401d-b204-f718b87dd215',
+        'user-agent': 'mcdonald_Android/7.0.41.0 (Android)',
+        'v': '7.0.41.0',
+        'ct': '102',
+        'p': '102',
+        'token': 'ac05229f37f344e582a330cef7a580d1',
+        'sid': '',
+        'language': 'cn',
+        'x-b3-traceid': '9DE2F0C0C6334025AACC593EA5836161',
+        'x-b3-spanid': '4CA91F28ECD54160',
+        'routingid': '',
+        'st': '1790167759',
+        'nonce': '1790167759114313369',
+        'tid': '00003TuN',
+        'meddyid': '',
+        'mcdtoken': 'ac05229f37f344e582a330cef7a580d1',
+        'd': 'BE/xH18c304uhbeLKnND/27QSHmyfJ5l6nSNa6FkQw6h/qVwIXXOmPn5mjf/a1uGqYC6m3bzTbd+l2lqRHvmtPQ==',
+        'authorization': 'hmac-auth-v1#HJ7YLqOY06F61FPEhF7H#1iFLnGFVtNFoIlJ47amUs0o37XmPx6+s3drsSGYpP1c=#hmac-sha256#Wed, 23 Sep 2026 12:49:19 GMT#ct;language;p;sid;sv;token;v;x-mcd-gw-v',
+        'sv': 'v4',
+        'x-hmac-digest': 'UpiBsa1pBaUKD+QfXUM6sC73wuZaR34SZzChjfuZIHQ=',
+        'x-mcd-gw-v': '1',
+    }
+
+    params = (
+        ('storeCode', '1450250'),
+        ('orderType', '2'),
+        ('beCode', '145025002'),
+        ('beType', '2'),
+        ('orderMode', '0'),
+        ('pinId', ''),
+        ('dayPartCode', '5'),
+    )
+    print(headers)
+    print(dict(params))
+    response = requests.get('https://api2.mcd.cn/bff/spc/menu', headers=headers, params=dict(params))
+    print(response.text)
