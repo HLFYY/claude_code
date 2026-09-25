@@ -23,6 +23,16 @@ from email.utils import formatdate
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
+# v5 RPC 客户端（可选）
+try:
+    from v5_rpc_client import get_v5_sign_rpc, check_v5_rpc_health, configure_v5_rpc
+    V5_RPC_AVAILABLE = True
+except ImportError:
+    V5_RPC_AVAILABLE = False
+    get_v5_sign_rpc = None
+    check_v5_rpc_health = None
+    configure_v5_rpc = None
+
 
 # ========== 配置区域 ==========
 
@@ -1047,7 +1057,7 @@ def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code=
 def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=None,
                 order_type='1', eat_type_code='eat-in', tableware_code='no',
                 order_mode='0', pin_id='', latitude=0.0, longitude=0.0,
-                date='', time='', menu_card_list=None):
+                date='', time='', menu_card_list=None, real_total_amount=0):
     """
     提交订单 (对应 curl: /bff/order/orders)
     使用 v5 加密
@@ -1092,14 +1102,14 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         "driveDurationNew": -1,
         "eatTypeCode": eat_type_code,
         "expectDeliveryDateCode": "",
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": '0',
+        "longitude": '0',
         "menuCardList": menu_card_list,
         "orderMode": order_mode,
         "orderType": order_type,
         "pinId": pin_id,
         "pinType": 0,
-        "realTotalAmount": "0",  # 会自动计算
+        "realTotalAmount": str(real_total_amount),  # 会自动计算
         "simulationTest": 0,
         "skipDtTimeCheck": False,
         "skipPriceChange": False,
@@ -1109,16 +1119,46 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         "time": time
     }
     body_str = json.dumps(body_data, separators=(',', ':'))
+    path = '/bff/order/orders'
+    url = f'{API_BASE}{path}'
 
-    # 注意：提交订单使用 v5 加密，需要特殊处理
-    # 这里暂时使用 v4，实际使用时需要实现 v5 签名
-    headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/order/orders')
-    url = f'{API_BASE}/bff/order/orders'
+    # 尝试使用 v5 签名（通过 RPC）
+    use_v5 = False
+    v5_signature = None
+
+    if V5_RPC_AVAILABLE and get_v5_sign_rpc is not None:
+        success, signature, msg = get_v5_sign_rpc(path)
+        if success:
+            use_v5 = True
+            v5_signature = signature
+            print(f"✅ 使用 v5 签名")
+        else:
+            print(f"⚠️  v5 签名获取失败({msg})，降级到 v4")
+
+    # 构建请求头
+    if use_v5:
+        # v5 签名：不使用 Authorization 和 X-HMAC-DIGEST
+        headers = {
+            'Content-Type': 'application/json',
+            'sv': 'v5',
+            'x-mcd-sign': v5_signature,
+            'token': token,
+            'sid': sid,
+            'v': '7.0.41.0',
+            'p': '102',
+            'ct': '102',
+            'language': 'en',
+            'x-mcd-gw-v': '1',
+            'Date': formatdate(timeval=None, localtime=False, usegmt=True),
+            'User-Agent': 'okhttp/4.9.0'
+        }
+    else:
+        # v4 签名（降级）
+        headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path)
 
     try:
         response = requests.post(url, headers=headers, data=body_str, timeout=10)
         result = response.json()
-
         if result.get('success'):
             data = result.get('data', {})
             order_id = data.get('orderId')

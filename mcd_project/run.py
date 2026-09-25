@@ -12,7 +12,7 @@ from mcd_api import (
     get_nearby_stores, search_stores, get_all_cities, get_city_by_location,
     get_store_menu, get_product_detail, clear_cart, add_to_cart,
     get_order_validation_info, get_order_promotion_info, get_nearest_store_info,
-    submit_order
+    submit_order, get_payment_channels, create_payment
 )
 
 # 默认配置
@@ -20,6 +20,7 @@ DEFAULT_PHONE = '17717295039'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = 'selected_store.json'
+ORDER_DATA_FILE = 'order_data.json'
 
 
 def get_login_info():
@@ -125,7 +126,7 @@ def store_flow():
             print(f"\n✅ {msg}")
             print("\n城市列表:")
             idx = 1
-            for group in city_groups[:1]:
+            for group in city_groups:
                 cities = group.get('cities', [])
                 for city in cities:
                     print(f"{idx}. {city.get('name', '')} ({city.get('code', '')})")
@@ -407,44 +408,48 @@ def order_flow():
     print(f"\n商品: {caer_product_name}")
     print(f"\n总价: ¥{total_yuan}")
 
-    # 获取促销/优惠券信息
-    print(f"\n[步骤 6] 正在获取促销/优惠券信息...")
+    # 获取订单验证信息（包含完整商品数据和自动匹配的优惠券）
+    print(f"\n[步骤 6] 正在获取订单验证信息...")
 
-    # 构建购物车商品数据
-    cart_items = []
-    for p in cart_products:
-        cart_items.append({
-            "actions": p.get('actions', [2]),
-            "activityNewcomer": 0,
-            "activityPoints": 0,
-            "associationType": 1,
-            "changeQuantity": 0,
-            "comboItemList": [],
-            "id": p['id'],
-            "orderDetailAssociationType": -1,
-            "orderDetailButtonUrl": "",
-            "packingFeePrice": str(p.get('packingFeePrice', 0) / 100),
-            "packingFeeTotalPrice": str(p.get('packingFeeTotalPrice', 0) / 100),
-            "pmtPrdReplace": False,
-            "price": str(p.get('realPrice', 0) / 100),
-            "productCode": p['code'],
-            "quantity": p['quantity']
-        })
-
-    success, promotion_data, msg = get_order_promotion_info(
-        token, sid, store_code, cart_items,
-        be_type='1',
-        order_type='1',
-        real_total_amount=str(total_yuan)
+    success, validation_data, msg = get_order_validation_info(
+        token, sid, store_code,
+        be_code=be_code,
+        order_type=1,
+        cart_type=1
     )
 
-    if success:
-        print(f"✅ {msg}")
-    else:
-        print(f"⚠️  {msg} (继续流程)")
+    if not success:
+        print(f"❌ {msg}")
+        sys.exit(1)
+
+    print(f"✅ {msg}")
+    # 从验证信息中提取完整的商品数据（包含所有25个必需字段）
+    validation_confirm_info = validation_data.get('confirmInfo', {})
+    validation_price_info = validation_confirm_info.get('productPriceInfo', {})
+    cart_product_list = validation_price_info.get('cartProductList', [])
+
+    if not cart_product_list:
+        print("❌ 订单验证信息中未获取到商品数据")
+        sys.exit(1)
+
+    print(f"   商品数量: {len(cart_product_list)}")
+
+    # 显示每个商品的优惠券信息
+    for idx, item in enumerate(cart_product_list, 1):
+        product_name = item.get('productName', '')
+        coupon_list = item.get('couponList', [])
+        print(f"   [{idx}] {product_name}")
+        if coupon_list:
+            for coupon in coupon_list:
+                coupon_name = coupon.get('couponName', '')
+                discount = coupon.get('couponFaceValue', 0) / 100
+                print(f"       💰 优惠: {coupon_name} (减免 ¥{discount:.2f})")
+
+    validation_total = validation_price_info.get('totalAmount', '0')
+    print(f"   订单总金额: ¥{validation_total}")
 
     # 确认是否继续
-    confirm = input("\n是否继续? (y/n): ").strip().lower()
+    confirm = input("\n是否继续提交订单? (y/n): ").strip().lower()
     if confirm != 'y':
         print("❌ 已取消")
         sys.exit(0)
@@ -453,7 +458,8 @@ def order_flow():
     print(f"\n[步骤 7] 正在获取门店信息...")
     success, store_data, msg = get_nearest_store_info(
         token, sid, store_code,
-        DEFAULT_LATITUDE, DEFAULT_LONGITUDE,
+        latitude, longitude,
+        # DEFAULT_LATITUDE, DEFAULT_LONGITUDE,
         be_code=be_code
     )
 
@@ -473,9 +479,193 @@ def order_flow():
         print("❌ 已取消")
         sys.exit(0)
 
-    # 7. 提交订单（暂不执行）
-    print("\n[步骤 8] 提交订单...")
-    print("⚠️  提交订单功能暂未实现（需要 v5 签名支持）")
+    # 7. 保存订单数据（使用订单验证接口返回的完整商品数据）
+    print("\n[步骤 8] 保存订单数据...")
+
+    # 提取 menuCardList（会员卡信息）
+    right_card_info = validation_confirm_info.get('productPriceInfo', {}).get('rightCardInfo', {})
+    card_list = right_card_info.get('cardList', [])
+
+    # 为每个卡片添加 menuCardType 字段
+    menu_card_list = []
+    for card in card_list:
+        menu_card_list.append({
+            'menuCardType': 0,
+            'menuMembershipCode': card.get('menuMembershipCode', ''),
+            'menuMembershipSpecId': card.get('menuMembershipSpecId', ''),
+            'productCode': card.get('productCode', '')
+        })
+
+    # 计算实际总金额（totalAmount 已经是字符串格式的实际价格）
+    real_total_amount = validation_price_info.get('totalAmount', '0')
+
+    # 直接使用订单验证接口返回的 cartProductList，包含所有25个必需字段
+    order_data = {
+        'token': token,
+        'sid': sid,
+        'meddyId': meddy_id,
+        'storeCode': store_code,
+        'storeName': store_name,
+        'beCode': be_code,
+        'cartItems': cart_product_list,  # 直接使用验证接口返回的完整数据
+        'menuCardList': menu_card_list,  # 会员卡信息
+        'beType': '1',
+        'orderType': '1',
+        'eatTypeCode': 'eat-in',
+        'tablewareCode': 'no',
+        'pinId': '',
+        'latitude': latitude,
+        'longitude': longitude,
+        'realTotalAmount': real_total_amount  # 实际订单总金额
+    }
+
+    with open(ORDER_DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(order_data, f, ensure_ascii=False, indent=2)
+
+    print(f"✅ 订单数据已保存到: {ORDER_DATA_FILE}")
+    print(f"   商品数: {len(cart_product_list)}")
+    print(f"   会员卡数: {len(menu_card_list)}")
+    print(f"   订单总金额: ¥{real_total_amount}")
+    print(f"   包含完整字段: couponList, suggestionEmbedding, trackingInfo 等")
+    print("\n提示: 运行 'python run.py payment' 提交订单并支付")
+    print("=" * 60)
+
+
+def payment_flow():
+    """支付流程（自动提交订单并支付）"""
+    print("=" * 60)
+    print("麦当劳提交订单并支付流程")
+    print("=" * 60)
+
+    # 1. 检查并读取订单数据
+    if not os.path.exists(ORDER_DATA_FILE):
+        print(f"\n❌ 未找到订单数据文件: {ORDER_DATA_FILE}")
+        print("请先运行: python run.py order")
+        sys.exit(1)
+
+    with open(ORDER_DATA_FILE, 'r', encoding='utf-8') as f:
+        order_data = json.load(f)
+
+    token = order_data.get('token', '')
+    sid = order_data.get('sid', '')
+    meddy_id = order_data.get('meddyId', '')
+    store_code = order_data.get('storeCode', '')
+    cart_items = order_data.get('cartItems', [])
+    menu_card_list = order_data.get('menuCardList', [])
+    real_total_amount = order_data.get('realTotalAmount', '0')
+    be_type = order_data.get('beType', '1')
+    order_type = order_data.get('orderType', '1')
+    eat_type_code = order_data.get('eatTypeCode', 'eat-in')
+    tableware_code = order_data.get('tablewareCode', 'no')
+    pin_id = order_data.get('pinId', '')
+    latitude = order_data.get('latitude', DEFAULT_LATITUDE)
+    longitude = order_data.get('longitude', DEFAULT_LONGITUDE)
+
+    print(f"\n✅ 已加载订单数据")
+    print(f"   门店: {order_data.get('storeName', '')}")
+    print(f"   商品数: {len(cart_items)}")
+    print(f"   会员卡数: {len(menu_card_list)}")
+    print(f"   订单总金额: ¥{real_total_amount}")
+
+    # 2. 提交订单
+    print(f"\n[步骤 1] 正在提交订单...")
+    success, order_result, msg = submit_order(
+        token=token,
+        sid=sid,
+        store_code=store_code,
+        cart_items=cart_items,
+        menu_card_list=menu_card_list,
+        real_total_amount=real_total_amount,
+        be_type=be_type,
+        order_type=order_type,
+        eat_type_code=eat_type_code,
+        tableware_code=tableware_code,
+        pin_id=pin_id,
+        latitude=latitude,
+        longitude=longitude
+    )
+
+    if not success:
+        print(f"❌ {msg}")
+        sys.exit(1)
+
+    print(f"✅ {msg}")
+
+    # 获取订单ID和支付ID
+    order_id = order_result.get('orderId', '')
+    pay_id = order_result.get('payId', '')
+
+    if not order_id or not pay_id:
+        print("❌ 订单提交成功但未返回订单ID或支付ID")
+        print(f"返回数据: {order_result}")
+        sys.exit(1)
+
+    print(f"\n订单ID: {order_id}")
+    print(f"支付ID: {pay_id}")
+
+    # 步骤1: 获取支付渠道
+    print(f"\n[步骤 1] 正在获取支付渠道...")
+    success, channels_data, msg = get_payment_channels(token, sid, order_id, pay_id, meddy_id)
+    print(channels_data)
+    if not success:
+        print(f"❌ {msg}")
+        sys.exit(1)
+
+    print(f"✅ {msg}")
+
+    # 展示支付渠道
+    channel_infos = channels_data.get('channelInfos', [])
+    if not channel_infos:
+        print("❌ 没有可用的支付渠道")
+        sys.exit(1)
+
+    print(f"\n可用支付渠道 (共 {len(channel_infos)} 个):")
+    for i, ch in enumerate(channel_infos, 1):
+        name = ch.get('name', '')
+        code = ch.get('code', '')
+        free_pay_name = ch.get('freePayName', '')
+        print(f"{i}. {name} ({code}) - {free_pay_name}")
+
+    # 选择支付渠道
+    channel_idx = input(f"\n请选择支付渠道 (1-{len(channel_infos)}): ").strip()
+    try:
+        channel_idx = int(channel_idx) - 1
+        if channel_idx < 0 or channel_idx >= len(channel_infos):
+            print("❌ 无效的选择")
+            sys.exit(1)
+    except ValueError:
+        print("❌ 请输入数字")
+        sys.exit(1)
+
+    selected_channel = channel_infos[channel_idx]
+    channel_code = selected_channel.get('code', '')
+    channel_name = selected_channel.get('name', '')
+
+    print(f"\n已选择: {channel_name} ({channel_code})")
+
+    # 步骤2: 预支付
+    print(f"\n[步骤 2] 正在创建支付订单...")
+    success, payment_data, msg = create_payment(token, sid, pay_id, pay_channel=channel_code)
+    print(payment_data)
+
+    if not success:
+        print(f"❌ {msg}")
+        sys.exit(1)
+
+    print(f"✅ {msg}")
+
+    # 展示支付信息
+    print(f"\n支付信息:")
+    print(f"  订单ID: {payment_data.get('orderId', '')}")
+    print(f"  支付ID: {payment_data.get('payId', '')}")
+    print(f"  支付状态: {payment_data.get('payStatus', '')}")
+    print(f"  支付渠道: {payment_data.get('channelPayDestination', '')}")
+
+    channel_pay_data = payment_data.get('channelPayData', '')
+    if channel_pay_data:
+        print(f"\n支付数据已生成 (长度: {len(channel_pay_data)} 字符)")
+        print("💡 提示: 将 channelPayData 传递给对应的支付 SDK 完成支付")
+
     print("\n流程结束")
     print("=" * 60)
 
@@ -483,8 +673,9 @@ def order_flow():
 def main():
     if len(sys.argv) < 2:
         print("用法:")
-        print("  python run.py store  - 选择店铺")
-        print("  python run.py order  - 下单流程")
+        print("  python run.py store   - 选择店铺")
+        print("  python run.py order   - 下单流程")
+        print("  python run.py payment - 支付流程")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -493,9 +684,11 @@ def main():
         store_flow()
     elif mode == 'order':
         order_flow()
+    elif mode == 'payment':
+        payment_flow()
     else:
         print(f"❌ 未知模式: {mode}")
-        print("支持的模式: store, order")
+        print("支持的模式: store, order, payment")
         sys.exit(1)
 
 

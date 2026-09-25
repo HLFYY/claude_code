@@ -1,0 +1,82 @@
+{
+  "token": "5a621f0a868e40bdb14bcd3fdd816ef1",
+  "sid": "eeca86cf9b41a5a8cc33ca0db02ba7c7_",
+  "meddyId": "MEDDY179943202559721717",
+  "storeCode": "1990198",
+  "storeName": "麦当劳苏州吴江长安路餐厅",
+  "beCode": "",
+  "cartItems": [
+    {
+      "uniqueKey": "9900015847-1",
+      "sequence": 1,
+      "productCode": "9900015847",
+      "id": "1-9900015847",
+      "productName": "麦麦顶“瓜瓜”套餐",
+      "productType": "7",
+      "realSubtotal": "59.9",
+      "quantity": 1,
+      "tags": [],
+      "saleStatus": 1,
+      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/20260924/product/MS_9900015847_320.png",
+      "price": "59.9",
+      "subtotal": "59.9",
+      "comboItemList": [
+        {
+          "productCode": "516020",
+          "name": "中薯条",
+          "quantity": 1
+        },
+        {
+          "productCode": "516013",
+          "name": "麦辣鸡翅-2块",
+          "quantity": 1
+        },
+        {
+          "productCode": "516014",
+          "name": "麦乐鸡-5块",
+          "quantity": 1
+        },
+        {
+          "productCode": "521900",
+          "name": "咸蛋黄鸡腿蛋月堡",
+          "quantity": 1
+        },
+        {
+          "productCode": "3050",
+          "name": "可乐中杯",
+          "quantity": 1
+        },
+        {
+          "productCode": "521914",
+          "name": "麦当劳燕云“葱不求人”按摩捶痒痒挠",
+          "quantity": 1
+        }
+      ],
+      "actions": [
+        2
+      ],
+      "trackingInfo": {
+        "grillInfo": [
+          "咸蛋黄沙拉酱_0_120548",
+          "冰_0_200002"
+        ]
+      }
+    }
+  ],
+  "menuCardList": [
+    {
+      "menuCardType": 0,
+      "menuMembershipCode": "106",
+      "menuMembershipSpecId": "880",
+      "productCode": "521234"
+    }
+  ],
+  "beType": "1",
+  "orderType": "1",
+  "eatTypeCode": "eat-in",
+  "tablewareCode": "no",
+  "pinId": "",
+  "latitude": 31.140296,
+  "longitude": 120.656772,
+  "realTotalAmount": "59.9"
+}
