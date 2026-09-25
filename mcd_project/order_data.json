@@ -7,48 +7,28 @@
   "beCode": "",
   "cartItems": [
     {
-      "uniqueKey": "9900015847-1",
-      "sequence": 1,
-      "productCode": "9900015847",
-      "id": "1-9900015847",
-      "productName": "麦麦顶“瓜瓜”套餐",
+      "uniqueKey": "9900013304-3",
+      "sequence": 3,
+      "productCode": "9900013304",
+      "id": "1-9900013304",
+      "productName": "人气经典随心配",
       "productType": "7",
-      "realSubtotal": "59.9",
+      "realSubtotal": "13.9",
       "quantity": 1,
       "tags": [],
       "saleStatus": 1,
-      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/20260924/product/MS_9900015847_320.png",
-      "price": "59.9",
-      "subtotal": "59.9",
+      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/20260916/product/MS_9900013304_320.png",
+      "price": "13.9",
+      "subtotal": "13.9",
       "comboItemList": [
         {
-          "productCode": "516020",
-          "name": "中薯条",
-          "quantity": 1
-        },
-        {
-          "productCode": "516013",
-          "name": "麦辣鸡翅-2块",
-          "quantity": 1
-        },
-        {
-          "productCode": "516014",
-          "name": "麦乐鸡-5块",
-          "quantity": 1
-        },
-        {
-          "productCode": "521900",
-          "name": "咸蛋黄鸡腿蛋月堡",
+          "productCode": "521316",
+          "name": "高达吉士双牛堡",
           "quantity": 1
         },
         {
           "productCode": "3050",
           "name": "可乐中杯",
-          "quantity": 1
-        },
-        {
-          "productCode": "521914",
-          "name": "麦当劳燕云“葱不求人”按摩捶痒痒挠",
           "quantity": 1
         }
       ],
@@ -57,10 +37,79 @@
       ],
       "trackingInfo": {
         "grillInfo": [
-          "咸蛋黄沙拉酱_0_120548",
+          "酸黄瓜_0_100202",
+          "洋葱粒_0_100212",
+          "番茄酱_0_100214",
+          "芥末酱_0_102230",
+          "高达干酪片_0_102215",
           "冰_0_200002"
         ]
       }
+    },
+    {
+      "uniqueKey": "9900000886-2",
+      "sequence": 2,
+      "productCode": "9900000886",
+      "id": "1-9900000886",
+      "productName": "不素之霸双层牛堡四件套",
+      "productType": "7",
+      "realSubtotal": "59.5",
+      "quantity": 1,
+      "tags": [],
+      "saleStatus": 1,
+      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/20260824/product/MS_9900000886_320.png",
+      "price": "59.5",
+      "subtotal": "59.5",
+      "comboItemList": [
+        {
+          "productCode": "4648",
+          "name": "不素之霸双层牛堡",
+          "quantity": 1
+        },
+        {
+          "productCode": "4810",
+          "name": "中薯条",
+          "quantity": 1
+        },
+        {
+          "productCode": "515106",
+          "name": "麦乐鸡4块",
+          "quantity": 1
+        },
+        {
+          "productCode": "3050",
+          "name": "可乐中杯",
+          "quantity": 1
+        }
+      ],
+      "actions": [
+        2
+      ],
+      "trackingInfo": {
+        "grillInfo": [
+          "芥末沙拉酱_0_102229",
+          "冰_0_200002"
+        ]
+      }
+    },
+    {
+      "uniqueKey": "3505-1",
+      "sequence": 1,
+      "productCode": "3505",
+      "id": "1-3505",
+      "productName": "锡兰红茶",
+      "productType": "1",
+      "realSubtotal": "11.5",
+      "quantity": 1,
+      "tags": [],
+      "saleStatus": 1,
+      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/ProductPool/product/MS_3505_320.png",
+      "price": "11.5",
+      "subtotal": "11.5",
+      "comboItemList": [],
+      "actions": [
+        2
+      ]
     }
   ],
   "menuCardList": [
@@ -78,5 +127,5 @@
   "pinId": "",
   "latitude": 31.140296,
   "longitude": 120.656772,
-  "realTotalAmount": "59.9"
+  "realTotalAmount": "84.9"
 }

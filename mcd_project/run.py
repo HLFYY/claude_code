@@ -213,7 +213,7 @@ def store_flow():
 
 
 def order_flow():
-    """下单流程"""
+    """下单流程 - 支持多商品添加"""
     print("=" * 60)
     print("麦当劳下单流程")
     print("=" * 60)
@@ -257,131 +257,209 @@ def order_flow():
     product_code_key = 'productCode'
     product_img_key = 'productImage'
 
-    # 展示菜单分类
-    print(f"\n菜单分类 (共 {len(menus)} 个):")
-    for i, category in enumerate(menus, 1):
-        category_name = category.get('categoryName', '')
-        products = category.get('productList', [])
+    # 记录已添加商品数量（用于限购检查）
+    added_products = {}  # {product_code: quantity}
+    cart_data = None
+    is_first_loop = True
 
-        if not products:
-            print(f"{i}. {category_name} (无商品)")
+    # 循环添加商品
+    while True:
+        # 非首次循环询问是否继续
+        if not is_first_loop:
+            continue_add = input("\n是否继续添加商品? (y/n): ").strip().lower()
+            if continue_add != 'y':
+                break
+
+        # 3. 展示菜单分类和商品数（统计嵌套结构中的所有商品）
+        print(f"\n菜单分类 (共 {len(menus)} 个):")
+        for i, category in enumerate(menus, 1):
+            category_name = category.get('categoryName', '').replace('\n', ' ')
+
+            # 统计商品数：可能有直接商品或嵌套小类
+            total_products = 0
+            direct_products = category.get('productList', [])
+            sub_categories = category.get('categories', [])
+
+            total_products += len(direct_products)
+            for sub_cat in sub_categories:
+                total_products += len(sub_cat.get('productList', []))
+
+            if total_products > 0:
+                print(f"{i}. {category_name} (共{total_products}个商品)")
+            else:
+                print(f"{i}. {category_name} (无商品)")
+
+        # 选择分类
+        category_idx = input(f"\n请选择分类 (1-{len(menus)}): ").strip()
+        try:
+            category_idx = int(category_idx) - 1
+            if category_idx < 0 or category_idx >= len(menus):
+                print("❌ 无效的选择")
+                continue
+        except ValueError:
+            print("❌ 请输入数字")
             continue
 
-        first_product = products[0].get(product_name_key, '')
-        last_product = products[-1].get(product_name_key, '') if len(products) > 1 else first_product
+        selected_category = menus[category_idx]
+        category_name = selected_category.get('categoryName', '').replace('\n', ' ')
 
-        print(f"{i}. {category_name} (共{len(products)}个商品)")
-        print(f"   首个商品: {first_product}")
-        if len(products) > 1:
-            print(f"   末个商品: {last_product}")
+        # 收集所有商品（包括嵌套小类中的商品）
+        all_products = []
 
-    # 选择分类
-    category_idx = input(f"\n请选择分类 (1-{len(menus)}): ").strip()
-    try:
-        category_idx = int(category_idx) - 1
-        if category_idx < 0 or category_idx >= len(menus):
-            print("❌ 无效的选择")
-            sys.exit(1)
-    except ValueError:
-        print("❌ 请输入数字")
-        sys.exit(1)
+        # 直接商品
+        direct_products = selected_category.get('productList', [])
+        for product in direct_products:
+            all_products.append({
+                'product': product,
+                'sub_category_name': None  # 无小类
+            })
 
-    selected_category = menus[category_idx]
-    products = selected_category.get('productList', [])
+        # 小类中的商品
+        sub_categories = selected_category.get('categories', [])
+        for sub_cat in sub_categories:
+            sub_cat_name = sub_cat.get('categoryName', '').replace('\n', ' ')
+            sub_products = sub_cat.get('productList', [])
+            for product in sub_products:
+                all_products.append({
+                    'product': product,
+                    'sub_category_name': sub_cat_name
+                })
 
-    if not products:
-        print("❌ 该分类下没有商品")
-        sys.exit(1)
+        if not all_products:
+            print(f"❌ {category_name} 分类下没有商品")
+            continue
 
-    # 展示商品列表
-    print(f"\n{selected_category.get('categoryName', '')} - 商品列表:")
-    for i, product in enumerate(products, 1):
-        product_name = product.get(product_name_key, '')
-        product_code = product.get(product_code_key, '')
-        print(f"{i}. {product_name} ({product_code})")
+        # 展示该分类下所有商品（格式：小类名称-商品名称）
+        print(f"\n{category_name} - 商品列表:")
+        for i, item in enumerate(all_products, 1):
+            product = item['product']
+            sub_cat_name = item['sub_category_name']
+            pname = product.get(product_name_key, '')
+            pcode = product.get(product_code_key, '')
+            current_qty = added_products.get(pcode, 0)
+            limit_qty = product.get('limitQuantity', 0)
 
-    # 选择商品
-    product_idx = input(f"\n请选择商品 (1-{len(products)}): ").strip()
-    try:
-        product_idx = int(product_idx) - 1
-        if product_idx < 0 or product_idx >= len(products):
-            print("❌ 无效的选择")
-            sys.exit(1)
-    except ValueError:
-        print("❌ 请输入数字")
-        sys.exit(1)
+            # 构建显示名称
+            if sub_cat_name:
+                display_name = f"{sub_cat_name}-{pname}"
+            else:
+                display_name = pname
 
-    selected_product = products[product_idx]
-    product_code = selected_product.get(product_code_key, '')
-    product_name = selected_product.get(product_name_key, '')
-    product_image = selected_product.get(product_img_key, '')
+            # 动态计算剩余限购数
+            if limit_qty > 0:
+                remaining = limit_qty - current_qty
+                if remaining <= 0:
+                    print(f"{i}. {display_name} ({pcode}) [已达限购]")
+                else:
+                    print(f"{i}. {display_name} ({pcode}) [还可购{remaining}件]")
+            else:
+                if current_qty > 0:
+                    print(f"{i}. {display_name} ({pcode}) [已添加{current_qty}件]")
+                else:
+                    print(f"{i}. {display_name} ({pcode})")
 
-    # 3. 获取商品详情
-    print(f"\n[步骤 2] 正在获取商品详情...")
-    success, detail_data, msg = get_product_detail(token, sid, product_code, store_code, be_code, order_type=1)
+        # 选择商品
+        product_idx = input(f"\n请选择商品 (1-{len(all_products)}): ").strip()
+        try:
+            product_idx = int(product_idx) - 1
+            if product_idx < 0 or product_idx >= len(all_products):
+                print("❌ 无效的选择")
+                continue
+        except ValueError:
+            print("❌ 请输入数字")
+            continue
 
-    if not success:
-        print(f"❌ {msg}")
-        sys.exit(1)
+        selected_product = all_products[product_idx]['product']
+        product_code = selected_product.get(product_code_key, '')
+        product_name = selected_product.get(product_name_key, '')
+        product_image = selected_product.get(product_img_key, '')
+        limit_qty = selected_product.get('limitQuantity', 0)
+        current_qty = added_products.get(product_code, 0)
 
-    print(f"✅ {msg}")
-    print(detail_data)
-    detail_data = detail_data.get('product', {})
-    detail_name = detail_data.get('name', product_name)
-    origin_price = str(detail_data.get('price', 0) / 100)
-    real_price = origin_price
-    real_bt = ''
-    if detail_data.get('rightInfo'):
-        real_price = detail_data['rightInfo']['price'] / 100
-        real_bt = f"({detail_data['rightInfo']['buttonText']})"
+        # 检查是否已达限购
+        if limit_qty > 0 and current_qty >= limit_qty:
+            print(f"❌ 该商品限购{limit_qty}件，已达上限")
+            continue
 
-    print(f"\n商品信息:")
-    print(f"  名称: {detail_name}")
-    print(f"  原价: ¥{origin_price}")
-    print(f"  最低价: ¥{real_price} {real_bt}")
+        # 4. 获取商品详情，展示标题和价格
+        print(f"\n正在获取商品详情...")
+        success, detail_data, msg = get_product_detail(token, sid, product_code, store_code, be_code, order_type=1)
 
-    # 确认加入购物车
-    confirm = input("\n是否加入购物车? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("❌ 已取消")
+        if not success:
+            print(f"❌ {msg}")
+            continue
+
+        print(f"✅ {msg}")
+        detail_data = detail_data.get('product', {})
+        detail_name = detail_data.get('name', product_name)
+        origin_price = detail_data.get('price', 0) / 100
+        real_price = origin_price
+        real_bt = ''
+        if detail_data.get('rightInfo'):
+            real_price = detail_data['rightInfo']['price'] / 100
+            real_bt = f"({detail_data['rightInfo']['buttonText']})"
+
+        print(f"\n商品信息:")
+        print(f"  名称: {detail_name}")
+        print(f"  原价: ¥{origin_price:.2f}")
+        if real_bt:
+            print(f"  最低价: ¥{real_price:.2f} {real_bt}")
+
+        # 5. 首次循环清空购物车
+        if is_first_loop:
+            print(f"\n正在清空购物车...")
+            success, clear_result, msg = clear_cart(token, sid, store_code, be_code, order_type=1, store_name=store_name)
+            if success:
+                print(f"✅ {msg}, 购物车中商品数: {len(clear_result.get('products', []))}")
+            else:
+                print(f"⚠️  {msg} (继续流程)")
+
+        # 6. 加入购物车
+        print(f"\n正在添加商品到购物车...")
+        success, cart_data, msg = add_to_cart(
+            token, sid, store_code, be_code,
+            product_code=product_code,
+            product_name=product_name,
+            product_image=product_image,
+            quantity=1,
+            order_type=1,
+            store_name=store_name
+        )
+
+        if not success:
+            print(f"❌ {msg}")
+            continue
+
+        # 更新已添加商品记录
+        added_products[product_code] = added_products.get(product_code, 0) + 1
+
+        cart_detail = cart_data.get('cartDetail', {})
+        cart_products = cart_detail.get('products', [])
+        print(f"✅ {msg}, 购物车中商品数: {len(cart_products)}")
+
+        is_first_loop = False
+
+    # 循环结束后，展示购物车信息
+    if cart_data:
+        cart_detail = cart_data.get('cartDetail', {})
+        cart_products = cart_detail.get('products', [])
+        print(f"\n购物车商品数: {len(cart_products)}")
+        print("购物车商品列表:")
+        for idx, product in enumerate(cart_products, 1):
+            pname = product.get('name', '')
+            qty = product.get('quantity', 0)
+            print(f"  {idx}. {pname} x{qty}")
+    else:
+        print("\n❌ 购物车为空")
         sys.exit(0)
 
-    # 4. 清空购物车并添加商品
-    print(f"\n[步骤 3] 正在清空购物车...")
-    success, cart_data, msg = clear_cart(token, sid, store_code, be_code, order_type=1, store_name=store_name)
-
-    if success:
-        print(f"✅ {msg}, 购物车中商品数:{len(cart_data['products'])}")
-    else:
-        print(f"⚠️  {msg} (继续流程)")
-
-    print(f"\n[步骤 4] 正在添加商品到购物车...")
-    success, cart_data, msg = add_to_cart(
-        token, sid, store_code, be_code,
-        product_code=product_code,
-        product_name=product_name,
-        product_image=product_image,
-        quantity=1,
-        order_type=1,
-        store_name=store_name
-    )
-
-    if not success:
-        print(f"❌ {msg}")
-        sys.exit(1)
-
-    # 获取购物车商品列表（用于后续订单）
-    cart_detail = cart_data.get('cartDetail', {})
-    cart_products = cart_detail.get('products', [])
-
-    print(f"✅ {msg}, 购物车中商品数:{len(cart_products)}, {cart_products[0].get('name', '')}")
-
-    # 5. 获取订单验证信息
-    print(f"\n[步骤 5] 正在获取订单验证信息...")
+    # 7. 获取订单验证信息
+    print(f"\n正在获取订单验证信息...")
     success, validation_data, msg = get_order_validation_info(
         token, sid, store_code,
+        be_code=be_code,
         order_type=1,
-        be_code=be_code
+        cart_type=1
     )
 
     if not success:
@@ -390,7 +468,15 @@ def order_flow():
 
     print(f"✅ {msg}")
 
-    caer_product_name = validation_data["validation"]["productStatusList"][0]['name']
+    # 展示第一个商品标题
+    validation_info = validation_data.get('validation', {})
+    product_status_list = validation_info.get('productStatusList', [])
+    if product_status_list:
+        all_product_name = [pdata['name'] for pdata in product_status_list if pdata.get('name', '')]
+        print(f"\n商品: {','.join(all_product_name)}")
+        print("订单商品列表:")
+        for idx, pname in enumerate(all_product_name, 1):
+            print(f"  {idx}. {pname}")
 
     # 展示就餐方式
     confirm_info = validation_data.get('confirmInfo', {})
@@ -404,62 +490,20 @@ def order_flow():
 
     # 展示总价
     product_price_info = confirm_info.get('productPriceInfo', {})
-    total_yuan = product_price_info.get('totalAmount', 0)
-    print(f"\n商品: {caer_product_name}")
-    print(f"\n总价: ¥{total_yuan}")
-
-    # 获取订单验证信息（包含完整商品数据和自动匹配的优惠券）
-    print(f"\n[步骤 6] 正在获取订单验证信息...")
-
-    success, validation_data, msg = get_order_validation_info(
-        token, sid, store_code,
-        be_code=be_code,
-        order_type=1,
-        cart_type=1
-    )
-
-    if not success:
-        print(f"❌ {msg}")
-        sys.exit(1)
-
-    print(f"✅ {msg}")
-    # 从验证信息中提取完整的商品数据（包含所有25个必需字段）
-    validation_confirm_info = validation_data.get('confirmInfo', {})
-    validation_price_info = validation_confirm_info.get('productPriceInfo', {})
-    cart_product_list = validation_price_info.get('cartProductList', [])
-
-    if not cart_product_list:
-        print("❌ 订单验证信息中未获取到商品数据")
-        sys.exit(1)
-
-    print(f"   商品数量: {len(cart_product_list)}")
-
-    # 显示每个商品的优惠券信息
-    for idx, item in enumerate(cart_product_list, 1):
-        product_name = item.get('productName', '')
-        coupon_list = item.get('couponList', [])
-        print(f"   [{idx}] {product_name}")
-        if coupon_list:
-            for coupon in coupon_list:
-                coupon_name = coupon.get('couponName', '')
-                discount = coupon.get('couponFaceValue', 0) / 100
-                print(f"       💰 优惠: {coupon_name} (减免 ¥{discount:.2f})")
-
-    validation_total = validation_price_info.get('totalAmount', '0')
-    print(f"   订单总金额: ¥{validation_total}")
+    total_amount = product_price_info.get('totalAmount', 0)
+    print(f"\n总价: ¥{total_amount}")
 
     # 确认是否继续
-    confirm = input("\n是否继续提交订单? (y/n): ").strip().lower()
+    confirm = input("\n是否继续? (y/n): ").strip().lower()
     if confirm != 'y':
         print("❌ 已取消")
         sys.exit(0)
 
-    # 6. 获取最近门店信息
-    print(f"\n[步骤 7] 正在获取门店信息...")
+    # 8. 获取门店信息
+    print(f"\n正在获取门店信息...")
     success, store_data, msg = get_nearest_store_info(
         token, sid, store_code,
         latitude, longitude,
-        # DEFAULT_LATITUDE, DEFAULT_LONGITUDE,
         be_code=be_code
     )
 
@@ -469,9 +513,11 @@ def order_flow():
 
     print(f"✅ {msg}")
     store_text = store_data.get('text', '')
-    store_name_confirm = store_data.get('nearestStoreInfo', '').get('storeName')
+    nearest_store_info = store_data.get('nearestStoreInfo', {})
+    store_name_confirm = nearest_store_info.get('storeName', '')
+
     print(f"\n门店名称: {store_name_confirm}")
-    print(f"\n提醒: {store_text}")
+    print(f"提示: {store_text}")
 
     # 确认门店
     confirm = input("\n是否确认门店? (y/n): ").strip().lower()
@@ -479,14 +525,20 @@ def order_flow():
         print("❌ 已取消")
         sys.exit(0)
 
-    # 7. 保存订单数据（使用订单验证接口返回的完整商品数据）
-    print("\n[步骤 8] 保存订单数据...")
+    # 9. 保存订单数据（使用订单验证接口返回的完整商品数据）
+    print("\n正在保存订单数据...")
+
+    # 从验证信息中提取完整的商品数据
+    cart_product_list = product_price_info.get('cartProductList', [])
+
+    if not cart_product_list:
+        print("❌ 订单验证信息中未获取到商品数据")
+        sys.exit(1)
 
     # 提取 menuCardList（会员卡信息）
-    right_card_info = validation_confirm_info.get('productPriceInfo', {}).get('rightCardInfo', {})
+    right_card_info = product_price_info.get('rightCardInfo', {})
     card_list = right_card_info.get('cardList', [])
 
-    # 为每个卡片添加 menuCardType 字段
     menu_card_list = []
     for card in card_list:
         menu_card_list.append({
@@ -496,10 +548,7 @@ def order_flow():
             'productCode': card.get('productCode', '')
         })
 
-    # 计算实际总金额（totalAmount 已经是字符串格式的实际价格）
-    real_total_amount = validation_price_info.get('totalAmount', '0')
-
-    # 直接使用订单验证接口返回的 cartProductList，包含所有25个必需字段
+    # 直接使用订单验证接口返回的 cartProductList
     order_data = {
         'token': token,
         'sid': sid,
@@ -507,8 +556,8 @@ def order_flow():
         'storeCode': store_code,
         'storeName': store_name,
         'beCode': be_code,
-        'cartItems': cart_product_list,  # 直接使用验证接口返回的完整数据
-        'menuCardList': menu_card_list,  # 会员卡信息
+        'cartItems': cart_product_list,
+        'menuCardList': menu_card_list,
         'beType': '1',
         'orderType': '1',
         'eatTypeCode': 'eat-in',
@@ -516,7 +565,7 @@ def order_flow():
         'pinId': '',
         'latitude': latitude,
         'longitude': longitude,
-        'realTotalAmount': real_total_amount  # 实际订单总金额
+        'realTotalAmount': str(total_amount)
     }
 
     with open(ORDER_DATA_FILE, 'w', encoding='utf-8') as f:
@@ -524,9 +573,7 @@ def order_flow():
 
     print(f"✅ 订单数据已保存到: {ORDER_DATA_FILE}")
     print(f"   商品数: {len(cart_product_list)}")
-    print(f"   会员卡数: {len(menu_card_list)}")
-    print(f"   订单总金额: ¥{real_total_amount}")
-    print(f"   包含完整字段: couponList, suggestionEmbedding, trackingInfo 等")
+    print(f"   订单总金额: ¥{total_amount}")
     print("\n提示: 运行 'python run.py payment' 提交订单并支付")
     print("=" * 60)
 
@@ -604,7 +651,7 @@ def payment_flow():
     print(f"支付ID: {pay_id}")
 
     # 步骤1: 获取支付渠道
-    print(f"\n[步骤 1] 正在获取支付渠道...")
+    print(f"\n[步骤 2] 正在获取支付渠道...")
     success, channels_data, msg = get_payment_channels(token, sid, order_id, pay_id, meddy_id)
     print(channels_data)
     if not success:
@@ -644,7 +691,7 @@ def payment_flow():
     print(f"\n已选择: {channel_name} ({channel_code})")
 
     # 步骤2: 预支付
-    print(f"\n[步骤 2] 正在创建支付订单...")
+    print(f"\n[步骤 3] 正在创建支付订单...")
     success, payment_data, msg = create_payment(token, sid, pay_id, pay_channel=channel_code)
     print(payment_data)
 
