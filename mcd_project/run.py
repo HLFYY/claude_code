@@ -16,15 +16,16 @@ from mcd_api import (
     get_order_validation_info, get_order_promotion_info, get_nearest_store_info,
     submit_order, get_payment_channels, create_payment
 )
+from config import DATA_DIR
 
 # 默认配置
 DEFAULT_PHONE = '17717295039'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
-STORE_FILE = 'save_selected_store.json'
-ORDER_GOODS_FILE = 'save_order_data.json'
-PAY_INFO_FILE = 'save_payment_info.json'
-PAY_MONEY_FILE = 'save_payment_money.json'
+STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
+ORDER_GOODS_FILE = os.path.join(DATA_DIR, 'save_order_data.json')
+PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
+PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
 
 def get_login_info():

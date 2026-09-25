@@ -11,6 +11,7 @@ import requests
 from datetime import datetime
 from typing import Optional, Tuple, Dict
 
+from config import DATA_DIR
 from mcd_api import (
     generate_token,
     activate_token,
@@ -51,8 +52,7 @@ class LoginManager:
 
         # 凭证文件路径
         if credentials_file is None:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            credentials_file = os.path.join(current_dir, 'credentials.json')
+            credentials_file = os.path.join(DATA_DIR, 'credentials.json')
 
         self.credentials_file = credentials_file
 
