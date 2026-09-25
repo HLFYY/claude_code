@@ -7,6 +7,8 @@
 import sys
 import json
 import os
+from datetime import datetime
+
 from login_manager import LoginManager
 from mcd_api import (
     get_nearby_stores, search_stores, get_all_cities, get_city_by_location,
@@ -19,8 +21,10 @@ from mcd_api import (
 DEFAULT_PHONE = '17717295039'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
-STORE_FILE = 'selected_store.json'
-ORDER_DATA_FILE = 'order_data.json'
+STORE_FILE = 'save_selected_store.json'
+ORDER_GOODS_FILE = 'save_order_data.json'
+PAY_INFO_FILE = 'save_payment_info.json'
+PAY_MONEY_FILE = 'save_payment_money.json'
 
 
 def get_login_info():
@@ -33,7 +37,7 @@ def get_login_info():
     print("正在获取登录信息...")
 
     login_manager = LoginManager(phone)
-    token, sid, meddy_id = login_manager.ensure_login()
+    token, sid, meddy_id = login_manager.ensure_login(auto_relogin=True)
 
     if not token or not sid:
         print("❌ 登录失败")
@@ -218,7 +222,12 @@ def order_flow():
     print("麦当劳下单流程")
     print("=" * 60)
 
-    # 1. 读取店铺信息
+    # 1. 验证登录状态并获取最新的 token/sid
+    print("\n正在验证登录状态...")
+    token, sid, meddy_id = get_login_info()
+    print("✅ 登录验证通过")
+
+    # 2. 读取店铺信息（只读取店铺相关字段，不覆盖 token/sid）
     if not os.path.exists(STORE_FILE):
         print(f"\n❌ 未找到店铺信息文件: {STORE_FILE}")
         print("请先运行: python run.py store")
@@ -227,9 +236,7 @@ def order_flow():
     with open(STORE_FILE, 'r', encoding='utf-8') as f:
         store_info = json.load(f)
 
-    token = store_info.get('token', '')
-    sid = store_info.get('sid', '')
-    meddy_id = store_info.get('meddyId', '')
+    # 只读取店铺信息，保留新获取的 token/sid/meddy_id
     store_code = store_info.get('storeCode', '')
     store_name = store_info.get('storeName', '')
     be_code = store_info.get('beCode', '')
@@ -613,87 +620,129 @@ def order_flow():
         'realTotalAmount': str(real_total_amount)
     }
 
-    with open(ORDER_DATA_FILE, 'w', encoding='utf-8') as f:
+    with open(ORDER_GOODS_FILE, 'w', encoding='utf-8') as f:
         json.dump(order_data, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ 订单数据已保存到: {ORDER_DATA_FILE}")
+    print(f"✅ 订单数据已保存到: {ORDER_GOODS_FILE}")
     print(f"   商品数: {len(cart_product_list)}")
     print(f"   订单总金额: ¥{real_total_amount}")
     print("\n提示: 运行 'python run.py payment' 提交订单并支付")
     print("=" * 60)
 
 
-def payment_flow():
-    """支付流程（自动提交订单并支付）"""
+def payment_flow(use_existing=False):
+    """支付流程（自动提交订单并支付）
+
+    Args:
+        use_existing: 是否使用已有的订单ID和支付ID（跳过提交订单步骤）
+    """
     print("=" * 60)
     print("麦当劳提交订单并支付流程")
     print("=" * 60)
 
-    # 1. 检查并读取订单数据
-    if not os.path.exists(ORDER_DATA_FILE):
-        print(f"\n❌ 未找到订单数据文件: {ORDER_DATA_FILE}")
-        print("请先运行: python run.py order")
-        sys.exit(1)
+    # 1. 验证登录状态并获取最新的 token/sid
+    print("\n正在验证登录状态...")
+    token, sid, meddy_id = get_login_info()
+    print("✅ 登录验证通过")
 
-    with open(ORDER_DATA_FILE, 'r', encoding='utf-8') as f:
-        order_data = json.load(f)
+    # 定义支付信息文件路径
 
-    token = order_data.get('token', '')
-    sid = order_data.get('sid', '')
-    meddy_id = order_data.get('meddyId', '')
-    store_code = order_data.get('storeCode', '')
-    cart_items = order_data.get('cartItems', [])
-    menu_card_list = order_data.get('menuCardList', [])
-    real_total_amount = order_data.get('realTotalAmount', '0')
-    be_type = order_data.get('beType', '1')
-    order_type = order_data.get('orderType', '1')
-    eat_type_code = order_data.get('eatTypeCode', 'eat-in')
-    tableware_code = order_data.get('tablewareCode', 'no')
-    pin_id = order_data.get('pinId', '')
-    latitude = order_data.get('latitude', DEFAULT_LATITUDE)
-    longitude = order_data.get('longitude', DEFAULT_LONGITUDE)
+    # 如果使用已有订单，直接读取订单信息
+    if use_existing:
+        if not os.path.exists(PAY_INFO_FILE):
+            print(f"\n❌ 未找到支付信息文件: {PAY_INFO_FILE}")
+            print("请先运行: python run.py payment (不带 old 参数)")
+            sys.exit(1)
 
-    print(f"\n✅ 已加载订单数据")
-    print(f"   门店: {order_data.get('storeName', '')}")
-    print(f"   商品数: {len(cart_items)}")
-    print(f"   会员卡数: {len(menu_card_list)}")
-    print(f"   订单总金额: ¥{real_total_amount}")
+        with open(PAY_INFO_FILE, 'r', encoding='utf-8') as f:
+            payment_info = json.load(f)
 
-    # 2. 提交订单
-    print(f"\n[步骤 1] 正在提交订单...")
-    success, order_result, msg = submit_order(
-        token=token,
-        sid=sid,
-        store_code=store_code,
-        cart_items=cart_items,
-        menu_card_list=menu_card_list,
-        real_total_amount=real_total_amount,
-        be_type=be_type,
-        order_type=order_type,
-        eat_type_code=eat_type_code,
-        tableware_code=tableware_code,
-        pin_id=pin_id,
-        latitude=latitude,
-        longitude=longitude
-    )
+        order_id = payment_info.get('orderId', '')
+        pay_id = payment_info.get('payId', '')
 
-    if not success:
-        print(f"❌ {msg}")
-        sys.exit(1)
+        print(f"\n✅ 已加载已有支付信息")
+        print(f"   订单ID: {order_id}")
+        print(f"   支付ID: {pay_id}")
 
-    print(f"✅ {msg}")
+    else:
+        # 正常流程：提交订单
+        # 2. 检查并读取订单数据（只读取订单相关字段，不覆盖 token/sid）
+        if not os.path.exists(ORDER_GOODS_FILE):
+            print(f"\n❌ 未找到订单商品文件: {ORDER_GOODS_FILE}")
+            print("请先运行: python run.py order")
+            sys.exit(1)
 
-    # 获取订单ID和支付ID
-    order_id = order_result.get('orderId', '')
-    pay_id = order_result.get('payId', '')
+        with open(ORDER_GOODS_FILE, 'r', encoding='utf-8') as f:
+            order_data = json.load(f)
 
-    if not order_id or not pay_id:
-        print("❌ 订单提交成功但未返回订单ID或支付ID")
-        print(f"返回数据: {order_result}")
-        sys.exit(1)
+        # 只读取订单信息，保留新获取的 token/sid/meddy_id
+        store_code = order_data.get('storeCode', '')
+        cart_items = order_data.get('cartItems', [])
+        menu_card_list = order_data.get('menuCardList', [])
+        real_total_amount = order_data.get('realTotalAmount', '0')
+        be_type = order_data.get('beType', '1')
+        order_type = order_data.get('orderType', '1')
+        eat_type_code = order_data.get('eatTypeCode', 'eat-in')
+        tableware_code = order_data.get('tablewareCode', 'no')
+        pin_id = order_data.get('pinId', '')
+        latitude = order_data.get('latitude', DEFAULT_LATITUDE)
+        longitude = order_data.get('longitude', DEFAULT_LONGITUDE)
 
-    print(f"\n订单ID: {order_id}")
-    print(f"支付ID: {pay_id}")
+        print(f"\n✅ 已加载订单商品数据")
+        print(f"   门店: {order_data.get('storeName', '')}")
+        print(f"   商品数: {len(cart_items)}")
+        print(f"   会员卡数: {len(menu_card_list)}")
+        print(f"   订单总金额: ¥{real_total_amount}")
+
+        # 2. 提交订单
+        print(f"\n[步骤 1] 正在提交订单...")
+        success, order_result, msg = submit_order(
+            token=token,
+            sid=sid,
+            store_code=store_code,
+            cart_items=cart_items,
+            menu_card_list=menu_card_list,
+            real_total_amount=real_total_amount,
+            be_type=be_type,
+            order_type=order_type,
+            eat_type_code=eat_type_code,
+            tableware_code=tableware_code,
+            pin_id=pin_id,
+            latitude=latitude,
+            longitude=longitude
+        )
+
+        if not success:
+            print(f"❌ {msg}")
+            sys.exit(1)
+
+        print(f"✅ {msg}")
+
+        # 获取订单ID和支付ID
+        order_id = order_result.get('orderId', '')
+        pay_id = order_result.get('payId', '')
+
+        if not order_id or not pay_id:
+            print("❌ 订单提交成功但未返回订单ID或支付ID")
+            print(f"返回数据: {order_result}")
+            sys.exit(1)
+
+        print(f"\n订单ID: {order_id}")
+        print(f"支付ID: {pay_id}")
+
+        # 保存支付信息到文件，供后续使用
+        payment_info = {
+            'orderId': order_id,
+            'payId': pay_id,
+            'realTotalAmount': real_total_amount,
+            'storeName': order_data.get('storeName', ''),
+            'timestamp': datetime.now().isoformat()
+        }
+
+        with open(PAY_INFO_FILE, 'w', encoding='utf-8') as f:
+            json.dump(payment_info, f, ensure_ascii=False, indent=2)
+
+        print(f"✅ 支付信息已保存到: {PAY_INFO_FILE}")
 
     # 步骤1: 获取支付渠道
     print(f"\n[步骤 2] 正在获取支付渠道...")
@@ -756,7 +805,58 @@ def payment_flow():
     channel_pay_data = payment_data.get('channelPayData', '')
     if channel_pay_data:
         print(f"\n支付数据已生成 (长度: {len(channel_pay_data)} 字符)")
-        print("💡 提示: 将 channelPayData 传递给对应的支付 SDK 完成支付")
+
+        # 解析支付数据
+        try:
+            pay_data_json = json.loads(channel_pay_data)
+
+            # 提取关键信息
+            method = pay_data_json.get('method', '')
+            biz_content_str = pay_data_json.get('biz_content', '')
+
+            if biz_content_str:
+                biz_content = json.loads(biz_content_str)
+                out_trade_no = biz_content.get('out_trade_no', '')
+                total_amount = biz_content.get('total_amount', '')
+                subject = biz_content.get('subject', '')
+
+                print(f"\n支付信息:")
+                print(f"  支付方式: {method}")
+                print(f"  商户: {subject}")
+                print(f"  金额: ¥{total_amount}")
+                print(f"  交易号: {out_trade_no}")
+
+            # 保存支付字符串到文件
+            with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
+                f.write(channel_pay_data)
+
+            print(f"\n✅ 支付字符串已保存到: {PAY_MONEY_FILE}")
+            print(f"\n⚠️  重要说明:")
+            print("支付宝 APP 支付需要在移动端调用支付宝 SDK，不能通过链接或二维码完成。")
+            print("\n有以下几种支付方式:")
+            print("\n1. 【推荐】在麦当劳官方 APP 中完成支付")
+            print("   - 这是麦当劳设计的正常支付流程")
+            print("   - APP 会调用支付宝 SDK 并传入支付字符串")
+
+            print("\n2. 如需测试支付接口，可以:")
+            print("   - 开发移动端应用并集成支付宝 SDK")
+            print("   - 调用 AlipaySDK.payV2(paymentString, fromScheme)")
+            print(f"   - 支付字符串已保存在: {PAY_MONEY_FILE}")
+
+            print("\n3. 查看完整支付数据 (用于调试)")
+            view_data = input("\n是否查看完整支付数据? (y/n): ").strip().lower()
+
+            if view_data == 'y':
+                print(f"\n完整支付数据:")
+                print(json.dumps(pay_data_json, ensure_ascii=False, indent=2))
+
+        except json.JSONDecodeError:
+            print("⚠️  无法解析支付数据，显示原始内容:")
+            print(channel_pay_data)
+        except Exception as e:
+            print(f"⚠️  处理支付数据时出错: {str(e)}")
+            print(f"\n原始支付数据:")
+            print(channel_pay_data)
 
     print("\n流程结束")
     print("=" * 60)
@@ -767,7 +867,8 @@ def main():
         print("用法:")
         print("  python run.py store   - 选择店铺")
         print("  python run.py order   - 下单流程")
-        print("  python run.py payment - 支付流程")
+        print("  python run.py payment - 支付流程（提交订单并保存支付信息）")
+        print("  python run.py payment old - 使用已保存的订单ID和支付ID")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -777,7 +878,9 @@ def main():
     elif mode == 'order':
         order_flow()
     elif mode == 'payment':
-        payment_flow()
+        # 检查是否有 old 参数
+        use_existing = len(sys.argv) > 2 and sys.argv[2] == 'old'
+        payment_flow(use_existing=use_existing)
     else:
         print(f"❌ 未知模式: {mode}")
         print("支持的模式: store, order, payment")

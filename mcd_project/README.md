@@ -1,41 +1,72 @@
 # 麦当劳 API 项目
 
-一个完整的麦当劳 App API 逆向工程项目，支持登录、多账号管理、店铺查询、商品浏览、购物车管理、订单流程等功能。
+一个完整的麦当劳中国 App API 逆向工程项目，实现了从登录、选店、点餐到支付的完整下单流程。
+
+## 项目特性
+
+✅ **完整的三步流程**
+- 店铺选择（附近店铺/搜索店铺）
+- 商品点餐（支持多商品、规格选择、自动处理优惠券）
+- 订单支付（自动提交订单、生成支付宝支付链接/二维码）
+
+✅ **登录管理**
+- 多账号支持
+- 自动检测登录状态
+- Token 过期自动重新登录
+
+✅ **API 完整实现**
+- V4 签名算法（HMAC-SHA256）
+- AES-128-ECB 加密
+- 所有核心业务接口
 
 ## 项目结构
 
 ```
 mcd_project/
-├── mcd_api.py              # 核心 API 功能（签名、加密、所有业务接口、密钥配置）
+├── mcd_api.py              # 核心 API 功能（签名、加密、所有业务接口）
 ├── login_manager.py        # 登录管理类（多账号、状态检查、凭证管理）
-├── run.py                  # 店铺查找和下单流程测试脚本
-├── use_login_manager.py    # 登录管理器测试脚本（5个测试场景）
+├── run.py                  # 主流程脚本（店铺/点餐/支付三步流程）
+├── test_add_all_categories.py  # 测试每个分类第一个商品
+├── use_login_manager.py    # 登录管理器测试脚本
 ├── demo.py                 # 清空购物车演示脚本
 ├── credentials.json        # 登录凭证存储（自动生成）
-└── README.md              # 项目文档
+├── selected_store.json     # 当前选择的店铺信息（自动生成）
+└── order_data.json         # 待支付订单数据（自动生成）
 ```
 
 ## 快速开始
 
-### 使用测试脚本
+### 完整下单流程（推荐）
 
 ```bash
-# 测试登录管理器（包含5个测试场景）
-python3 use_login_manager.py
-
-# 清空购物车演示
-python3 demo.py
-```
-
-### 完整下单流程
-
-```bash
-# 第一步：选择店铺
+# 第一步：选择店铺（附近店铺或搜索）
 python run.py store
 
-# 第二步：测试下单流程（需要先执行 store）
+# 第二步：点餐添加商品到购物车
 python run.py order
+
+# 第三步：提交订单并生成支付链接
+python run.py payment
 ```
+
+每步执行完会自动保存状态，下一步自动读取。所有流程开始前会自动验证登录状态。
+
+### 测试脚本
+
+```bash
+# 测试每个分类的第一个商品能否添加购物车
+python test_add_all_categories.py
+
+# 测试登录管理器（5个场景）
+python use_login_manager.py
+
+# 清空购物车演示
+python demo.py
+```
+
+## 登录管理器 API
+
+### 基本用法
 
 ```python
 from login_manager import LoginManager
@@ -43,17 +74,16 @@ from login_manager import LoginManager
 # 创建登录管理器
 manager = LoginManager(phone="17717295039")
 
-# 检查登录状态（如果凭证有效直接返回，否则返回 None）
-token, sid, meddy_id = manager.ensure_login(auto_relogin=False)
+# 自动检查并登录（如失效会提示输入验证码）
+token, sid, meddy_id = manager.ensure_login(auto_relogin=True)
 
 if token:
     print(f"登录成功")
-    print(f"Token: {token}")
-else:
-    print("需要重新登录")
 ```
 
-### 2. 手动登录流程
+### 使用场景
+
+**1. 检查登录状态**
 
 ```python
 from login_manager import LoginManager
@@ -120,7 +150,7 @@ if token and sid:
         print(f"积分: {user_info['points']}")
 ```
 
-## mcd_api.py 已实现的接口
+## mcd_api.py 核心接口
 
 ### 登录相关
 - `generate_token()` - 生成设备 Token
@@ -131,128 +161,31 @@ if token and sid:
 
 ### 城市和店铺
 - `get_all_cities(token, sid, meddy_id)` - 获取所有城市信息
-- `get_current_city(latitude, longitude, token, sid, meddy_id)` - 通过经纬度获取当前城市
-- `search_stores(city_code, keyword, token, sid, meddy_id, page_no=1, page_size=10)` - 搜索店铺
-- `get_nearby_stores(latitude, longitude, token, sid, meddy_id, show_type=2, order_type=1)` - 获取附近店铺
+- `get_city_by_location(latitude, longitude, token, sid, meddy_id)` - 通过经纬度获取当前城市
+- `search_stores(city_code, keyword, token, sid, meddy_id, ...)` - 搜索店铺
+- `get_nearby_stores(token, sid, latitude, longitude, ...)` - 获取附近店铺
 
 ### 商品和菜单
-- `get_store_menu(store_code, token, sid, meddy_id, order_type=1, day_part_code="5")` - 获取店铺商品菜单
-- `get_product_detail(product_code, store_code, token, sid, meddy_id, ...)` - 获取商品详情
+- `get_store_menu(token, sid, store_code, be_code, ...)` - 获取店铺商品菜单
+- `get_product_detail(token, sid, product_code, store_code, ...)` - 获取商品详情
 
 ### 购物车
-- `empty_cart(store_code, token, sid, meddy_id, ...)` - 清空购物车
-- `update_cart(products, store_code, token, sid, meddy_id, ...)` - 更新购物车（加入/删除商品）
+- `clear_cart(token, sid, store_code, be_code, ...)` - 清空购物车
+- `add_to_cart(token, sid, store_code, be_code, product_code, ...)` - 添加商品到购物车
 
 ### 订单相关
-- `get_order_validation_info(store_code, token, sid, meddy_id, ...)` - 获取订单验证信息
-- `get_order_promotion(cart_items, store_code, token, sid, meddy_id, ...)` - 获取促销/优惠券信息
-- `get_nearest_store(store_code, latitude, longitude, token, sid, meddy_id)` - 获取门店信息
-- `get_payment_channels(order_id, pay_id, mcd_id, token, sid, meddy_id)` - 获取支付渠道
-- `submit_order(...)` - 提交订单（需要 v5 签名，暂不可用）
-- `preorder_payment(...)` - 预支付（需先完成提交订单）
+- `get_order_validation_info(token, sid, store_code, ...)` - 获取订单验证信息
+- `get_order_promotion_info(token, sid, store_code, cart_items, ...)` - 获取促销/优惠券信息
+- `get_nearest_store_info(token, sid, store_code, ...)` - 获取门店信息
+- `submit_order(token, sid, ...)` - 提交订单
+- `get_payment_channels(token, sid, order_id, pay_id, ...)` - 获取支付渠道
+- `create_payment(token, sid, order_id, pay_id, ...)` - 创建支付
 
-## LoginManager 类 API
-
-### 构造函数
-
-```python
-LoginManager(phone: str, credentials_file: str = None)
-```
-
-- `phone`: 手机号（11位）
-- `credentials_file`: 凭证文件路径（可选，默认为当前目录下的 credentials.json）
-
-### 主要方法
-
-#### `ensure_login(auto_relogin: bool = False)`
-
-确保已登录状态。
-
-- 参数：
-  - `auto_relogin`: 如果凭证失效，是否自动重新登录（需要手动输入验证码）
-- 返回：`(token, sid, meddy_id)` 或 `(None, None, None)`
-
-#### `send_verify_code()`
-
-发送验证码（会自动生成并激活 token）。
-
-- 返回：`(success, message)`
-
-#### `do_login(verify_code: str)`
-
-使用验证码登录。
-
-- 参数：
-  - `verify_code`: 6位短信验证码
-- 返回：`(success, message)`
-
-#### `check_login_status()`
-
-检查当前登录状态是否有效。
-
-- 返回：`(is_valid, user_info)`
-
-#### `load_credentials()`
-
-从文件加载指定手机号的登录凭证。
-
-- 返回：`(token, sid, meddy_id)` 或 `(None, None, None)`
-
-#### `save_credentials(token, sid, meddy_id)`
-
-保存登录凭证到文件。
-
-#### `get_credentials()`
-
-获取当前内存中的凭证。
-
-- 返回：`(token, sid, meddy_id)`
-
-#### `clear_credentials()`
-
-清除当前手机号的凭证（从文件和内存中删除）。
-
-## 测试
-
-运行测试脚本：
-
-```bash
-python3 use_login_manager.py
-```
-
-测试包括：
-1. 基本用法（检查登录状态）
-2. 手动登录流程
-3. 自动重新登录
-4. 多账号管理
-5. 仅检查登录状态
-
-## 凭证文件格式
-
-`credentials.json` 支持多账号存储：
-
-```json
-{
-  "16752934813": {
-    "token": "5a56a1ad7c1d48edbf8db6c209034712",
-    "sid": "c79997abd0c02824e5178aac7d9a3dc1_",
-    "meddy_id": "MEDDY163321681473498257",
-    "saved_at": "2026-09-24T15:30:00"
-  },
-  "13800138000": {
-    "token": "...",
-    "sid": "...",
-    "meddy_id": "...",
-    "saved_at": "2026-09-24T16:00:00"
-  }
-}
-```
-
-### 技术实现
+## 技术实现
 
 ### 签名算法
 
-使用 HMAC-SHA256 签名：
+使用 HMAC-SHA256 签名（V4 版本）：
 
 - **V4AK**: `HJ7YLqOY06F61FPEhF7H`（Access Key）
 - **V4SK**: `JURCUMJRrQRI8gkB1mGrL9vexmkGgpLgxJ96Yovp`（Sign Key）
@@ -268,7 +201,7 @@ python3 use_login_manager.py
 <空行>
 ```
 
-#### AES 加密
+### AES 加密
 
 手机号和验证码使用 AES-128-ECB 加密：
 
@@ -277,12 +210,78 @@ python3 use_login_manager.py
 - **填充**: PKCS7
 - **编码**: Base64
 
+### 购物车 API 实现细节
+
+通过抓包对比发现，购物车接口使用 **PUT** 方法而非 POST，且需要：
+
+1. **完整的商品规格信息**：包括 `modification.optionGroups` 和 `modification.values`
+2. **daypartCode**：时段代码，通过 `get_product_detail` 获取
+3. **正确的请求体结构**：完整的商品、门店、订单信息
+
+## 流程说明
+
+### 1. 店铺选择流程 (store)
+
+- 选择附近店铺或搜索店铺
+- 自动保存到 `selected_store.json`
+- 保存店铺代码、名称、BE代码、经纬度等信息
+
+### 2. 点餐流程 (order)
+
+- 验证登录状态（自动刷新 token）
+- 加载店铺信息
+- 获取菜单并选择分类和商品
+- 获取商品详情（包含规格、daypartCode）
+- 支持循环添加多个商品
+- 自动处理优惠券和会员卡
+- 保存订单数据到 `order_data.json`
+
+### 3. 支付流程 (payment)
+
+- 验证登录状态
+- 加载订单数据
+- 提交订单获取订单ID和支付ID
+- 获取支付渠道
+- 创建支付并生成支付宝支付数据
+- **保存支付信息到 `payment_info.json`**
+
+**支付方式**：
+```bash
+# 正常模式：提交订单并保存支付信息
+python run.py payment
+
+# 使用已有订单：直接读取已保存的订单ID和支付ID
+python run.py payment old
+```
+
+**⚠️ 支付数据说明**：
+- 麦当劳返回的 `channelPayData` 是**支付宝 APP 支付**专用字符串
+- **不能**通过二维码扫描或支付链接完成支付
+- 只能在以下场景使用：
+  1. **麦当劳官方 APP** 内调用支付宝 SDK
+  2. **自己开发的移动应用**中集成支付宝 SDK 后调用
+- 支付字符串会自动保存到 `alipay_payment_*.txt` 文件供移动端使用
+
 ## 注意事项
 
-1. 登录凭证可能会失效（例如在其他设备登录）
-2. 验证码有效期约 5 分钟
-3. 建议在每次 API 请求前检查登录状态
-4. 凭证文件包含敏感信息，请妥善保管
+1. **登录凭证管理**
+   - 所有流程开始前会自动验证登录状态
+   - Token 过期会自动触发重新登录
+   - 多账号支持，凭证存储在 `credentials.json`
+
+2. **商品规格处理**
+   - 某些商品（咖啡、饮品）必须选择规格才能添加
+   - 需要先调用 `get_product_detail` 获取完整规格信息
+   - `modification` 结构必须完整才能添加成功
+
+3. **时段代码 (daypartCode)**
+   - 不同时段商品可能不同
+   - 通过 `get_product_detail` 获取当前时段的 daypartCode
+
+4. **支付流程**
+   - 支持支付宝支付
+   - 生成的支付链接可在手机浏览器打开
+   - 或生成二维码用支付宝扫码支付
 
 ## License
 
