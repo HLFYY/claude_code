@@ -391,7 +391,38 @@ def order_flow():
 
         print(f"✅ {msg}")
         detail_data = detail_data.get('product', {})
-        detail_name = detail_data.get('name', product_name)
+
+        # 处理产品组 (G开头的code)
+        # 如果是产品组，需要选择具体的SKU
+        actual_product_code = product_code
+        actual_product_name = product_name
+        actual_product_image = product_image
+        modification = None
+        suggestion_embedding = ''
+
+        if product_code.startswith('G'):
+            # 这是产品组，需要获取具体的SKU列表
+            products = detail_data.get('products', [])
+            if products:
+                # 默认选择第一个SKU（通常是默认规格）
+                first_sku = products[0]
+                actual_product_code = first_sku.get('code', product_code)
+                actual_product_name = first_sku.get('name', product_name)
+                actual_product_image = first_sku.get('image', product_image)
+
+                # 提取默认的modification
+                from mcd_api import extract_default_modification
+                modification = extract_default_modification(first_sku)
+
+                print(f"  检测到产品组，自动选择默认规格: {actual_product_name} ({actual_product_code})")
+            else:
+                print(f"⚠️  产品组 {product_code} 没有可用的SKU")
+        else:
+            # 单品，提取默认modification（如果有）
+            from mcd_api import extract_default_modification
+            modification = extract_default_modification(detail_data)
+
+        detail_name = detail_data.get('name', actual_product_name)
         origin_price = detail_data.get('price', 0) / 100
         real_price = origin_price
         real_bt = ''
@@ -418,9 +449,11 @@ def order_flow():
         print(f"\n正在添加商品到购物车...")
         success, cart_data, msg = add_to_cart(
             token, sid, store_code, be_code,
-            product_code=product_code,
-            product_name=product_name,
-            product_image=product_image,
+            product_code=actual_product_code,
+            product_name=actual_product_name,
+            product_image=actual_product_image,
+            modification=modification,
+            suggestion_embedding=suggestion_embedding,
             quantity=1,
             order_type=1,
             store_name=store_name
@@ -430,8 +463,8 @@ def order_flow():
             print(f"❌ {msg}")
             continue
 
-        # 更新已添加商品记录
-        added_products[product_code] = added_products.get(product_code, 0) + 1
+        # 更新已添加商品记录（使用实际的SKU code）
+        added_products[actual_product_code] = added_products.get(actual_product_code, 0) + 1
 
         cart_detail = cart_data.get('cartDetail', {})
         cart_products = cart_detail.get('products', [])
@@ -488,10 +521,22 @@ def order_flow():
         sub_text = option.get('subText', '')
         print(f"  - {sub_text}")
 
-    # 展示总价
+    # 展示总价（使用实际支付价格）
     product_price_info = confirm_info.get('productPriceInfo', {})
+    real_total_amount = product_price_info.get('realTotalAmount', 0)
     total_amount = product_price_info.get('totalAmount', 0)
-    print(f"\n总价: ¥{total_amount}")
+
+    # 转换为浮点数进行计算
+    real_total_float = float(real_total_amount) if real_total_amount else 0
+    total_float = float(total_amount) if total_amount else 0
+
+    # 显示价格信息
+    if real_total_float != total_float:
+        discount = total_float - real_total_float
+        print(f"\n原价: ¥{total_float}")
+        print(f"实付: ¥{real_total_float} (优惠 ¥{discount})")
+    else:
+        print(f"\n总价: ¥{real_total_float}")
 
     # 确认是否继续
     confirm = input("\n是否继续? (y/n): ").strip().lower()
@@ -565,7 +610,7 @@ def order_flow():
         'pinId': '',
         'latitude': latitude,
         'longitude': longitude,
-        'realTotalAmount': str(total_amount)
+        'realTotalAmount': str(real_total_amount)
     }
 
     with open(ORDER_DATA_FILE, 'w', encoding='utf-8') as f:
@@ -573,7 +618,7 @@ def order_flow():
 
     print(f"✅ 订单数据已保存到: {ORDER_DATA_FILE}")
     print(f"   商品数: {len(cart_product_list)}")
-    print(f"   订单总金额: ¥{total_amount}")
+    print(f"   订单总金额: ¥{real_total_amount}")
     print("\n提示: 运行 'python run.py payment' 提交订单并支付")
     print("=" * 60)
 

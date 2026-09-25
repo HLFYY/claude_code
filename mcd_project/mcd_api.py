@@ -776,8 +776,42 @@ def clear_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=No
         return False, {}, f"请求异常: {str(e)}"
 
 
+def extract_default_modification(product_detail):
+    """
+    从产品详情中提取默认的 modification 结构
+
+    Args:
+        product_detail: 产品详情数据 (来自 get_product_detail 的返回)
+
+    Returns:
+        modification 字典，格式: {"values": [{"code": "xxx", "key": "0-1", "quantity": 1}]}
+        如果没有默认规格则返回 None
+    """
+    modification = product_detail.get('modification', {})
+    items = modification.get('items', [])
+
+    if not items:
+        return None
+
+    values = []
+    for item in items:
+        item_values = item.get('values', [])
+        for val in item_values:
+            if val.get('selectedQuantity', 0) > 0:
+                values.append({
+                    "code": val.get('code'),
+                    "key": val.get('selectedKey'),
+                    "quantity": val.get('selectedQuantity')
+                })
+
+    if values:
+        return {"values": values}
+    return None
+
+
 def add_to_cart(token, sid, store_code, be_code='', product_code='', product_name='', product_image='',
                 quantity=1, order_type=1, daypart_code=None, product_type='1', combo_items=None,
+                modification=None, suggestion_embedding='',
                 store_name='', channel_code='03', order_mode='0', pin_id='', pickup_time_type='',
                 card_id='', card_type=0, coupon_code='', coupon_id='', gm_assist_service_code='',
                 membership_code='', sequence=-1, animation_id=''):
@@ -797,6 +831,8 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         daypart_code: 时段编码 (None=自动获取)
         product_type: 商品类型 (1=单品, 7=套餐)
         combo_items: 套餐子项列表 (仅套餐需要)
+        modification: 商品规格修改 (如冰度、配料等)
+        suggestion_embedding: 推荐嵌入数据
         store_name: 店铺名称
         channel_code: 渠道代码 (默认'03')
         order_mode: 订单模式 (默认'0')
@@ -838,6 +874,14 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         "sequence": sequence,
         "type": product_type
     }
+
+    # 添加规格修改 (modification)
+    if modification:
+        product_data["modification"] = modification
+
+    # 添加推荐嵌入数据 (suggestionEmbedding)
+    if suggestion_embedding:
+        product_data["suggestionEmbedding"] = suggestion_embedding
 
     # 如果是套餐，添加套餐子项
     if combo_items:
