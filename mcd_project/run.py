@@ -514,8 +514,7 @@ def order_flow():
     product_status_list = validation_info.get('productStatusList', [])
     if product_status_list:
         all_product_name = [pdata['name'] for pdata in product_status_list if pdata.get('name', '')]
-        print(f"\n商品: {','.join(all_product_name)}")
-        print("订单商品列表:")
+        print("\n订单商品列表:")
         for idx, pname in enumerate(all_product_name, 1):
             print(f"  {idx}. {pname}")
 
@@ -831,20 +830,20 @@ def payment_flow(use_existing=False):
             with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
                 f.write(channel_pay_data)
 
-            print(f"\n✅ 支付字符串已保存到: {PAY_MONEY_FILE}")
-            print(f"\n⚠️  重要说明:")
-            print("支付宝 APP 支付需要在移动端调用支付宝 SDK，不能通过链接或二维码完成。")
-            print("\n有以下几种支付方式:")
-            print("\n1. 【推荐】在麦当劳官方 APP 中完成支付")
-            print("   - 这是麦当劳设计的正常支付流程")
-            print("   - APP 会调用支付宝 SDK 并传入支付字符串")
-
-            print("\n2. 如需测试支付接口，可以:")
-            print("   - 开发移动端应用并集成支付宝 SDK")
-            print("   - 调用 AlipaySDK.payV2(paymentString, fromScheme)")
-            print(f"   - 支付字符串已保存在: {PAY_MONEY_FILE}")
-
-            print("\n3. 查看完整支付数据 (用于调试)")
+            # print(f"\n✅ 支付字符串已保存到: {PAY_MONEY_FILE}")
+            # print(f"\n⚠️  重要说明:")
+            # print("支付宝 APP 支付需要在移动端调用支付宝 SDK，不能通过链接或二维码完成。")
+            # print("\n有以下几种支付方式:")
+            # print("\n1. 【推荐】在麦当劳官方 APP 中完成支付")
+            # print("   - 这是麦当劳设计的正常支付流程")
+            # print("   - APP 会调用支付宝 SDK 并传入支付字符串")
+            #
+            # print("\n2. 如需测试支付接口，可以:")
+            # print("   - 开发移动端应用并集成支付宝 SDK")
+            # print("   - 调用 AlipaySDK.payV2(paymentString, fromScheme)")
+            # print(f"   - 支付字符串已保存在: {PAY_MONEY_FILE}")
+            #
+            # print("\n3. 查看完整支付数据 (用于调试)")
             view_data = input("\n是否查看完整支付数据? (y/n): ").strip().lower()
 
             if view_data == 'y':
