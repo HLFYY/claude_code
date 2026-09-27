@@ -1290,9 +1290,44 @@ def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, so
         return False, {}, f"请求异常: {str(e)}"
 
 
+def get_order_list(token, sid, cursor='', page_size=10):
+    """
+    获取账号订单列表 (对应 curl: /bff/order/orders/list)
+
+    Args:
+        token: 设备 Token
+        sid: 会话 SID
+        cursor: 分页游标（空字符串表示第一页）
+        page_size: 每页数量（默认10）
+
+    Returns:
+        (success, order_list_data, message)
+    """
+    body_data = {
+        "cursor": cursor,
+        "pageSize": page_size
+    }
+    body_str = json.dumps(body_data, separators=(',', ':'))
+
+    headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/order/orders/list')
+    url = f'{API_BASE}/bff/order/orders/list'
+
+    try:
+        response = requests.post(url, headers=headers, data=body_str, timeout=10)
+        result = response.json()
+
+        if result.get('success'):
+            data = result.get('data', {})
+            return True, data, "获取订单列表成功"
+        else:
+            return False, {}, result.get('message', '获取订单列表失败')
+    except Exception as e:
+        return False, {}, f"请求异常: {str(e)}"
+
+
 def get_order_detail(token, sid, order_id):
     """
-    获取订单详情
+    获取订单详情 (对应 curl: /bff/order/orders/{order_id})
 
     Args:
         token: 设备 Token

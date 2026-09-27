@@ -7,60 +7,44 @@
   "beCode": "",
   "cartItems": [
     {
-      "uniqueKey": "9900015847-1",
+      "uniqueKey": "9900015849-1",
       "sequence": 1,
-      "productCode": "9900015847",
-      "id": "1-9900015847",
-      "productName": "麦麦顶“瓜瓜”套餐",
+      "productCode": "9900015849",
+      "id": "1-9900015849",
+      "productName": "众星捧月小食拼盘",
       "productType": "7",
-      "realSubtotal": "59.9",
+      "realSubtotal": "39.9",
       "quantity": 1,
       "tags": [],
       "saleStatus": 1,
-      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/20260924/product/MS_9900015847_320.png",
-      "price": "59.9",
-      "subtotal": "59.9",
+      "productImage": "https://menu-img.mcd.cn/pcm/prod/menu/ProductPool/product/MS_9900015849_320.png",
+      "price": "39.9",
+      "subtotal": "39.9",
       "comboItemList": [
-        {
-          "productCode": "516020",
-          "name": "中薯条",
-          "quantity": 1
-        },
-        {
-          "productCode": "516013",
-          "name": "麦辣鸡翅-2块",
-          "quantity": 1
-        },
         {
           "productCode": "516014",
           "name": "麦乐鸡-5块",
           "quantity": 1
         },
         {
-          "productCode": "521900",
-          "name": "咸蛋黄鸡腿蛋月堡",
+          "productCode": "521902",
+          "name": "月下相思扭扭薯",
           "quantity": 1
         },
         {
-          "productCode": "3050",
-          "name": "可乐中杯",
+          "productCode": "516012",
+          "name": "麦麦脆汁鸡-琵琶腿",
           "quantity": 1
         },
         {
-          "productCode": "521914",
-          "name": "麦当劳燕云“葱不求人”按摩捶痒痒挠",
+          "productCode": "516013",
+          "name": "麦辣鸡翅-2块",
           "quantity": 1
         }
       ],
       "actions": [
         2
-      ],
-      "trackingInfo": {
-        "grillInfo": [
-          "咸蛋黄沙拉酱_0_120548",
-          "冰_0_200002"
-        ]
-      }
+      ]
     }
   ],
   "menuCardList": [
@@ -78,5 +62,5 @@
   "pinId": "",
   "latitude": 31.140296,
   "longitude": 120.656772,
-  "realTotalAmount": "59.9"
+  "realTotalAmount": "39.9"
 }

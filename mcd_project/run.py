@@ -14,7 +14,7 @@ from mcd_api import (
     get_nearby_stores, search_stores, get_all_cities, get_city_by_location,
     get_store_menu, get_product_detail, clear_cart, add_to_cart,
     get_order_validation_info, get_order_promotion_info, get_nearest_store_info,
-    submit_order, get_payment_channels, create_payment
+    submit_order, get_payment_channels, create_payment, get_order_detail, get_order_list
 )
 from config import DATA_DIR
 
@@ -645,9 +645,7 @@ def payment_flow(use_existing=False):
     token, sid, meddy_id = get_login_info()
     print("✅ 登录验证通过")
 
-    # 定义支付信息文件路径
-
-    # 如果使用已有订单，直接读取订单信息
+    # 如果使用已有订单，先查询订单详情检查状态
     if use_existing:
         if not os.path.exists(PAY_INFO_FILE):
             print(f"\n❌ 未找到支付信息文件: {PAY_INFO_FILE}")
@@ -663,6 +661,52 @@ def payment_flow(use_existing=False):
         print(f"\n✅ 已加载已有支付信息")
         print(f"   订单ID: {order_id}")
         print(f"   支付ID: {pay_id}")
+
+        # 查询订单详情检查状态
+        print(f"\n正在查询订单详情...")
+        success, order_detail, msg = get_order_detail(token, sid, order_id)
+
+        if not success:
+            print(f"❌ {msg}")
+            sys.exit(1)
+
+        print(f"✅ {msg}")
+
+        # 获取订单状态
+        order_status_code = order_detail.get('orderStatusCode', '')
+        order_status = order_detail.get('orderStatus', '')
+        mp_order_status_code = order_detail.get('mpOrderStatusCode', '')
+
+        print(f"\n订单状态:")
+        print(f"  状态码: {order_status_code}")
+        print(f"  状态: {order_status}")
+        print(f"  MP状态码: {mp_order_status_code}")
+
+        # 判断订单状态（已确认的映射关系）
+        # orderStatusCode: 1=待支付（确认）, 7=已取消（确认）, 2-6=已支付及后续状态（待验证）
+        # mpOrderStatusCode: 10=待支付（确认）, 60=已取消（确认）
+
+        # 检查是否为已取消状态
+        if order_status_code == '7' and mp_order_status_code == '60':
+            print(f"\n❌ 订单已取消，无法继续支付")
+            print(f"   订单状态: {order_status}")
+            print(f"   状态码: orderStatusCode={order_status_code}, mpOrderStatusCode={mp_order_status_code}")
+            sys.exit(1)
+
+        # 检查是否为待支付状态
+        if order_status_code == '1' and mp_order_status_code == '10':
+            print(f"\n✅ 订单状态为待支付，继续支付流程")
+        else:
+            # 其他所有状态都不允许支付（可能已支付/已完成等）
+            print(f"\n⚠️  订单不是待支付状态，无法继续支付")
+            print(f"   订单状态: {order_status}")
+            print(f"   状态码: orderStatusCode={order_status_code}, mpOrderStatusCode={mp_order_status_code}")
+
+            # 提示可能的状态（待验证）
+            if order_status_code in ['2', '3', '4', '5', '6']:
+                print(f"   提示: 可能已支付或已完成")
+
+            sys.exit(1)
 
     else:
         # 正常流程：提交订单
@@ -747,7 +791,7 @@ def payment_flow(use_existing=False):
     # 步骤1: 获取支付渠道
     print(f"\n[步骤 2] 正在获取支付渠道...")
     success, channels_data, msg = get_payment_channels(token, sid, order_id, pay_id, meddy_id)
-    print(channels_data)
+
     if not success:
         print(f"❌ {msg}")
         sys.exit(1)
@@ -787,7 +831,6 @@ def payment_flow(use_existing=False):
     # 步骤2: 预支付
     print(f"\n[步骤 3] 正在创建支付订单...")
     success, payment_data, msg = create_payment(token, sid, pay_id, pay_channel=channel_code)
-    print(payment_data)
 
     if not success:
         print(f"❌ {msg}")
@@ -830,20 +873,6 @@ def payment_flow(use_existing=False):
             with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
                 f.write(channel_pay_data)
 
-            # print(f"\n✅ 支付字符串已保存到: {PAY_MONEY_FILE}")
-            # print(f"\n⚠️  重要说明:")
-            # print("支付宝 APP 支付需要在移动端调用支付宝 SDK，不能通过链接或二维码完成。")
-            # print("\n有以下几种支付方式:")
-            # print("\n1. 【推荐】在麦当劳官方 APP 中完成支付")
-            # print("   - 这是麦当劳设计的正常支付流程")
-            # print("   - APP 会调用支付宝 SDK 并传入支付字符串")
-            #
-            # print("\n2. 如需测试支付接口，可以:")
-            # print("   - 开发移动端应用并集成支付宝 SDK")
-            # print("   - 调用 AlipaySDK.payV2(paymentString, fromScheme)")
-            # print(f"   - 支付字符串已保存在: {PAY_MONEY_FILE}")
-            #
-            # print("\n3. 查看完整支付数据 (用于调试)")
             view_data = input("\n是否查看完整支付数据? (y/n): ").strip().lower()
 
             if view_data == 'y':
@@ -857,6 +886,41 @@ def payment_flow(use_existing=False):
             print(f"⚠️  处理支付数据时出错: {str(e)}")
             print(f"\n原始支付数据:")
             print(channel_pay_data)
+
+    # 步骤3: 查询账号订单列表
+    print(f"\n[步骤 4] 正在查询账号订单列表...")
+    success, order_list_data, msg = get_order_list(token, sid, cursor='', page_size=10)
+
+    if not success:
+        print(f"❌ {msg}")
+    else:
+        print(f"✅ {msg}")
+
+        order_list = order_list_data.get('list', [])
+        has_next = order_list_data.get('hasNext', False)
+
+        if order_list:
+            print(f"\n最近 {len(order_list)} 个订单:")
+            print("-" * 80)
+            for idx, order_item in enumerate(order_list, 1):
+                oms_order = order_item.get('omsOrder', {})
+                order_id_display = oms_order.get('orderId', '')
+                create_time = oms_order.get('createTime', '')
+                order_status = oms_order.get('orderStatus', '')
+                store_name = oms_order.get('storeName', '')
+                real_total = oms_order.get('realTotalAmount', '')
+
+                print(f"{idx}. 订单ID: {order_id_display}")
+                print(f"   时间: {create_time}")
+                print(f"   状态: {order_status}")
+                print(f"   门店: {store_name}")
+                print(f"   金额: ¥{real_total}")
+                print("-" * 80)
+
+            if has_next:
+                print("提示: 还有更多订单，可以使用分页查询")
+        else:
+            print("\n暂无订单记录")
 
     print("\n流程结束")
     print("=" * 60)
