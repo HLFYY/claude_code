@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-麦当劳下单流程测试脚本
+麦当劳下单流程测试脚本 - API 客户端版本
+通过 Flask API 接口调用，而不是直接调用 mcd_api
 """
 
 import sys
 import json
 import os
+import requests
 from datetime import datetime
 
-from login_manager import LoginManager
-from mcd_api import (
-    get_nearby_stores, search_stores, get_all_cities, get_city_by_location,
-    get_store_menu, get_product_detail, clear_cart, add_to_cart,
-    get_order_validation_info, get_order_promotion_info, get_nearest_store_info,
-    submit_order, get_payment_channels, create_payment, get_order_detail, get_order_list
-)
 from config import DATA_DIR
+
+# API 配置
+API_BASE = 'http://127.0.0.1:5001'
 
 # 默认配置
 DEFAULT_PHONE = '17717295039'
@@ -28,6 +26,24 @@ PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
 PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
 
+def api_call(endpoint, method='GET', data=None, params=None):
+    """通用 API 调用"""
+    url = f"{API_BASE}{endpoint}"
+
+    try:
+        if method == 'POST':
+            response = requests.post(url, json=data, timeout=30)
+        else:
+            response = requests.get(url, params=params, timeout=30)
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ API 请求失败: {str(e)}")
+        return {'success': False, 'message': f'API 请求失败: {str(e)}'}
+
+
 def get_login_info():
     """获取登录信息"""
     phone = input(f"请输入手机号 (回车使用默认 {DEFAULT_PHONE}): ").strip()
@@ -35,21 +51,70 @@ def get_login_info():
         phone = DEFAULT_PHONE
 
     print(f"\n使用手机号: {phone}")
-    print("正在获取登录信息...")
+    print("正在检查登录状态...")
 
-    login_manager = LoginManager(phone)
-    token, sid, meddy_id = login_manager.ensure_login(auto_relogin=True)
+    # 检查登录状态
+    result = api_call('/api/login/status', params={'phone': phone})
+    if result.get('success') and result.get('data', {}).get('is_logged_in'):
+        print(f"✅ 已登录")
+        print(result)
+        data = result['data']
+        token = data.get('token')
+        sid = data.get('sid')
+        meddy_id = data.get('meddy_id')
 
-    if not token or not sid:
-        print("❌ 登录失败")
+        user_info = data.get('user_info', {})
+        if user_info:
+            print(f"   用户: {user_info.get('name', '')}")
+            print(f"   积分: {user_info.get('points', '0')}")
+        return phone, token, sid, meddy_id
+
+    # 需要登录
+    print(f"⚠️  未登录，开始登录流程...")
+
+    # 发送验证码
+    result = api_call('/api/login/send_code', method='POST', data={'phone': phone})
+
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '发送验证码失败')}")
+        sys.exit(1)
+
+    token = result.get('data', {}).get('token')
+    reused = result.get('data', {}).get('reused', False)
+
+    if reused:
+        print(f"✅ 验证码已发送（使用已有设备）")
+    else:
+        print(f"✅ 验证码已发送")
+
+    # 输入验证码
+    code = input("请输入验证码: ").strip()
+    if not code:
+        print("❌ 验证码不能为空")
+        sys.exit(1)
+
+    # 验证登录
+    result = api_call('/api/login/verify', method='POST', data={
+        'phone': phone,
+        'verify_code': code,
+        'token': token
+    })
+
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '登录失败')}")
         sys.exit(1)
 
     print(f"✅ 登录成功")
+    data = result['data']
+    token = data.get('token')
+    sid = data.get('sid')
+    meddy_id = data.get('meddy_id')
+
     print(f"   Token: {token[:20]}...")
     print(f"   SID: {sid[:20]}...")
     print(f"   MeddyID: {meddy_id}")
 
-    return token, sid, meddy_id
+    return phone, token, sid, meddy_id
 
 
 def store_flow():
@@ -59,7 +124,7 @@ def store_flow():
     print("=" * 60)
 
     # 获取登录信息
-    token, sid, meddy_id = get_login_info()
+    phone, token, sid, meddy_id = get_login_info()
 
     # 选择入口
     print("\n请选择店铺获取方式:")
@@ -72,13 +137,20 @@ def store_flow():
     if choice == '1':
         # 1.1 附近店铺
         print(f"\n正在获取附近店铺... (经纬度: {DEFAULT_LATITUDE}, {DEFAULT_LONGITUDE})")
-        success, stores, msg = get_nearby_stores(token, sid, DEFAULT_LATITUDE, DEFAULT_LONGITUDE)
+        result = api_call('/api/mcd/get_nearby_stores', params={
+            'phone': phone,
+            'latitude': DEFAULT_LATITUDE,
+            'longitude': DEFAULT_LONGITUDE,
+            'show_type': 2,
+            'order_type': 1
+        })
 
-        if not success or not stores:
-            print(f"❌ {msg}")
+        if not result.get('success'):
+            print(f"❌ {result.get('message', '获取附近店铺失败')}")
             sys.exit(1)
 
-        print(f"✅ {msg}")
+        stores = result.get('data', {}).get('stores', [])
+        print(f"✅ {result.get('message', '获取成功')}")
 
     elif choice == '2':
         # 1.2 搜索店铺
@@ -95,40 +167,51 @@ def store_flow():
         if search_choice == '1':
             # 1.2.1 当前城市搜索
             print(f"\n正在获取当前城市信息... (经纬度: {DEFAULT_LATITUDE}, {DEFAULT_LONGITUDE})")
-            success, city_data, msg = get_city_by_location(token, sid, DEFAULT_LATITUDE, DEFAULT_LONGITUDE)
+            result = api_call('/api/mcd/get_city_by_location', params={
+                'phone': phone,
+                'latitude': DEFAULT_LATITUDE,
+                'longitude': DEFAULT_LONGITUDE
+            })
 
-            if not success:
-                print(f"❌ {msg}")
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '获取城市信息失败')}")
                 sys.exit(1)
 
+            city_data = result.get('data', {}).get('city', {})
             city_code = city_data.get('code', '')
             city_name = city_data.get('name', '')
             print(f"✅ 当前城市: {city_name} ({city_code})")
 
             print(f"\n正在搜索店铺...")
-            success, stores_data, msg = search_stores(token, sid, city_code, keyword)
+            result = api_call('/api/mcd/search_stores', params={
+                'phone': phone,
+                'city_code': city_code,
+                'keyword': keyword
+            })
 
-            if not success:
-                print(f"❌ {msg}")
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '搜索失败')}")
                 sys.exit(1)
 
-            stores = stores_data.get('stores', [])
-            print(f"✅ {msg}")
+            stores = result.get('data', {}).get('stores', [])
+            print(f"✅ {result.get('message', '搜索成功')}")
 
         elif search_choice == '2':
             # 1.2.2 全部城市
             print("\n正在获取所有城市...")
-            success, cities_data, msg = get_all_cities(token, sid)
+            result = api_call('/api/mcd/get_all_cities', params={'phone': phone})
 
-            if not success:
-                print(f"❌ {msg}")
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '获取城市列表失败')}")
                 sys.exit(1)
 
+            cities_data = result.get('data', {})
+
             # 展示城市列表
-            city_groups = [{"initial": '热门城市', "cities": cities_data['hotCities']}] + cities_data.get('groups', [])
+            city_groups = [{"initial": '热门城市', "cities": cities_data.get('hotCities', [])}] + cities_data.get('groups', [])
             all_cities = []
 
-            print(f"\n✅ {msg}")
+            print(f"\n✅ {result.get('message', '获取成功')}")
             print("\n城市列表:")
             idx = 1
             for group in city_groups:
@@ -155,14 +238,18 @@ def store_flow():
             print(f"\n已选择城市: {city_name} ({city_code})")
 
             print(f"\n正在搜索店铺...")
-            success, stores_data, msg = search_stores(token, sid, city_code, keyword)
+            result = api_call('/api/mcd/search_stores', params={
+                'phone': phone,
+                'city_code': city_code,
+                'keyword': keyword
+            })
 
-            if not success:
-                print(f"❌ {msg}")
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '搜索失败')}")
                 sys.exit(1)
 
-            stores = stores_data.get('stores', [])
-            print(f"✅ {msg}")
+            stores = result.get('data', {}).get('stores', [])
+            print(f"✅ {result.get('message', '搜索成功')}")
 
         else:
             print("❌ 无效的选择")
@@ -204,15 +291,13 @@ def store_flow():
         'beCode': selected_store.get('beCode', ''),
         'latitude': selected_store.get('latitude', DEFAULT_LATITUDE),
         'longitude': selected_store.get('longitude', DEFAULT_LONGITUDE),
-        'token': token,
-        'sid': sid,
-        'meddyId': meddy_id
+        'phone': phone
     }
 
     with open(STORE_FILE, 'w', encoding='utf-8') as f:
         json.dump(store_info, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✅ 已选择店铺: {selected_store.get('storeName', '')}")
+    print(f"\n✅ 已选择店铺: {selected_store.get('name', '')}")
     print(f"✅ 店铺信息已保存到: {STORE_FILE}")
     print("=" * 60)
 
@@ -223,21 +308,20 @@ def order_flow():
     print("麦当劳下单流程")
     print("=" * 60)
 
-    # 1. 验证登录状态并获取最新的 token/sid
+    # 1. 验证登录状态
     print("\n正在验证登录状态...")
-    token, sid, meddy_id = get_login_info()
+    phone, token, sid, meddy_id = get_login_info()
     print("✅ 登录验证通过")
 
-    # 2. 读取店铺信息（只读取店铺相关字段，不覆盖 token/sid）
+    # 2. 读取店铺信息
     if not os.path.exists(STORE_FILE):
         print(f"\n❌ 未找到店铺信息文件: {STORE_FILE}")
-        print("请先运行: python run.py store")
+        print("请先运行: python run_api_client.py store")
         sys.exit(1)
 
     with open(STORE_FILE, 'r', encoding='utf-8') as f:
         store_info = json.load(f)
 
-    # 只读取店铺信息，保留新获取的 token/sid/meddy_id
     store_code = store_info.get('storeCode', '')
     store_name = store_info.get('storeName', '')
     be_code = store_info.get('beCode', '')
@@ -246,16 +330,22 @@ def order_flow():
 
     print(f"\n已加载店铺: {store_name} ({store_code})")
 
-    # 2. 获取店铺菜单
+    # 3. 获取店铺菜单
     print(f"\n[步骤 1] 正在获取店铺菜单...")
-    success, menu_data, msg = get_store_menu(token, sid, store_code, be_code, order_type=1)
+    result = api_call('/api/mcd/get_store_menu', params={
+        'phone': phone,
+        'store_code': store_code,
+        'be_code': be_code,
+        'order_type': 1
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取菜单失败')}")
         sys.exit(1)
 
-    print(f"✅ {msg}")
+    print(f"✅ {result.get('message', '获取成功')}")
 
+    menu_data = result.get('data', {})
     menus = menu_data.get('menu', [])
     if not menus:
         print("❌ 菜单为空")
@@ -265,8 +355,8 @@ def order_flow():
     product_code_key = 'productCode'
     product_img_key = 'productImage'
 
-    # 记录已添加商品数量（用于限购检查）
-    added_products = {}  # {product_code: quantity}
+    # 记录已添加商品数量
+    added_products = {}
     cart_data = None
     is_first_loop = True
 
@@ -278,12 +368,12 @@ def order_flow():
             if continue_add != 'y':
                 break
 
-        # 3. 展示菜单分类和商品数（统计嵌套结构中的所有商品）
+        # 展示菜单分类
         print(f"\n菜单分类 (共 {len(menus)} 个):")
         for i, category in enumerate(menus, 1):
             category_name = category.get('categoryName', '').replace('\n', ' ')
 
-            # 统计商品数：可能有直接商品或嵌套小类
+            # 统计商品数
             total_products = 0
             direct_products = category.get('productList', [])
             sub_categories = category.get('categories', [])
@@ -311,7 +401,7 @@ def order_flow():
         selected_category = menus[category_idx]
         category_name = selected_category.get('categoryName', '').replace('\n', ' ')
 
-        # 收集所有商品（包括嵌套小类中的商品）
+        # 收集所有商品
         all_products = []
 
         # 直接商品
@@ -319,7 +409,7 @@ def order_flow():
         for product in direct_products:
             all_products.append({
                 'product': product,
-                'sub_category_name': None  # 无小类
+                'sub_category_name': None
             })
 
         # 小类中的商品
@@ -337,7 +427,7 @@ def order_flow():
             print(f"❌ {category_name} 分类下没有商品")
             continue
 
-        # 展示该分类下所有商品（格式：小类名称-商品名称）
+        # 展示商品列表
         print(f"\n{category_name} - 商品列表:")
         for i, item in enumerate(all_products, 1):
             product = item['product']
@@ -353,7 +443,7 @@ def order_flow():
             else:
                 display_name = pname
 
-            # 动态计算剩余限购数
+            # 显示限购信息
             if limit_qty > 0:
                 remaining = limit_qty - current_qty
                 if remaining <= 0:
@@ -384,49 +474,48 @@ def order_flow():
         limit_qty = selected_product.get('limitQuantity', 0)
         current_qty = added_products.get(product_code, 0)
 
-        # 检查是否已达限购
+        # 检查限购
         if limit_qty > 0 and current_qty >= limit_qty:
             print(f"❌ 该商品限购{limit_qty}件，已达上限")
             continue
 
-        # 4. 获取商品详情，展示标题和价格
+        # 4. 获取商品详情
         print(f"\n正在获取商品详情...")
-        success, detail_data, msg = get_product_detail(token, sid, product_code, store_code, be_code, order_type=1)
+        result = api_call('/api/mcd/get_product_detail', params={
+            'phone': phone,
+            'product_code': product_code,
+            'store_code': store_code,
+            'be_code': be_code,
+            'order_type': 1
+        })
 
-        if not success:
-            print(f"❌ {msg}")
+        if not result.get('success'):
+            print(f"❌ {result.get('message', '获取商品详情失败')}")
             continue
 
-        print(f"✅ {msg}")
-        detail_data = detail_data.get('product', {})
+        print(f"✅ {result.get('message', '获取成功')}")
+        detail_data = result.get('data', {}).get('product', {})
 
-        # 处理产品组 (G开头的code)
-        # 如果是产品组，需要选择具体的SKU
+        # 处理产品组
         actual_product_code = product_code
         actual_product_name = product_name
         actual_product_image = product_image
         modification = None
-        suggestion_embedding = ''
 
         if product_code.startswith('G'):
-            # 这是产品组，需要获取具体的SKU列表
             products = detail_data.get('products', [])
             if products:
-                # 默认选择第一个SKU（通常是默认规格）
                 first_sku = products[0]
                 actual_product_code = first_sku.get('code', product_code)
                 actual_product_name = first_sku.get('name', product_name)
                 actual_product_image = first_sku.get('image', product_image)
 
-                # 提取默认的modification
+                # 提取默认modification
                 from mcd_api import extract_default_modification
                 modification = extract_default_modification(first_sku)
 
                 print(f"  检测到产品组，自动选择默认规格: {actual_product_name} ({actual_product_code})")
-            else:
-                print(f"⚠️  产品组 {product_code} 没有可用的SKU")
         else:
-            # 单品，提取默认modification（如果有）
             from mcd_api import extract_default_modification
             modification = extract_default_modification(detail_data)
 
@@ -447,36 +536,46 @@ def order_flow():
         # 5. 首次循环清空购物车
         if is_first_loop:
             print(f"\n正在清空购物车...")
-            success, clear_result, msg = clear_cart(token, sid, store_code, be_code, order_type=1, store_name=store_name)
-            if success:
-                print(f"✅ {msg}, 购物车中商品数: {len(clear_result.get('products', []))}")
+            result = api_call('/api/mcd/clear_cart', method='POST', data={
+                'phone': phone,
+                'store_code': store_code,
+                'be_code': be_code,
+                'order_type': 1,
+                'store_name': store_name
+            })
+            if result.get('success'):
+                cart_result = result.get('data', {})
+                print(f"✅ {result.get('message', '清空成功')}, 购物车中商品数: {len(cart_result.get('products', []))}")
             else:
-                print(f"⚠️  {msg} (继续流程)")
+                print(f"⚠️  {result.get('message', '清空失败')} (继续流程)")
 
         # 6. 加入购物车
         print(f"\n正在添加商品到购物车...")
-        success, cart_data, msg = add_to_cart(
-            token, sid, store_code, be_code,
-            product_code=actual_product_code,
-            product_name=actual_product_name,
-            product_image=actual_product_image,
-            modification=modification,
-            suggestion_embedding=suggestion_embedding,
-            quantity=1,
-            order_type=1,
-            store_name=store_name
-        )
+        result = api_call('/api/mcd/add_to_cart', method='POST', data={
+            'phone': phone,
+            'store_code': store_code,
+            'be_code': be_code,
+            'product_code': actual_product_code,
+            'product_name': actual_product_name,
+            'product_image': actual_product_image,
+            'modification': modification,
+            'suggestion_embedding': '',
+            'quantity': 1,
+            'order_type': 1,
+            'store_name': store_name
+        })
 
-        if not success:
-            print(f"❌ {msg}")
+        if not result.get('success'):
+            print(f"❌ {result.get('message', '添加失败')}")
             continue
 
-        # 更新已添加商品记录（使用实际的SKU code）
+        # 更新已添加商品记录
         added_products[actual_product_code] = added_products.get(actual_product_code, 0) + 1
 
+        cart_data = result.get('data', {})
         cart_detail = cart_data.get('cartDetail', {})
         cart_products = cart_detail.get('products', [])
-        print(f"✅ {msg}, 购物车中商品数: {len(cart_products)}")
+        print(f"✅ {result.get('message', '添加成功')}, 购物车中商品数: {len(cart_products)}")
 
         is_first_loop = False
 
@@ -496,20 +595,23 @@ def order_flow():
 
     # 7. 获取订单验证信息
     print(f"\n正在获取订单验证信息...")
-    success, validation_data, msg = get_order_validation_info(
-        token, sid, store_code,
-        be_code=be_code,
-        order_type=1,
-        cart_type=1
-    )
+    result = api_call('/api/mcd/get_order_validation_info', params={
+        'phone': phone,
+        'store_code': store_code,
+        'be_code': be_code,
+        'order_type': 1,
+        'cart_type': 1
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取订单验证信息失败')}")
         sys.exit(1)
 
-    print(f"✅ {msg}")
+    print(f"✅ {result.get('message', '获取成功')}")
 
-    # 展示第一个商品标题
+    validation_data = result.get('data', {})
+
+    # 展示商品列表
     validation_info = validation_data.get('validation', {})
     product_status_list = validation_info.get('productStatusList', [])
     if product_status_list:
@@ -528,16 +630,14 @@ def order_flow():
         sub_text = option.get('subText', '')
         print(f"  - {sub_text}")
 
-    # 展示总价（使用实际支付价格）
+    # 展示总价
     product_price_info = confirm_info.get('productPriceInfo', {})
     real_total_amount = product_price_info.get('realTotalAmount', 0)
     total_amount = product_price_info.get('totalAmount', 0)
 
-    # 转换为浮点数进行计算
     real_total_float = float(real_total_amount) if real_total_amount else 0
     total_float = float(total_amount) if total_amount else 0
 
-    # 显示价格信息
     if real_total_float != total_float:
         discount = total_float - real_total_float
         print(f"\n原价: ¥{total_float}")
@@ -553,17 +653,20 @@ def order_flow():
 
     # 8. 获取门店信息
     print(f"\n正在获取门店信息...")
-    success, store_data, msg = get_nearest_store_info(
-        token, sid, store_code,
-        latitude, longitude,
-        be_code=be_code
-    )
+    result = api_call('/api/mcd/get_nearest_store_info', params={
+        'phone': phone,
+        'store_code': store_code,
+        'latitude': latitude,
+        'longitude': longitude,
+        'be_code': be_code
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取门店信息失败')}")
         sys.exit(1)
 
-    print(f"✅ {msg}")
+    print(f"✅ {result.get('message', '获取成功')}")
+    store_data = result.get('data', {})
     store_text = store_data.get('text', '')
     nearest_store_info = store_data.get('nearestStoreInfo', {})
     store_name_confirm = nearest_store_info.get('storeName', '')
@@ -577,17 +680,16 @@ def order_flow():
         print("❌ 已取消")
         sys.exit(0)
 
-    # 9. 保存订单数据（使用订单验证接口返回的完整商品数据）
+    # 9. 保存订单数据
     print("\n正在保存订单数据...")
 
-    # 从验证信息中提取完整的商品数据
     cart_product_list = product_price_info.get('cartProductList', [])
 
     if not cart_product_list:
         print("❌ 订单验证信息中未获取到商品数据")
         sys.exit(1)
 
-    # 提取 menuCardList（会员卡信息）
+    # 提取会员卡信息
     right_card_info = product_price_info.get('rightCardInfo', {})
     card_list = right_card_info.get('cardList', [])
 
@@ -600,11 +702,8 @@ def order_flow():
             'productCode': card.get('productCode', '')
         })
 
-    # 直接使用订单验证接口返回的 cartProductList
     order_data = {
-        'token': token,
-        'sid': sid,
-        'meddyId': meddy_id,
+        'phone': phone,
         'storeCode': store_code,
         'storeName': store_name,
         'beCode': be_code,
@@ -626,31 +725,27 @@ def order_flow():
     print(f"✅ 订单数据已保存到: {ORDER_GOODS_FILE}")
     print(f"   商品数: {len(cart_product_list)}")
     print(f"   订单总金额: ¥{real_total_amount}")
-    print("\n提示: 运行 'python run.py payment' 提交订单并支付")
+    print("\n提示: 运行 'python run_api_client.py payment' 提交订单并支付")
     print("=" * 60)
 
 
 def payment_flow(arg2=''):
-    """支付流程（自动提交订单并支付）
-
-    Args:
-        use_existing: 是否使用已有的订单ID和支付ID（跳过提交订单步骤）
-    """
+    """支付流程"""
     print("=" * 60)
     print("麦当劳提交订单并支付流程")
     print("=" * 60)
 
-    # 1. 验证登录状态并获取最新的 token/sid
+    # 1. 验证登录状态
     print("\n正在验证登录状态...")
-    token, sid, meddy_id = get_login_info()
+    phone, token, sid, meddy_id = get_login_info()
     print("✅ 登录验证通过")
 
-    # 如果使用已有订单，先查询订单详情检查状态
+    # 如果使用已有订单
     if arg2:
         if arg2 == 'old':
             if not os.path.exists(PAY_INFO_FILE):
                 print(f"\n❌ 未找到支付信息文件: {PAY_INFO_FILE}")
-                print("请先运行: python run.py payment (不带 old 参数)")
+                print("请先运行: python run_api_client.py payment (不带 old 参数)")
                 sys.exit(1)
 
             with open(PAY_INFO_FILE, 'r', encoding='utf-8') as f:
@@ -659,13 +754,18 @@ def payment_flow(arg2=''):
             order_id = payment_info.get('orderId', '')
             pay_id = payment_info.get('payId', '')
         else:
-            success, order_list_data, msg = get_order_list(token, sid, cursor='', page_size=10)
+            result = api_call('/api/mcd/get_order_list', params={
+                'phone': phone,
+                'cursor': '',
+                'page_size': 10
+            })
 
-            if not success:
-                print(f"❌ {msg}")
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '获取订单列表失败')}")
                 sys.exit(1)
             else:
-                print(f"✅ {msg}")
+                print(f"✅ {result.get('message', '获取成功')}")
+                order_list_data = result.get('data', {})
                 order_list = order_list_data.get('list', [])
                 order_data = order_list[0]['omsOrder']
                 order_id = order_data['orderId']
@@ -675,16 +775,20 @@ def payment_flow(arg2=''):
         print(f"   订单ID: {order_id}")
         print(f"   支付ID: {pay_id}")
 
-        # 查询订单详情检查状态
+        # 查询订单详情
         print(f"\n正在查询订单详情...")
-        success, order_detail, msg = get_order_detail(token, sid, order_id)
+        result = api_call('/api/mcd/get_order_detail', params={
+            'phone': phone,
+            'order_id': order_id
+        })
 
-        if not success:
-            print(f"❌ {msg}")
+        if not result.get('success'):
+            print(f"❌ {result.get('message', '获取订单详情失败')}")
             sys.exit(1)
 
-        print(f"✅ {msg}")
-        # 获取订单状态
+        print(f"✅ {result.get('message', '获取成功')}")
+        order_detail = result.get('data', {})
+
         order_status_code = order_detail.get('orderStatusCode', '')
         order_status = order_detail.get('orderStatus', '')
         mp_order_status_code = order_detail.get('mpOrderStatusCode', '')
@@ -694,45 +798,30 @@ def payment_flow(arg2=''):
         print(f"  状态: {order_status}")
         print(f"  MP状态码: {mp_order_status_code}")
 
-        # 判断订单状态（已确认的映射关系）
-        # orderStatusCode: 1=待支付（确认）, 7=已取消（确认）, 2-6=已支付及后续状态（待验证）
-        # mpOrderStatusCode: 10=待支付（确认）, 60=已取消（确认）
-
-        # 检查是否为待支付状态
         if order_status_code == '1' and mp_order_status_code == '10':
             print(f"\n✅ 订单状态为待支付，继续支付流程")
         else:
-            # 检查是否为已取消状态
             if order_status_code == '7' and mp_order_status_code == '60':
                 print(f"\n❌ 订单已取消，无法继续支付")
             elif order_status_code == '6' and mp_order_status_code == '40':
-                # 取餐码
                 pickup_code = order_detail["pickupCode"]
                 print(f"\n✅ 订单状态为已完成，获取取餐码-{pickup_code}")
             else:
-                # 其他所有状态都不允许支付（可能已支付/已完成等）
                 print(f"\n⚠️  订单不是待支付状态，无法继续支付")
                 print(f"   订单状态: {order_status}")
-                print(f"   状态码: orderStatusCode={order_status_code}, mpOrderStatusCode={mp_order_status_code}")
-
-                # 提示可能的状态（待验证）
-                if order_status_code in ['2', '3', '4', '5', '6']:
-                    print(f"   提示: 可能已支付或已完成")
 
             sys.exit(1)
 
     else:
         # 正常流程：提交订单
-        # 2. 检查并读取订单数据（只读取订单相关字段，不覆盖 token/sid）
         if not os.path.exists(ORDER_GOODS_FILE):
             print(f"\n❌ 未找到订单商品文件: {ORDER_GOODS_FILE}")
-            print("请先运行: python run.py order")
+            print("请先运行: python run_api_client.py order")
             sys.exit(1)
 
         with open(ORDER_GOODS_FILE, 'r', encoding='utf-8') as f:
             order_data = json.load(f)
 
-        # 只读取订单信息，保留新获取的 token/sid/meddy_id
         store_code = order_data.get('storeCode', '')
         cart_items = order_data.get('cartItems', [])
         menu_card_list = order_data.get('menuCardList', [])
@@ -751,43 +840,41 @@ def payment_flow(arg2=''):
         print(f"   会员卡数: {len(menu_card_list)}")
         print(f"   订单总金额: ¥{real_total_amount}")
 
-        # 2. 提交订单
+        # 提交订单
         print(f"\n[步骤 1] 正在提交订单...")
-        success, order_result, msg = submit_order(
-            token=token,
-            sid=sid,
-            store_code=store_code,
-            cart_items=cart_items,
-            menu_card_list=menu_card_list,
-            real_total_amount=real_total_amount,
-            be_type=be_type,
-            order_type=order_type,
-            eat_type_code=eat_type_code,
-            tableware_code=tableware_code,
-            pin_id=pin_id,
-            latitude=latitude,
-            longitude=longitude
-        )
+        result = api_call('/api/mcd/submit_order', method='POST', data={
+            'phone': phone,
+            'store_code': store_code,
+            'cart_items': cart_items,
+            'menu_card_list': menu_card_list,
+            'real_total_amount': real_total_amount,
+            'be_type': be_type,
+            'order_type': order_type,
+            'eat_type_code': eat_type_code,
+            'tableware_code': tableware_code,
+            'pin_id': pin_id,
+            'latitude': latitude,
+            'longitude': longitude
+        })
 
-        if not success:
-            print(f"❌ {msg}")
+        if not result.get('success'):
+            print(f"❌ {result.get('message', '提交订单失败')}")
             sys.exit(1)
 
-        print(f"✅ {msg}")
+        print(f"✅ {result.get('message', '提交成功')}")
 
-        # 获取订单ID和支付ID
+        order_result = result.get('data', {})
         order_id = order_result.get('orderId', '')
         pay_id = order_result.get('payId', '')
 
         if not order_id or not pay_id:
             print("❌ 订单提交成功但未返回订单ID或支付ID")
-            print(f"返回数据: {order_result}")
             sys.exit(1)
 
         print(f"\n订单ID: {order_id}")
         print(f"支付ID: {pay_id}")
 
-        # 保存支付信息到文件，供后续使用
+        # 保存支付信息
         payment_info = {
             'orderId': order_id,
             'payId': pay_id,
@@ -801,17 +888,22 @@ def payment_flow(arg2=''):
 
         print(f"✅ 支付信息已保存到: {PAY_INFO_FILE}")
 
-    # 步骤1: 获取支付渠道
+    # 获取支付渠道
     print(f"\n[步骤 2] 正在获取支付渠道...")
-    success, channels_data, msg = get_payment_channels(token, sid, order_id, pay_id, meddy_id)
+    result = api_call('/api/mcd/get_payment_channels', method='POST', data={
+        'phone': phone,
+        'order_id': order_id,
+        'pay_id': pay_id,
+        'mcd_id': meddy_id
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取支付渠道失败')}")
         sys.exit(1)
 
-    print(f"✅ {msg}")
+    print(f"✅ {result.get('message', '获取成功')}")
 
-    # 展示支付渠道
+    channels_data = result.get('data', {})
     channel_infos = channels_data.get('channelInfos', [])
     if not channel_infos:
         print("❌ 没有可用的支付渠道")
@@ -841,17 +933,22 @@ def payment_flow(arg2=''):
 
     print(f"\n已选择: {channel_name} ({channel_code})")
 
-    # 步骤2: 预支付
+    # 创建支付
     print(f"\n[步骤 3] 正在创建支付订单...")
-    success, payment_data, msg = create_payment(token, sid, pay_id, pay_channel=channel_code)
+    result = api_call('/api/mcd/create_payment', method='POST', data={
+        'phone': phone,
+        'pay_id': pay_id,
+        'pay_channel': channel_code
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '创建支付失败')}")
         sys.exit(1)
 
-    print(f"✅ {msg}")
+    print(f"✅ {result.get('message', '创建成功')}")
 
-    # 展示支付信息
+    payment_data = result.get('data', {})
+
     print(f"\n支付信息:")
     print(f"  订单ID: {payment_data.get('orderId', '')}")
     print(f"  支付ID: {payment_data.get('payId', '')}")
@@ -862,11 +959,9 @@ def payment_flow(arg2=''):
     if channel_pay_data:
         print(f"\n支付数据已生成 (长度: {len(channel_pay_data)} 字符)")
 
-        # 解析支付数据
         try:
             pay_data_json = json.loads(channel_pay_data)
 
-            # 提取关键信息
             method = pay_data_json.get('method', '')
             biz_content_str = pay_data_json.get('biz_content', '')
 
@@ -882,7 +977,7 @@ def payment_flow(arg2=''):
                 print(f"  金额: ¥{total_amount}")
                 print(f"  交易号: {out_trade_no}")
 
-            # 保存支付字符串到文件
+            # 保存支付字符串
             with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
                 f.write(channel_pay_data)
 
@@ -893,22 +988,24 @@ def payment_flow(arg2=''):
                 print(json.dumps(pay_data_json, ensure_ascii=False, indent=2))
 
         except json.JSONDecodeError:
-            print("⚠️  无法解析支付数据，显示原始内容:")
-            print(channel_pay_data)
+            print("⚠️  无法解析支付数据")
         except Exception as e:
             print(f"⚠️  处理支付数据时出错: {str(e)}")
-            print(f"\n原始支付数据:")
-            print(channel_pay_data)
 
-    # 步骤3: 查询账号订单列表
+    # 查询订单列表
     print(f"\n[步骤 4] 正在查询账号订单列表...")
-    success, order_list_data, msg = get_order_list(token, sid, cursor='', page_size=10)
+    result = api_call('/api/mcd/get_order_list', params={
+        'phone': phone,
+        'cursor': '',
+        'page_size': 10
+    })
 
-    if not success:
-        print(f"❌ {msg}")
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取订单列表失败')}")
     else:
-        print(f"✅ {msg}")
+        print(f"✅ {result.get('message', '获取成功')}")
 
+        order_list_data = result.get('data', {})
         order_list = order_list_data.get('list', [])
         has_next = order_list_data.get('hasNext', False)
 
@@ -942,10 +1039,10 @@ def payment_flow(arg2=''):
 def main():
     if len(sys.argv) < 2:
         print("用法:")
-        print("  python run.py store   - 选择店铺")
-        print("  python run.py order   - 下单流程")
-        print("  python run.py payment - 支付流程（提交订单并保存支付信息）")
-        print("  python run.py payment old - 使用已保存的订单ID和支付ID")
+        print("  python run_api_client.py store   - 选择店铺")
+        print("  python run_api_client.py order   - 下单流程")
+        print("  python run_api_client.py payment - 支付流程（提交订单并保存支付信息）")
+        print("  python run_api_client.py payment old - 使用已保存的订单ID和支付ID")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -955,7 +1052,6 @@ def main():
     elif mode == 'order':
         order_flow()
     elif mode == 'payment':
-        # 检查是否有 old 参数
         arg2 = sys.argv[2] if len(sys.argv) > 2 else ''
         payment_flow(arg2=arg2)
     else:

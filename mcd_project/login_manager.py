@@ -11,12 +11,13 @@ import requests
 import time
 import tempfile
 import shutil
+import redis
 from datetime import datetime
 from typing import Optional, Tuple, Dict
 from functools import wraps
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
-from config import DATA_DIR
+from config import DATA_DIR, REDIS_SET_URL
 from mcd_api import (
     generate_token,
     activate_token,
@@ -121,24 +122,37 @@ class LoginManager:
         token, sid, meddy_id = manager.ensure_login()
     """
 
-    def __init__(self, phone: str, credentials_file: str = None):
+    def __init__(self, phone: str, credentials_file: str = None, use_redis: bool = False):
         """
         初始化登录管理器
 
         Args:
             phone: 手机号（11位）
             credentials_file: 凭证保存文件路径（默认：当前目录下的 credentials.json）
+            use_redis: 是否使用 Redis 存储（默认 False 使用文件）
         """
         if len(phone) != 11:
             raise ValueError("手机号必须是11位数字")
 
         self.phone = phone
+        self.use_redis = use_redis
 
         # 凭证文件路径
         if credentials_file is None:
             credentials_file = os.path.join(DATA_DIR, 'credentials.json')
 
         self.credentials_file = credentials_file
+
+        # Redis 客户端（如果使用 Redis）
+        if self.use_redis:
+            self.redis_client = redis.Redis(
+                host=REDIS_SET_URL['host'],
+                port=REDIS_SET_URL['port'],
+                db=REDIS_SET_URL['db'],
+                password=REDIS_SET_URL['password'],
+                decode_responses=True,
+            )
+            self.redis_key = 'mcd:credentials'
 
         # 当前账号凭证
         self.token: Optional[str] = None
@@ -147,54 +161,72 @@ class LoginManager:
 
     def save_credentials(self, token: str, sid: str, meddy_id: str) -> None:
         """
-        保存登录凭证到文件（原子写入，支持多账号）
+        保存登录凭证到文件或 Redis（原子写入，支持多账号）
 
         Args:
             token: 设备 Token
             sid: 会话 SID
             meddy_id: MeddyId
         """
-        # 读取现有凭证
-        all_credentials = {}
-        if os.path.exists(self.credentials_file):
+        if self.use_redis:
+            # Redis 存储
+            credential_data = {
+                'token': token,
+                'sid': sid,
+                'meddy_id': meddy_id,
+                'saved_at': datetime.now().isoformat()
+            }
             try:
-                with open(self.credentials_file, 'r', encoding='utf-8') as f:
-                    all_credentials = json.load(f)
+                self.redis_client.hset(
+                    self.redis_key,
+                    self.phone,
+                    json.dumps(credential_data, ensure_ascii=False)
+                )
             except Exception as e:
-                print(f"⚠️  警告: 读取旧凭证失败: {e}")
-                # 继续执行，使用空字典
+                raise LoginError(f"保存凭证失败: {e}")
+        else:
+            # 文件存储
+            # 读取现有凭证
+            all_credentials = {}
+            if os.path.exists(self.credentials_file):
+                try:
+                    with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                        all_credentials = json.load(f)
+                except Exception as e:
+                    print(f"⚠️  警告: 读取旧凭证失败: {e}")
+                    # 继续执行，使用空字典
 
-        # 更新当前手机号的凭证
-        all_credentials[self.phone] = {
-            'token': token,
-            'sid': sid,
-            'meddy_id': meddy_id,
-            'saved_at': datetime.now().isoformat()
-        }
+            # 更新当前手机号的凭证
+            all_credentials[self.phone] = {
+                'token': token,
+                'sid': sid,
+                'meddy_id': meddy_id,
+                'saved_at': datetime.now().isoformat()
+            }
 
-        # 原子写入（先写临时文件，再重命名）
-        try:
-            # 确保目录存在
-            os.makedirs(os.path.dirname(self.credentials_file), exist_ok=True)
+            # 原子写入（先写临时文件，再重命名）
+            try:
+                # 确保目录存在
+                os.makedirs(os.path.dirname(self.credentials_file), exist_ok=True)
 
-            # 写入临时文件
-            with tempfile.NamedTemporaryFile(
-                mode='w',
-                encoding='utf-8',
-                dir=os.path.dirname(self.credentials_file),
-                delete=False
-            ) as tmp_file:
-                json.dump(all_credentials, tmp_file, indent=2, ensure_ascii=False)
-                tmp_path = tmp_file.name
+                # 写入临时文件
+                with tempfile.NamedTemporaryFile(
+                    mode='w',
+                    encoding='utf-8',
+                    dir=os.path.dirname(self.credentials_file),
+                    delete=False
+                ) as tmp_file:
+                    json.dump(all_credentials, tmp_file, indent=2, ensure_ascii=False)
+                    tmp_path = tmp_file.name
 
-            # 原子重命名（POSIX 系统保证原子性）
-            shutil.move(tmp_path, self.credentials_file)
+                # 原子重命名（POSIX 系统保证原子性）
+                shutil.move(tmp_path, self.credentials_file)
 
-        except Exception as e:
-            # 清理临时文件
-            if 'tmp_path' in locals() and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise LoginError(f"保存凭证失败: {e}")
+            except Exception as e:
+                # 清理临时文件
+                if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise LoginError(f"保存凭证失败: {e}")
 
         # 更新内存中的凭证
         self.token = token
@@ -205,39 +237,65 @@ class LoginManager:
 
     def load_credentials(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
-        从文件加载指定手机号的登录凭证
+        从文件或 Redis 加载指定手机号的登录凭证
 
         Returns:
             (token, sid, meddy_id) 或 (None, None, None)
         """
-        if not os.path.exists(self.credentials_file):
-            return None, None, None
+        if self.use_redis:
+            # Redis 存储
+            try:
+                credential_json = self.redis_client.hget(self.redis_key, self.phone)
+                if not credential_json:
+                    return None, None, None
 
-        try:
-            with open(self.credentials_file, 'r', encoding='utf-8') as f:
-                all_credentials = json.load(f)
+                cred = json.loads(credential_json)
+                token = cred.get('token')
+                sid = cred.get('sid')
+                meddy_id = cred.get('meddy_id')
+                saved_at = cred.get('saved_at')
 
-            # 获取当前手机号的凭证
-            cred = all_credentials.get(self.phone)
-            if not cred:
+                # 更新内存中的凭证
+                self.token = token
+                self.sid = sid
+                self.meddy_id = meddy_id
+
+                print(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
+                return token, sid, meddy_id
+
+            except Exception as e:
+                print(f"✗ 加载凭证失败: {e}")
+                return None, None, None
+        else:
+            # 文件存储
+            if not os.path.exists(self.credentials_file):
                 return None, None, None
 
-            token = cred.get('token')
-            sid = cred.get('sid')
-            meddy_id = cred.get('meddy_id')
-            saved_at = cred.get('saved_at')
+            try:
+                with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                    all_credentials = json.load(f)
 
-            # 更新内存中的凭证
-            self.token = token
-            self.sid = sid
-            self.meddy_id = meddy_id
+                # 获取当前手机号的凭证
+                cred = all_credentials.get(self.phone)
+                if not cred:
+                    return None, None, None
 
-            print(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
-            return token, sid, meddy_id
+                token = cred.get('token')
+                sid = cred.get('sid')
+                meddy_id = cred.get('meddy_id')
+                saved_at = cred.get('saved_at')
 
-        except Exception as e:
-            print(f"✗ 加载凭证失败: {e}")
-            return None, None, None
+                # 更新内存中的凭证
+                self.token = token
+                self.sid = sid
+                self.meddy_id = meddy_id
+
+                print(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
+                return token, sid, meddy_id
+
+            except Exception as e:
+                print(f"✗ 加载凭证失败: {e}")
+                return None, None, None
 
     @retry_on_network_error(max_attempts=3, base_delay=1.0)
     def check_login_status(self) -> Tuple[bool, Optional[Dict]]:
@@ -274,7 +332,6 @@ class LoginManager:
         # 发送请求（会被装饰器自动重试）
         url = API2_BASE + path
         response = requests.get(url, headers=headers, params=params, timeout=10)
-
         # 检查 HTTP 状态码
         response.raise_for_status()  # 会抛出 HTTPError
 
@@ -297,13 +354,13 @@ class LoginManager:
             return True, user_info
         else:
             # 业务失败，判断是否为认证问题
-            error_code = result.get('code')
+            error_code = str(result.get('code'))
             error_msg = result.get('message', '未知错误')
 
-            # 常见的认证失败错误码（根据实际 API 调整）
-            auth_error_codes = ['AUTH_FAILED', 'TOKEN_EXPIRED', 'INVALID_SESSION', 'UNAUTHORIZED']
+            # 常见的认证失败错误码（根据实际 API 调整       ）
+            auth_error_codes = ['401']
 
-            if error_code in auth_error_codes or 'token' in error_msg.lower() or 'auth' in error_msg.lower():
+            if error_code in auth_error_codes or '登录失效' in error_msg.lower() or '重新登录' in error_msg.lower:
                 raise AuthenticationError(f"认证失败: {error_msg} (code: {error_code})")
             else:
                 # 其他业务错误
@@ -481,28 +538,36 @@ class LoginManager:
 
     def clear_credentials(self) -> None:
         """
-        清除当前手机号的凭证（从文件和内存中删除）
+        清除当前手机号的凭证（从文件或 Redis 和内存中删除）
         """
         # 清除内存
         self.token = None
         self.sid = None
         self.meddy_id = None
 
-        # 从文件中删除
-        if os.path.exists(self.credentials_file):
+        if self.use_redis:
+            # Redis 存储
             try:
-                with open(self.credentials_file, 'r', encoding='utf-8') as f:
-                    all_credentials = json.load(f)
-
-                if self.phone in all_credentials:
-                    del all_credentials[self.phone]
-
-                    with open(self.credentials_file, 'w', encoding='utf-8') as f:
-                        json.dump(all_credentials, f, indent=2, ensure_ascii=False)
-
-                    print(f"✓ 已清除凭证 (手机号: {self.phone})")
+                self.redis_client.hdel(self.redis_key, self.phone)
+                print(f"✓ 已清除凭证 (手机号: {self.phone})")
             except Exception as e:
                 print(f"✗ 清除凭证失败: {e}")
+        else:
+            # 文件存储
+            if os.path.exists(self.credentials_file):
+                try:
+                    with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                        all_credentials = json.load(f)
+
+                    if self.phone in all_credentials:
+                        del all_credentials[self.phone]
+
+                        with open(self.credentials_file, 'w', encoding='utf-8') as f:
+                            json.dump(all_credentials, f, indent=2, ensure_ascii=False)
+
+                        print(f"✓ 已清除凭证 (手机号: {self.phone})")
+                except Exception as e:
+                    print(f"✗ 清除凭证失败: {e}")
 
 
 if __name__ == '__main__':

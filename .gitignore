@@ -8,7 +8,8 @@ __pycache__/
 # 忽略当前目录下的某个文件夹
 .claude/
 .idea/
-cache/
+.stock/cache/
+.stock/cache_sina/
 
 # 忽略任意层级同名文件夹
 **/node_modules/
@@ -21,6 +22,7 @@ cache/
 *.zip
 *.img
 *.mitm
+*.pkl
 
 # 忽略带版本号后缀的 .so 文件，保留纯 .so
 **/*.so.*
