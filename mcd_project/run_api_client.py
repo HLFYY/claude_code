@@ -11,13 +11,15 @@ import os
 import requests
 from datetime import datetime
 
-from config import DATA_DIR
+current_dir = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(current_dir, 'data')
+if not os.path.exists(DATA_DIR):
+    os.mkdir(DATA_DIR)
 
 # API 配置
 API_BASE = 'http://127.0.0.1:5001'
-
 # 默认配置
-DEFAULT_PHONE = '17717295039'
+DEFAULT_PHONE = '16752934813'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')

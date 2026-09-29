@@ -453,7 +453,7 @@ def get_city_by_location(token, sid, latitude, longitude):
         if result.get('success'):
             data = result.get('data', {})
             city = data.get('city', {})
-            return True, city, f"获取城市成功: {city.get('name', '')}"
+            return True, data, f"获取城市成功: {city.get('name', '')}"
         else:
             return False, {}, result.get('message', '获取城市失败')
     except Exception as e:
@@ -541,7 +541,7 @@ def get_nearby_stores(token, sid, latitude, longitude, show_type='2', be_type=''
         if result.get('success'):
             data = result.get('data', {})
             stores = data.get('stores', [])
-            return True, stores, f"找到 {len(stores)} 家店铺"
+            return True, data, f"找到 {len(stores)} 家店铺"
         else:
             return False, [], result.get('message', '获取店铺失败')
     except Exception as e:

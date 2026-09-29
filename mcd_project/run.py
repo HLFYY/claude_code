@@ -19,7 +19,7 @@ from mcd_api import (
 from config import DATA_DIR
 
 # 默认配置
-DEFAULT_PHONE = '17717295039'
+DEFAULT_PHONE = '16752934813'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
@@ -37,7 +37,7 @@ def get_login_info():
     print(f"\n使用手机号: {phone}")
     print("正在获取登录信息...")
 
-    login_manager = LoginManager(phone)
+    login_manager = LoginManager(phone, use_redis=True)
     token, sid, meddy_id = login_manager.ensure_login(auto_relogin=True)
 
     if not token or not sid:
@@ -72,12 +72,12 @@ def store_flow():
     if choice == '1':
         # 1.1 附近店铺
         print(f"\n正在获取附近店铺... (经纬度: {DEFAULT_LATITUDE}, {DEFAULT_LONGITUDE})")
-        success, stores, msg = get_nearby_stores(token, sid, DEFAULT_LATITUDE, DEFAULT_LONGITUDE)
+        success, stores_data, msg = get_nearby_stores(token, sid, DEFAULT_LATITUDE, DEFAULT_LONGITUDE)
 
-        if not success or not stores:
+        if not success or not stores_data:
             print(f"❌ {msg}")
             sys.exit(1)
-
+        stores = stores_data.get('stores', [])
         print(f"✅ {msg}")
 
     elif choice == '2':
@@ -100,9 +100,8 @@ def store_flow():
             if not success:
                 print(f"❌ {msg}")
                 sys.exit(1)
-
-            city_code = city_data.get('code', '')
-            city_name = city_data.get('name', '')
+            city_code = city_data['city'].get('code', '')
+            city_name = city_data['city'].get('name', '')
             print(f"✅ 当前城市: {city_name} ({city_code})")
 
             print(f"\n正在搜索店铺...")
