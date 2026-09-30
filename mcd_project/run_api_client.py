@@ -10,14 +10,12 @@ import json
 import os
 import requests
 from datetime import datetime
+from config import DATA_DIR
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(current_dir, 'data')
-if not os.path.exists(DATA_DIR):
-    os.mkdir(DATA_DIR)
 
 # API 配置
-API_BASE = 'http://127.0.0.1:5001'
+API_BASE = 'http://43.163.92.204:5001'
+# API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
 DEFAULT_PHONE = '16752934813'
 DEFAULT_LATITUDE = 31.026543
@@ -34,9 +32,9 @@ def api_call(endpoint, method='GET', data=None, params=None):
 
     try:
         if method == 'POST':
-            response = requests.post(url, json=data, timeout=30)
+            response = requests.post(url, json=data, timeout=30, proxies={'http': None, 'https': None})
         else:
-            response = requests.get(url, params=params, timeout=30)
+            response = requests.get(url, params=params, timeout=30, proxies={'http': None, 'https': None})
 
         response.raise_for_status()
         return response.json()

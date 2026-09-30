@@ -5,15 +5,42 @@
 通用接口: /api/mcd/<function_name>
 登录接口: /api/login/*
 """
+import re
+import logging
+import subprocess
+import sys
+
 from flask import Flask, request, jsonify
 import mcd_api
 import json
 import os
 import redis
 from datetime import datetime
+
+from config import CODE_DIR, LOG_DIR
 from login_manager import LoginManager
 
 app = Flask(__name__)
+
+CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]')
+
+class NoiseFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        # 1) 过滤协议层扫描产生的乱码/畸形请求
+        if CONTROL_CHAR_RE.search(msg):
+            return False
+        if 'Bad request version' in msg or 'Invalid HTTP version' in msg:
+            return False
+        # 2) 过滤 /api/mcd/ 下未知接口产生的 404
+        if record.args and len(record.args) >= 2:
+            requestline = str(record.args[0])
+            code = str(record.args[1])
+            if '/api/mcd/' in requestline and code == '404':
+                return False
+        return True
+
+logging.getLogger('werkzeug').addFilter(NoiseFilter())
 
 # 使用 Redis 存储的 LoginManager
 login_manager_cache = {}
@@ -150,6 +177,10 @@ def universal_mcd_api(function_name):
     else:
         params = request.args.to_dict()
 
+    # 5. 检查函数是否存在
+    if not hasattr(mcd_api, function_name):
+        return '', 404  # 不返回具体的错误信息，避免让扫描者知道你的路由结构
+
     # 2. 提取登录信息
     phone = params.pop('phone', None)
     token = params.get('token')
@@ -181,9 +212,6 @@ def universal_mcd_api(function_name):
         if meddy_id_from_redis:
             params['mcd_id'] = meddy_id_from_redis
 
-    # 5. 检查函数是否存在
-    if not hasattr(mcd_api, function_name):
-        return jsonify({'success': False, 'message': f'接口 {function_name} 不存在'}), 404
 
     # 6. 调用 mcd_api 函数
     try:
@@ -204,5 +232,22 @@ def health():
     return jsonify({'status': 'ok', 'service': 'mcd-api-refactored'})
 
 
+def start_gunicorn():
+    bind_address = '0.0.0.0:5001'
+    worker_count = 5
+
+    cmd = [
+        sys.executable, '-m', 'gunicorn',
+        '-w', str(worker_count),
+        '-b', bind_address,
+        '--access-logfile', os.path.join(LOG_DIR, 'mcd_server.log'),
+        '--timeout', '100',
+        'mcd_server:app'   # 改成实际文件名
+    ]
+    os.system("pkill -f 'mcd_server:app' || true")
+    process = subprocess.Popen(cmd, cwd=CODE_DIR)
+    return process
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    gunicorn_process = start_gunicorn()
+    gunicorn_process.wait()   # 让主进程保持前台，便于进程管理器接管
