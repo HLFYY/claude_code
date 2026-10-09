@@ -244,10 +244,9 @@ def start_gunicorn():
         '--timeout', '100',
         'mcd_server:app'   # 改成实际文件名
     ]
-    os.system("pkill -f 'mcd_server:app' || true")
+    os.system("kill -9 $(ps -ef|grep mcd_server:app|grep -v grep|awk '{print $2}')")
     process = subprocess.Popen(cmd, cwd=CODE_DIR)
     return process
 
 if __name__ == '__main__':
     gunicorn_process = start_gunicorn()
-    gunicorn_process.wait()   # 让主进程保持前台，便于进程管理器接管

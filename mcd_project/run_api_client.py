@@ -8,6 +8,8 @@
 import sys
 import json
 import os
+import traceback
+
 import requests
 from datetime import datetime
 from config import DATA_DIR
@@ -40,7 +42,7 @@ def api_call(endpoint, method='GET', data=None, params=None):
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ API 请求失败: {str(e)}")
+        print(f"❌ API 请求失败: {traceback.format_exc()}")
         return {'success': False, 'message': f'API 请求失败: {str(e)}'}
 
 
