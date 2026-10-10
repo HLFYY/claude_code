@@ -95,19 +95,23 @@ werkzeug_logger.setLevel(logging.INFO)
 # 使用 Redis 存储的 LoginManager
 login_manager_cache = {}
 
-def get_login_manager(phone):
+def get_login_manager(phone, city=None):
     """获取或创建指定手机号的 LoginManager 实例（使用 Redis）"""
-    if phone not in login_manager_cache:
+    # 缓存 key 包含 city 信息，避免同一手机号不同城市共享实例
+    cache_key = f"{phone}:{city}" if city else phone
+
+    if cache_key not in login_manager_cache:
         # 传入全局单例，避免重复初始化
         manager = LoginManager(
             phone,
             use_redis=True,
+            city=city,  # 传递城市参数
             proxy_pool=get_proxy_pool(),
             binding_manager=get_binding_manager(),
             failure_handler=get_failure_handler()
         )
-        login_manager_cache[phone] = manager
-    return login_manager_cache[phone]
+        login_manager_cache[cache_key] = manager
+    return login_manager_cache[cache_key]
 
 # 配置
 CREDENTIALS_FILE = 'data/credentials.json'
@@ -120,15 +124,16 @@ def login_send_code():
     data = request.json or {}
     phone = data.get('phone')
     use_new_device = data.get('use_new_device', False)
+    city = data.get('city')  # 新增：获取城市参数
 
-    app.logger.info(f"[send_code] 请求参数: phone={phone}, use_new_device={use_new_device}")
+    app.logger.info(f"[send_code] 请求参数: phone={phone}, use_new_device={use_new_device}, city={city}")
 
     if not phone:
         error_msg = '缺少 phone 参数'
         app.logger.error(f"[send_code] ❌ 失败: {error_msg}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone)
+    login_manager = get_login_manager(phone, city)  # 传递 city 参数
     login_manager.load_credentials()
     # 发送验证码
     success, message = login_manager.send_verify_code(force_new_device=use_new_device)
@@ -149,15 +154,16 @@ def login_verify():
     data = request.json or {}
     phone = data.get('phone')
     verify_code = data.get('verify_code')
+    city = data.get('city')  # 新增：获取城市参数
 
-    app.logger.info(f"[login_verify] 请求参数: phone={phone}, verify_code={verify_code}")
+    app.logger.info(f"[login_verify] 请求参数: phone={phone}, verify_code={verify_code}, city={city}")
 
     if not phone or not verify_code:
         error_msg = '缺少 phone 或 verify_code 参数'
         app.logger.error(f"[login_verify] ❌ 参数错误: {error_msg}, 收到的数据: {data}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone)
+    login_manager = get_login_manager(phone, city)  # 传递 city 参数
     login_manager.load_credentials()
     # 调用登录
     success, message = login_manager.do_login(verify_code)
@@ -260,11 +266,12 @@ def universal_mcd_api(function_name):
 
     # 2. 提取登录信息
     phone = params.pop('phone', None)
+    city = params.pop('city', None)  # 新增：提取城市参数
 
     if not phone:
         return jsonify({'success': False, 'message': '缺少登录信息: 需要 phone 或 (token+sid)'}), 400
 
-    login_manager = get_login_manager(phone)
+    login_manager = get_login_manager(phone, city)  # 传递 city 参数
     token, sid, meddy_id_from_redis = login_manager.load_credentials()
 
     if not (token and sid):

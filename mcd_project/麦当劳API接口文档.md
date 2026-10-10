@@ -26,8 +26,12 @@
 |---|---|---|---|
 | phone | string | 是 | 手机号（11位） |
 | use_new_device | bool | 否 | 是否强制生成新设备 Token，默认 false |
+| city | string | 否 | 指定城市（如"上海"），优先分配该城市的代理（v2.0新增） |
 
-内部逻辑：优先复用 Redis/文件中已保存的设备 Token；若无则调用 `generate_token()` 生成新 Token 并通过 `activate_token()` 激活，再调用 `send_verification_code()` 发送验证码（手机号会先用 AES-128-ECB 加密）。
+内部逻辑：
+- 优先复用 Redis/文件中已保存的设备 Token；若无则调用 `generate_token()` 生成新 Token 并通过 `activate_token()` 激活
+- 调用 `send_verification_code()` 发送验证码（手机号会先用 AES-128-ECB 加密）
+- **v2.0 新增**：首次请求时自动为账号分配代理，如果指定 `city` 参数则优先分配同城代理
 
 响应：
 ```json
@@ -41,8 +45,11 @@
 |---|---|---|---|
 | phone | string | 是 | 手机号 |
 | verify_code | string | 是 | 6位短信验证码 |
+| city | string | 否 | 指定城市（如"上海"），优先分配该城市的代理（v2.0新增） |
 
 内部调用 `login_manager.do_login()` → `mcd_api.login()`，登录成功后凭证会自动落盘（Redis 或 `data/credentials.json`）。
+
+**v2.0 新增**：所有请求自动使用账号绑定的代理，如果指定 `city` 参数则优先分配同城代理。
 
 响应：
 ```json
@@ -93,10 +100,17 @@
 
 若函数需要 `mcd_id` 但未传，会自动用 Redis 中该手机号对应的 `meddy_id` 补全。
 
+**v2.0 重要更新：代理自动管理**
+- 所有通过此接口的请求会自动使用账号绑定的代理
+- 首次请求时自动为账号分配代理（负载均衡）
+- 请求失败自动触发四级容错机制（重试、临时切换、观察期、永久切换）
+- 业务代码无需关心代理管理，完全透明
+
 错误处理：
 - 函数不存在 → 404，`{"success": false, "message": "接口 xxx 不存在"}`
 - 参数错误（TypeError）→ 400
 - 调用异常 → 500
+- 代理请求失败 → 自动容错处理（不会直接返回错误）
 
 以下是 `function_name` 可取值及各自参数说明（均可通过该通用接口调用）：
 
@@ -200,7 +214,224 @@
 
 ---
 
-## 三、健康检查
+## 三、代理池管理接口（v2.0 新增）
+
+### 1. 查看代理池状态
+`GET /api/proxy/pool/status`
+
+无参数。
+
+响应：
+```json
+{
+  "success": true,
+  "data": {
+    "total_proxies": 3,
+    "active_proxies": 2,
+    "failed_proxies": 0,
+    "observation_proxies": 1,
+    "bound_accounts": 4
+  }
+}
+```
+
+### 2. 获取所有代理列表
+`GET /api/proxy/pool/list`
+
+无参数。
+
+响应：
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "mcd_proxy_001",
+      "host": "61.155.141.105",
+      "port": 20080,
+      "username": "user",
+      "protocol": "http",
+      "status": "active",
+      "city": "上海",
+      "bound_accounts": 2,
+      "success_count": 150,
+      "fail_count": 3,
+      "response_time": 0.43,
+      "last_check": "2026-10-10T16:57:56",
+      "created_at": "2026-10-10T10:00:00"
+    }
+  ]
+}
+```
+
+**代理状态说明：**
+- `active` - 正常可用
+- `slow` - 响应慢（>3秒）但可用
+- `observation` - 观察期（临时故障，5分钟观察期）
+- `failed` - 已失效
+- `disabled` - 已禁用（手动或连续失败5次）
+
+### 3. 添加代理到代理池
+`POST /api/proxy/pool/add`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| host | string | 是 | 代理IP地址 |
+| port | int | 是 | 代理端口 |
+| username | string | 否 | 代理用户名（无密码代理可不传） |
+| password | string | 否 | 代理密码 |
+| protocol | string | 否 | 协议类型，默认 'http'（可选 'https'/'socks5'） |
+| city | string | 否 | 代理所属城市（不传则自动查询） |
+
+响应：
+```json
+{
+  "success": true,
+  "data": {
+    "id": "mcd_proxy_003",
+    "host": "61.155.141.105",
+    "port": 20080,
+    "city": "上海",
+    "status": "active"
+  },
+  "message": "代理添加成功"
+}
+```
+
+### 4. 移除/禁用代理
+`POST /api/proxy/pool/remove`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| proxy_id | string | 是 | 代理ID（如 'mcd_proxy_001'） |
+
+响应：
+```json
+{
+  "success": true,
+  "message": "代理已禁用"
+}
+```
+
+**注意：** 此接口不会物理删除代理，而是将状态标记为 `disabled`，已绑定的账号会在下次请求时自动切换到其他代理。
+
+### 5. 查看账号代理绑定关系
+`GET /api/proxy/account/binding`
+
+无参数。
+
+响应：
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "phone": "13800138000",
+      "proxy_id": "mcd_proxy_001",
+      "temp_proxy_id": null,
+      "bound_at": "2026-10-10T10:00:00",
+      "in_observation": false,
+      "observation_start": null,
+      "observation_until": null,
+      "observation_fail_count": 0,
+      "total_fail_count": 0,
+      "fail_window_start": "2026-10-10T10:00:00",
+      "last_fail_time": null,
+      "request_count": 25,
+      "last_request": "2026-10-10T15:30:00"
+    }
+  ]
+}
+```
+
+**字段说明：**
+- `proxy_id` - 主代理ID（长期绑定）
+- `temp_proxy_id` - 临时代理ID（观察期时使用）
+- `in_observation` - 是否在观察期
+- `observation_fail_count` - 观察期内失败次数（≥10次会立即永久切换）
+- `total_fail_count` - 失败窗口（10分钟）内的总失败次数
+- `request_count` - 累计请求次数
+
+### 6. 手动切换账号代理
+`POST /api/proxy/account/switch`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| phone | string | 是 | 手机号 |
+
+响应：
+```json
+{
+  "success": true,
+  "data": {
+    "new_proxy_id": "mcd_proxy_002"
+  },
+  "message": "代理切换成功: mcd_proxy_002"
+}
+```
+
+**逻辑：** 自动排除当前代理，从可用代理池中选择负载最低的代理进行永久绑定。
+
+### 7. 获取代理池统计数据
+`GET /api/proxy/statistics`
+
+无参数。
+
+响应：
+```json
+{
+  "success": true,
+  "data": {
+    "total_proxies": 3,
+    "by_status": {
+      "active": 2,
+      "observation": 1
+    },
+    "by_city": {
+      "上海": {
+        "count": 2,
+        "bound_accounts": 3
+      },
+      "北京": {
+        "count": 1,
+        "bound_accounts": 1
+      }
+    },
+    "total_bound_accounts": 4,
+    "total_requests": 523,
+    "total_success": 508,
+    "total_fail": 15,
+    "success_rate": "97.13%"
+  }
+}
+```
+
+**字段说明：**
+- `by_status` - 按状态分组的代理数量
+- `by_city` - 按城市分组的代理数量和绑定账号数
+- `total_bound_accounts` - 总绑定账号数（实时计算）
+- `success_rate` - 全局成功率
+
+### 8. 手动触发健康检查
+`POST /api/proxy/health/check`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| proxy_id | string | 是 | 代理ID |
+
+响应：
+```json
+{
+  "success": true,
+  "data": true
+}
+```
+
+**返回值：** `true` 表示健康，`false` 表示失败。此接口会更新代理的健康状态和响应时间。
+
+---
+
+## 四、健康检查
 
 `GET /health`
 
@@ -213,9 +444,46 @@
 
 ---
 
-## 四、通用说明
+## 五、通用说明
 
-### 1. 时段代码（daypartCode）
+### 1. 代理池工作机制（v2.0 新增）
+
+#### 自动代理分配
+- 所有业务接口（通过 `/api/mcd/<function_name>` 调用）会自动使用账号绑定的代理
+- 首次请求时自动分配代理（优先同城市代理，负载均衡）
+- 单个代理最多绑定 5 个账号
+
+#### 四级容错机制
+代理请求失败时自动触发智能容错：
+
+**阶段1：立即重试**
+- 首次失败 → 等待 1 秒后使用相同代理重试
+- 连续失败 2 次 → 再次等待 1 秒后重试
+
+**阶段2：临时切换 + 观察期**
+- 连续失败 3 次 → 临时切换到新代理，原代理进入观察期（5分钟）
+- 观察期内使用临时代理，主代理暂停使用
+
+**阶段2.5：观察期内连续失败保护**
+- 观察期内连续失败 10 次 → 立即永久切换代理（不等观察期结束）
+
+**阶段3：观察期结束判断**
+- 观察期结束后自动健康检查主代理：
+  - 健康 → 恢复使用主代理
+  - 失败 → 永久切换到临时代理
+
+#### 失败计数窗口
+- 失败计数有 10 分钟滑动窗口
+- 10 分钟内的失败会累计，超过 10 分钟的失败自动清零
+- 避免历史失败永久影响代理状态
+
+#### 定时任务（scheduler.py）
+- **全量健康检查**：每 12 小时，检查所有代理状态
+- **观察期检查**：每 5 分钟，检查观察期账号是否恢复
+- **失败记录清理**：每天凌晨 3 点，清理过期失败记录
+- **绑定计数同步**：每 3 分钟，同步代理绑定账号数缓存
+
+### 2. 时段代码（daypartCode）
 多数接口的 `daypart_code` 不传时会调用 `get_current_daypart_code()` 按服务器当前时间自动计算：
 
 | 时间段 | 代码 | 含义 |
@@ -226,22 +494,160 @@
 | 17:00–21:59 | 5 | 夜市 |
 | 22:00–04:59 | 6 | 宵夜 |
 
-### 2. 堂食/外卖类型
+### 2. 时段代码（daypartCode）
+多数接口的 `daypart_code` 不传时会调用 `get_current_daypart_code()` 按服务器当前时间自动计算：
+
+| 时间段 | 代码 | 含义 |
+|---|---|---|
+| 05:00–10:29 | 1 | 早餐 |
+| 10:30–14:29 | 8 | 午餐 |
+| 14:30–16:59 | 4 | 下午茶 |
+| 17:00–21:59 | 5 | 夜市 |
+| 22:00–04:59 | 6 | 宵夜 |
+
+### 3. 堂食/外卖类型
 不同接口对 `order_type`/`be_type` 的取值含义略有差异（同一字段在不同上游接口中编码不一致，代码中已按各接口分别处理）：
 - 多数接口：`1`=堂食，`2`=外卖
 - `clear_cart` 中的 `be_type`：`0`=堂食，`1`=外卖
 
 调用时建议按各函数文档中给出的取值为准，不要跨接口套用。
 
-### 3. 鉴权凭证来源
+### 4. 鉴权凭证来源
 所有业务接口（除登录接口外）都需要 `token` + `sid`，两者的获取方式：
 - 通过 `phone` 参数由服务端自动从 Redis（`mcd:credentials` 哈希表，字段为手机号）读取，凭证由登录流程写入
 - 或调用方直接传入已有的 `token`/`sid`
 
-### 4. 请求签名机制（供理解 `mcd_api.py` 内部实现）
+### 5. 请求签名机制（供理解 `mcd_api.py` 内部实现）
 - v4 签名：`Authorization` 头由 `hmac-auth-v1` 格式的 HMAC-SHA256 签名组成，签名内容包含请求方法、路径、排序后的查询字符串、时间等；请求体额外用 `X-Hmac-Digest`（HMAC-SHA256）签名
 - v5 签名：通过独立的 `v5_rpc_client` 模块获取 `x-mcd-sign`，仅 `submit_order` 优先尝试使用，不可用时自动降级为 v4
 - 手机号、验证码在请求体中以 AES-128-ECB + PKCS7 加密后传输
 
-### 5. 多进程/多实例说明
+### 6. 多进程/多实例说明
 `mcd_server.py` 中的 `login_manager_cache` 是进程内内存字典（`{phone: LoginManager实例}`），仅用于避免重复创建对象；真正的凭证持久化在 `LoginManager(use_redis=True)` 对应的 Redis 中，因此多进程部署时凭证是共享一致的，但缓存对象本身不共享。
+
+代理池管理同样基于 Redis 持久化，支持多进程/多实例部署：
+- 代理池数据（`mcd:proxy:{id}`）存储在 Redis
+- 账号绑定关系（`mcd:account_binding:{phone}`）存储在 Redis
+- 全局单例模式（`get_proxy_pool()`、`get_binding_manager()`）确保进程内不重复初始化
+- 多进程间通过 Redis 共享代理状态和绑定关系
+
+---
+
+## 六、使用示例
+
+### 完整下单流程示例
+
+```python
+import requests
+
+API_BASE = 'http://127.0.0.1:5001'
+PHONE = '13800138000'
+
+# 1. 发送验证码
+response = requests.post(f'{API_BASE}/api/login/send_code', json={'phone': PHONE})
+print(response.json())
+
+# 2. 验证码登录
+response = requests.post(f'{API_BASE}/api/login/verify', json={
+    'phone': PHONE,
+    'verify_code': '123456'
+})
+print(response.json())
+
+# 3. 查询附近门店
+response = requests.post(f'{API_BASE}/api/mcd/get_nearby_stores', json={
+    'phone': PHONE,
+    'latitude': '31.230416',
+    'longitude': '121.473701'
+})
+stores = response.json()['data']['stores']
+store = stores[0]
+
+# 4. 获取门店菜单
+response = requests.post(f'{API_BASE}/api/mcd/get_store_menu', json={
+    'phone': PHONE,
+    'store_code': store['code'],
+    'be_code': store['beCode']
+})
+menu = response.json()['data']
+
+# 5. 获取商品详情
+product = menu['categories'][0]['products'][0]
+response = requests.post(f'{API_BASE}/api/mcd/get_product_detail', json={
+    'phone': PHONE,
+    'product_code': product['code'],
+    'store_code': store['code'],
+    'be_code': store['beCode']
+})
+product_detail = response.json()['data']
+
+# 6. 清空购物车
+response = requests.post(f'{API_BASE}/api/mcd/clear_cart', json={
+    'phone': PHONE,
+    'store_code': store['code'],
+    'be_code': store['beCode']
+})
+
+# 7. 添加商品到购物车
+response = requests.post(f'{API_BASE}/api/mcd/add_to_cart', json={
+    'phone': PHONE,
+    'store_code': store['code'],
+    'be_code': store['beCode'],
+    'product_code': product['code'],
+    'product_name': product['name'],
+    'product_image': product['image'],
+    'quantity': 1
+})
+cart = response.json()['data']
+
+# 8. 提交订单
+response = requests.post(f'{API_BASE}/api/mcd/submit_order', json={
+    'phone': PHONE,
+    'store_code': store['code'],
+    'cart_items': cart['cartItems'],
+    'latitude': '31.230416',
+    'longitude': '121.473701'
+})
+order = response.json()['data']
+
+# 9. 创建支付
+response = requests.post(f'{API_BASE}/api/mcd/create_payment', json={
+    'phone': PHONE,
+    'pay_id': order['payId'],
+    'pay_channel': 'ALI'
+})
+payment = response.json()['data']
+print(f"支付宝支付串: {payment['channelPayData']}")
+```
+
+### 代理池管理示例
+
+```python
+# 1. 添加代理
+response = requests.post(f'{API_BASE}/api/proxy/pool/add', json={
+    'host': '61.155.141.105',
+    'port': 20080,
+    'username': 'user',
+    'password': 'pass',
+    'protocol': 'http'
+})
+print(response.json())
+
+# 2. 查看代理池状态
+response = requests.get(f'{API_BASE}/api/proxy/pool/status')
+print(response.json())
+
+# 3. 查看账号绑定关系
+response = requests.get(f'{API_BASE}/api/proxy/account/binding')
+print(response.json())
+
+# 4. 手动切换账号代理
+response = requests.post(f'{API_BASE}/api/proxy/account/switch', json={
+    'phone': PHONE
+})
+print(response.json())
+
+# 5. 获取统计数据
+response = requests.get(f'{API_BASE}/api/proxy/statistics')
+print(response.json())
+```
