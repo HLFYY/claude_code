@@ -494,10 +494,24 @@ def proxy_statistics():
             'total_fail': 0
         }
 
+        # 从绑定关系中实时统计账号数（修复缓存计数不准确的问题）
+        all_bindings = binding_mgr.get_all_bindings()
+
+        # 按代理ID统计实际绑定的账号数
+        proxy_binding_count = {}
+        for binding in all_bindings:
+            proxy_id = binding.get('proxy_id')
+            if proxy_id:
+                proxy_binding_count[proxy_id] = proxy_binding_count.get(proxy_id, 0) + 1
+
         # 按状态统计
         for proxy in all_proxies:
             status = proxy['status']
             stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+
+            # 获取实际绑定账号数（从绑定关系统计，而非代理缓存）
+            proxy_id = proxy['id']
+            actual_bound_count = proxy_binding_count.get(proxy_id, 0)
 
             # 按城市统计
             city = proxy.get('city', '未知')
@@ -507,10 +521,10 @@ def proxy_statistics():
                     'bound_accounts': 0
                 }
             stats['by_city'][city]['count'] += 1
-            stats['by_city'][city]['bound_accounts'] += proxy.get('bound_accounts', 0)
+            stats['by_city'][city]['bound_accounts'] += actual_bound_count
 
-            # 累计统计
-            stats['total_bound_accounts'] += proxy.get('bound_accounts', 0)
+            # 累计统计（使用实际绑定数）
+            stats['total_bound_accounts'] += actual_bound_count
             stats['total_success'] += proxy.get('success_count', 0)
             stats['total_fail'] += proxy.get('fail_count', 0)
 

@@ -18,14 +18,6 @@ from proxy_pool import ProxyPool
 from account_proxy_binding import AccountProxyBinding
 from utils import log_info
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
 
 class ProxyFailureHandler:
     """代理失败处理器（四级容错）"""
@@ -55,7 +47,7 @@ class ProxyFailureHandler:
         self.observation_threshold = PROXY_FAILURE_CONFIG['observation_threshold']
         self.permanent_switch_threshold = PROXY_FAILURE_CONFIG['permanent_switch_threshold']
 
-        logger.info("✓ ProxyFailureHandler 初始化完成")
+        log_info("✓ ProxyFailureHandler 初始化完成")
 
     def handle_request_failure(self, phone: str, proxy_id: str, error: str) -> Tuple[bool, str, str, str]:
         """
@@ -76,7 +68,7 @@ class ProxyFailureHandler:
         binding = self.binding_manager.get_binding(phone)
 
         if not binding:
-            logger.error(f"账号 {phone} 没有绑定信息")
+            log_info(f"账号 {phone} 没有绑定信息")
             return (False, proxy_id, "error", "账号没有绑定信息")
 
         # 标记代理失败
@@ -91,7 +83,7 @@ class ProxyFailureHandler:
                 temp_proxy_id = binding['temp_proxy_id']
                 self.binding_manager.permanent_switch(phone, temp_proxy_id)
 
-                logger.error(
+                log_info(
                     f"账号 {phone[-4:]} 观察期内连续失败{observation_fail_count}次，"
                     f"立即永久切换到 {temp_proxy_id}"
                 )
@@ -103,7 +95,7 @@ class ProxyFailureHandler:
                         "观察期连续失败10次，立即永久切换")
             else:
                 # 继续使用临时代理
-                logger.warning(
+                log_info(
                     f"账号 {phone[-4:]} 观察期内失败 {observation_fail_count}/{self.permanent_switch_threshold} 次，"
                     f"继续使用临时代理 {binding['temp_proxy_id']}"
                 )
@@ -115,13 +107,13 @@ class ProxyFailureHandler:
 
         if total_fail_count == 1:
             # 阶段1：首次失败 → 立即重试
-            logger.info(f"账号 {phone[-4:]} 代理 {proxy_id} 首次失败，1秒后重试")
+            log_info(f"账号 {phone[-4:]} 代理 {proxy_id} 首次失败，1秒后重试")
             time.sleep(1)
             return (True, proxy_id, "retry_same_proxy", "首次失败，立即重试")
 
         elif total_fail_count == 2:
             # 第2次失败 → 继续重试
-            logger.warning(f"账号 {phone[-4:]} 代理 {proxy_id} 第2次失败，继续重试")
+            log_info(f"账号 {phone[-4:]} 代理 {proxy_id} 第2次失败，继续重试")
             time.sleep(1)
             return (True, proxy_id, "retry_same_proxy", "第2次失败，继续重试")
 
@@ -130,13 +122,13 @@ class ProxyFailureHandler:
             temp_proxy = self.proxy_pool.get_available_proxy(exclude=[proxy_id])
 
             if not temp_proxy:
-                logger.error(f"账号 {phone[-4:]} 无可用临时代理")
+                log_info(f"账号 {phone[-4:]} 无可用临时代理")
                 return (False, proxy_id, "error", "无可用代理")
 
             # 启动观察期
             self.binding_manager.start_observation(phone, proxy_id, temp_proxy['id'])
 
-            logger.warning(
+            log_info(
                 f"账号 {phone[-4:]} 代理 {proxy_id} 连续失败{total_fail_count}次，"
                 f"临时切换到 {temp_proxy['id']}，观察期{PROXY_FAILURE_CONFIG['observation_period']//60}分钟"
             )
@@ -148,12 +140,12 @@ class ProxyFailureHandler:
             new_proxy = self.proxy_pool.get_available_proxy(exclude=[proxy_id])
 
             if not new_proxy:
-                logger.error(f"账号 {phone[-4:]} 无可用代理")
+                log_info(f"账号 {phone[-4:]} 无可用代理")
                 return (False, proxy_id, "error", "无可用代理")
 
             self.binding_manager.permanent_switch(phone, new_proxy['id'])
 
-            logger.error(
+            log_info(
                 f"账号 {phone[-4:]} 代理 {proxy_id} 失败{total_fail_count}次（异常），"
                 f"永久切换到 {new_proxy['id']}"
             )

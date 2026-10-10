@@ -337,8 +337,8 @@ class ProxyPool:
         # 构建代理URL
         proxy_url = self._build_proxy_url(proxy)
 
-        # 测试请求
-        test_url = 'https://api.mcd.cn/bff/common/proxy/tid?channelId=96&campaignId=0&exposureId=0&groupId=0&salerId=0'
+        # 测试请求（使用百度作为测试URL，稳定且不需要认证）
+        test_url = 'https://www.baidu.com'
 
         try:
             start = time.time()
@@ -348,7 +348,6 @@ class ProxyPool:
                 proxies={'http': proxy_url, 'https': proxy_url},
                 timeout=PROXY_HEALTH_CHECK_CONFIG['health_check_timeout']
             )
-
             response_time = time.time() - start
 
             is_healthy = response.status_code == 200
