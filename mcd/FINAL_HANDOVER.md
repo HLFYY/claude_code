@@ -3,8 +3,8 @@
 **项目名称**: 麦当劳中国 App API 加密与签名逆向
 **项目周期**: 2026-09-14 至 2026-09-24
 **完成度**: 100% (所有功能已实现并验证)
-**最后更新**: 2026-09-24
-**文档版本**: v5.0 Final
+**最后更新**: 2026-10-10
+**文档版本**: v6.0 (代理池管理系统)
 
 ---
 
@@ -47,6 +47,13 @@ cat mcd_project/login_manager.py
 
 ### 已实现的功能（mcd_project 目录）
 
+**🎉 v2.0 新增：代理池管理系统** (2026-10-10)
+- ✅ **代理池管理** - 增删查改、状态管理、健康检查
+- ✅ **账号-代理绑定** - 长期绑定、负载均衡、城市优先
+- ✅ **四级智能容错** - 自动重试、临时切换、观察期、永久切换
+- ✅ **定时任务调度** - 全量检查、观察期检查、失败清理
+- ✅ **HTTP API 接口** - 8个代理管理接口（详见 `CHANGELOG.md`）
+
 **完整三步流程**：
 - ✅ **店铺选择流程** (`python run.py store`)
   - 附近店铺查询（通过经纬度）
@@ -71,11 +78,11 @@ cat mcd_project/login_manager.py
   - 生成支付二维码（⚠️ 当前二维码格式有问题，见下方"已知问题"）
 
 **核心 API 接口**：
-- ✅ Token 生成和激活
-- ✅ 发送验证码
-- ✅ 验证码登录
-- ✅ 登录状态检查
-- ✅ 多账号凭证管理
+- ✅ Token 生成和激活（支持代理）
+- ✅ 发送验证码（支持代理）
+- ✅ 验证码登录（支持代理）
+- ✅ 登录状态检查（自动代理）
+- ✅ 多账号凭证管理（Redis）
 - ✅ 获取城市信息（全部城市、当前城市）
 - ✅ 获取店铺列表（附近店铺、搜索店铺）
 - ✅ 获取店铺商品菜单
@@ -88,6 +95,15 @@ cat mcd_project/login_manager.py
 - ✅ 提交订单（v4 签名）
 - ✅ 获取支付渠道（v4 签名）
 - ✅ 创建支付（v4 签名）
+
+**v2.0 代理管理接口**：
+- ✅ 代理池状态查询
+- ✅ 代理池列表查询
+- ✅ 添加/移除代理
+- ✅ 账号代理绑定查询
+- ✅ 手动切换代理
+- ✅ 代理统计数据
+- ✅ 健康检查触发
 
 ### 已知问题
 
@@ -499,14 +515,23 @@ rm test_cart_operation.py
 
 ### 3.2 生产代码（mcd_project 目录）
 
-| 文件 | 说明 | 状态 |
-|------|------|------|
-| `mcd_api.py` | 核心 API 实现（签名、加密、所有业务接口） | ✅ 已验证 |
-| `config.py` | 配置文件（包含所有提取的密钥） | ✅ 已验证 |
-| `login_manager.py` | 登录管理器（多账号支持） | ✅ 已验证 |
-| `run.py` | 店铺查找和下单流程测试脚本 | ✅ 已实现 |
-| `credentials.json` | 多账号凭证存储 | ✅ 运行中 |
-| `README.md` | 项目使用文档 | ✅ 最新 |
+| 文件 | 说明 | 状态 | 版本 |
+|------|------|------|------|
+| `mcd_api.py` | 核心 API 实现（签名、加密、所有业务接口，支持代理） | ✅ 已验证 | v2.0 |
+| `config.py` | 配置文件（包含所有提取的密钥 + 代理配置） | ✅ 已验证 | v2.0 |
+| `login_manager.py` | 登录管理器（多账号支持 + 自动代理） | ✅ 已验证 | v2.0 |
+| `mcd_server.py` | HTTP API 服务器（新增8个代理管理接口） | ✅ 已验证 | v2.0 |
+| `proxy_pool.py` | 代理池管理器 | ✅ 新增 | v2.0 |
+| `account_proxy_binding.py` | 账号代理绑定管理器 | ✅ 新增 | v2.0 |
+| `proxy_failure_handler.py` | 四级容错失败处理器 | ✅ 新增 | v2.0 |
+| `proxy_manager.py` | 代理管理统一入口 | ✅ 新增 | v2.0 |
+| `ip_location.py` | IP 地理位置查询 | ✅ 新增 | v2.0 |
+| `scheduler.py` | 定时任务调度器 | ✅ 新增 | v2.0 |
+| `utils.py` | 公共工具函数 | ✅ 新增 | v2.0 |
+| `run.py` | 店铺查找和下单流程测试脚本 | ✅ 已实现 | v1.0 |
+| `credentials.json` | 多账号凭证存储（Redis） | ✅ 运行中 | v1.0 |
+| `README.md` | 项目使用文档 | ✅ 最新 | v2.0 |
+| `CHANGELOG.md` | 更新日志 | ✅ 新增 | v2.0 |
 
 **mcd_api.py 已实现的接口**：
 - **登录相关**: Token 生成/激活、发送验证码、验证码登录、登录状态检查
@@ -1094,4 +1119,225 @@ python3 mcdonald_api_auth.py
 - ✅ v5 签名（TDRisk SDK）已完全分析，但依赖服务端无法独立使用
 - ✅ 推荐使用 v4 签名，所有接口都支持
 - ✅ 项目已完成，生产代码可直接使用
+
+
+---
+
+## 十、v2.0 代理池管理系统（2026-10-10 新增）
+
+### 10.1 系统概述
+
+v2.0 新增了完整的**代理池管理系统**，实现了账号-代理绑定、智能故障切换和健康监控功能。
+
+**核心特性：**
+- ✅ 代理池管理（增删查改、状态管理、健康检查）
+- ✅ 账号-代理长期绑定（Redis 持久化）
+- ✅ 四级智能容错（自动重试、临时切换、观察期、永久切换）
+- ✅ 城市优先分配（自动查询代理 IP 城市）
+- ✅ 定时任务调度（全量检查、观察期检查、失败清理）
+- ✅ HTTP API 接口（8个代理管理接口）
+
+### 10.2 新增文件（8个）
+
+| 文件 | 说明 | 行数 |
+|------|------|------|
+| `proxy_pool.py` | 代理池管理器 | 791 |
+| `account_proxy_binding.py` | 账号代理绑定管理器 | 533 |
+| `proxy_failure_handler.py` | 四级容错失败处理器 | 278 |
+| `proxy_manager.py` | 代理管理统一入口 | 394 |
+| `ip_location.py` | IP 地理位置查询 | 119 |
+| `scheduler.py` | 定时任务调度器 | 125 |
+| `utils.py` | 公共工具函数 | 18 |
+| `requirements.txt` | 依赖包列表 | 7 |
+
+### 10.3 修改文件（6个）
+
+| 文件 | 主要改动 | 新增行数 |
+|------|----------|----------|
+| `config.py` | 新增代理相关配置 | +71 |
+| `login_manager.py` | 集成代理池、自动容错 | +167 |
+| `mcd_api.py` | 所有API支持代理参数 | +47 |
+| `mcd_server.py` | 新增8个代理管理接口 | +213 |
+| `demo.py` | 代理池初始化 | 重构 |
+| `run_api_client.py` | 小改 | -1 |
+
+### 10.4 四级容错机制
+
+```
+阶段1: 首次失败 → 立即重试（同代理）
+阶段2: 连续失败3次 → 临时切换 + 观察期（5分钟）
+阶段2.5: 观察期内连续失败10次 → 立即永久切换
+阶段3: 观察期结束 → 健康检查决定（恢复/永久切换）
+```
+
+### 10.5 HTTP API 接口（8个）
+
+| 接口路径 | 方法 | 功能 |
+|---------|------|------|
+| `/api/proxy/pool/status` | GET | 查看代理池状态 |
+| `/api/proxy/pool/list` | GET | 获取所有代理列表 |
+| `/api/proxy/pool/add` | POST | 添加代理到代理池 |
+| `/api/proxy/pool/remove` | POST | 移除/禁用代理 |
+| `/api/proxy/account/binding` | GET | 查看账号代理绑定关系 |
+| `/api/proxy/account/switch` | POST | 手动切换账号代理 |
+| `/api/proxy/statistics` | GET | 获取代理池统计数据 |
+| `/api/proxy/health/check` | POST | 手动触发健康检查 |
+
+### 10.6 快速开始
+
+**1. 添加代理到代理池**
+
+```python
+from proxy_pool import ProxyPool
+
+pool = ProxyPool()
+
+# 添加代理（自动查询城市）
+proxy = pool.add_proxy(
+    host='61.155.141.105',
+    port=20080,
+    username='user',
+    password='pass',
+    protocol='http'
+)
+```
+
+**2. 使用代理登录（自动）**
+
+```python
+from login_manager import LoginManager
+
+# 创建登录管理器（自动分配代理）
+manager = LoginManager(
+    phone="13800138000",
+    use_redis=True,
+    city="上海"  # 可选：优先使用上海的代理
+)
+
+# 登录（自动使用绑定的代理）
+token, sid, meddy_id = manager.ensure_login(auto_relogin=True)
+
+# 后续所有请求自动使用该账号绑定的代理
+# 失败自动触发四级容错机制
+```
+
+**3. 启动 HTTP API 服务器**
+
+```bash
+python mcd_server.py
+# 或使用 gunicorn
+gunicorn -w 4 -b 0.0.0.0:5001 mcd_server:app
+```
+
+**4. 启动定时任务调度器**
+
+```bash
+# 前台运行
+python scheduler.py
+
+# 后台运行
+nohup python scheduler.py > logs/scheduler.log 2>&1 &
+```
+
+### 10.7 配置说明
+
+所有配置项在 `config.py` 中可调整：
+
+```python
+# 请求超时时间（秒）
+PROXY_REQUEST_TIMEOUT = 15
+
+# 代理失败容错配置
+PROXY_FAILURE_CONFIG = {
+    'observation_threshold': 3,           # 加入观察期的失败次数阈值
+    'permanent_switch_threshold': 10,     # 观察期内永久换绑的失败次数阈值
+    'observation_period': 5 * 60,         # 观察期时长（秒）
+    'failure_window': 10 * 60,            # 失败计数时间窗口（秒）
+}
+
+# 代理池配置
+PROXY_POOL_CONFIG = {
+    'slow_threshold': 3.0,                # 响应时间阈值（秒）
+    'max_fail_count': 5,                  # 连续失败多少次标记为failed
+    'max_accounts_per_proxy': 5,          # 单个代理最大账号负载
+}
+```
+
+### 10.8 详细文档
+
+完整的代理池管理系统文档请参阅：
+- **[代理池管理系统详解](PROXY_POOL_SYSTEM.md)** (新增文档)
+- **[更新日志](../mcd_project/CHANGELOG.md)** (新增文档)
+
+内容包括：
+- 系统架构图
+- 核心模块详解
+- 四级容错流程图
+- HTTP API 接口详解
+- 配置说明
+- 监控运维
+- 故障排查
+- 性能优化建议
+
+### 10.9 技术亮点
+
+1. **全局单例模式** - 避免 ProxyPool/AccountProxyBinding/ProxyFailureHandler 重复初始化
+2. **Redis 持久化** - 所有代理信息、绑定关系、失败计数均存储在 Redis
+3. **无侵入集成** - LoginManager 自动处理代理分配和故障切换，业务代码无需修改
+4. **城市感知** - 自动查询代理 IP 城市，支持账号按城市优先分配代理
+5. **健康检查缓存** - 30秒 TTL，避免短时间重复检查同一代理
+6. **批量处理** - 健康检查支持分批（每批10个，间隔6秒）避免瞬间大量请求
+7. **日志增强** - 统一使用 `utils.log_info()`，支持 `flush=True` 确保 crontab 实时输出
+
+### 10.10 破坏性变更
+
+#### LoginManager 构造函数签名变化
+
+**旧版本：**
+```python
+LoginManager(phone, credentials_file=None, use_redis=False)
+```
+
+**新版本：**
+```python
+LoginManager(
+    phone,
+    credentials_file=None,
+    use_redis=True,  # 默认值改为 True
+    city=None,       # 新增：城市优先
+    proxy_pool=None, # 新增：代理池实例
+    binding_manager=None,  # 新增：绑定管理器实例
+    failure_handler=None   # 新增：失败处理器实例
+)
+```
+
+#### mcd_api.py 所有 API 函数签名变化
+
+所有 API 函数新增最后一个参数：`proxies=None`
+
+**示例：**
+```python
+# 旧版本
+send_verification_code(phone, token)
+
+# 新版本
+send_verification_code(phone, token, proxies=None)
+```
+
+### 10.11 依赖更新
+
+新增依赖：
+```
+schedule==1.2.0
+```
+
+安装命令：
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+**v2.0 更新时间**: 2026-10-10  
+**v2.0 核心贡献者**: 侯杰 + Claude Code
 

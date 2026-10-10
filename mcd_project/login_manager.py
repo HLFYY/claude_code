@@ -17,7 +17,7 @@ from typing import Optional, Tuple, Dict
 from functools import wraps
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
-from config import DATA_DIR, REDIS_SET_URL
+from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT
 from mcd_api import (
     generate_token,
     activate_token,
@@ -33,6 +33,12 @@ from exceptions import (
     ServerError,
     ValidationError
 )
+
+# 导入代理管理模块
+from proxy_pool import ProxyPool
+from account_proxy_binding import AccountProxyBinding
+from proxy_failure_handler import ProxyFailureHandler
+from utils import log_info
 
 
 def retry_on_network_error(max_attempts=3, base_delay=1.0, backoff=2.0):
@@ -63,7 +69,7 @@ def retry_on_network_error(max_attempts=3, base_delay=1.0, backoff=2.0):
 
                     if attempt < max_attempts - 1:
                         delay = base_delay * (backoff ** attempt)
-                        print(f"  ⚠️  网络请求失败，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
+                        log_info(f"  ⚠️  网络请求失败，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
                         time.sleep(delay)
 
                 except requests.HTTPError as e:
@@ -84,7 +90,7 @@ def retry_on_network_error(max_attempts=3, base_delay=1.0, backoff=2.0):
 
                         if attempt < max_attempts - 1:
                             delay = base_delay * (backoff ** attempt)
-                            print(f"  ⚠️  服务器错误，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
+                            log_info(f"  ⚠️  服务器错误，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
                             time.sleep(delay)
                     else:
                         # 其他 HTTP 错误，不重试
@@ -96,7 +102,7 @@ def retry_on_network_error(max_attempts=3, base_delay=1.0, backoff=2.0):
 
                     if attempt < max_attempts - 1:
                         delay = base_delay * (backoff ** attempt)
-                        print(f"  ⚠️  请求异常，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
+                        log_info(f"  ⚠️  请求异常，{delay:.1f}秒后重试... ({attempt + 1}/{max_attempts})")
                         time.sleep(delay)
 
             # 所有重试都失败
@@ -122,20 +128,26 @@ class LoginManager:
         token, sid, meddy_id = manager.ensure_login()
     """
 
-    def __init__(self, phone: str, credentials_file: str = None, use_redis: bool = False):
+    def __init__(self, phone: str, credentials_file: str = None, use_redis: bool = True, city: str = None,
+                 proxy_pool=None, binding_manager=None, failure_handler=None):
         """
         初始化登录管理器
 
         Args:
             phone: 手机号（11位）
             credentials_file: 凭证保存文件路径（默认：当前目录下的 credentials.json）
-            use_redis: 是否使用 Redis 存储（默认 False 使用文件）
+            use_redis: 是否使用 Redis 存储（默认 True）
+            city: 指定城市（可选），如果指定则优先分配该城市的代理
+            proxy_pool: ProxyPool 实例（可选，不传则自动创建）
+            binding_manager: AccountProxyBinding 实例（可选，不传则自动创建）
+            failure_handler: ProxyFailureHandler 实例（可选，不传则自动创建）
         """
         if len(phone) != 11:
             raise ValueError("手机号必须是11位数字")
 
         self.phone = phone
         self.use_redis = use_redis
+        self.city = city
 
         # 凭证文件路径
         if credentials_file is None:
@@ -158,6 +170,147 @@ class LoginManager:
         self.token: Optional[str] = None
         self.sid: Optional[str] = None
         self.meddy_id: Optional[str] = None
+
+        # ====== 新增：代理管理 ======
+        # 使用传入的实例或创建新实例
+        if proxy_pool is not None:
+            self.proxy_pool = proxy_pool
+        else:
+            from proxy_pool import ProxyPool
+            self.proxy_pool = ProxyPool()
+
+        if binding_manager is not None:
+            self.binding_manager = binding_manager
+        else:
+            from account_proxy_binding import AccountProxyBinding
+            self.binding_manager = AccountProxyBinding()
+
+        if failure_handler is not None:
+            self.failure_handler = failure_handler
+        else:
+            from proxy_failure_handler import ProxyFailureHandler
+            self.failure_handler = ProxyFailureHandler()
+
+        # 为当前账号分配代理
+        self._assign_proxy()
+
+        # 自动加载已保存的凭证（如果存在）
+        self.load_credentials()
+
+    def _assign_proxy(self) -> None:
+        """为当前账号分配代理"""
+        proxy_info = self.binding_manager.get_or_assign_proxy(self.phone, city=self.city)
+        self.current_proxy_id = proxy_info['id']
+
+    def _get_proxy_dict(self) -> Dict[str, str]:
+        """
+        获取当前代理的 requests proxies 字典
+
+        Returns:
+            {'http': 'http://user:pass@host:port', 'https': '...'}
+        """
+        # 获取当前应该使用的代理（可能是主代理或临时代理）
+        binding = self.binding_manager.get_binding(self.phone)
+
+        if not binding:
+            return {}
+
+        # 如果在观察期，使用临时代理
+        if binding.get('in_observation') and binding.get('temp_proxy_id'):
+            proxy_id = binding['temp_proxy_id']
+        else:
+            proxy_id = binding['proxy_id']
+
+        # 从代理池获取代理信息
+        proxy = self.proxy_pool.get_proxy(proxy_id)
+
+        if not proxy:
+            return {}
+
+        # 构建代理 URL
+        if proxy.get('username') and proxy.get('password'):
+            proxy_url = f"{proxy['protocol']}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+        else:
+            proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
+
+        return {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+
+    def _make_request_with_proxy(
+        self,
+        method: str,
+        url: str,
+        max_retries: int = 3,
+        **kwargs
+    ) -> requests.Response:
+        """
+        发送请求（集成代理和失败处理）
+
+        Args:
+            method: HTTP 方法（GET/POST）
+            url: 请求 URL
+            max_retries: 最大重试次数
+            **kwargs: requests 参数
+
+        Returns:
+            Response 对象
+
+        Raises:
+            NetworkError: 网络连接问题
+        """
+        last_error = None
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                # 获取当前代理
+                proxies = self._get_proxy_dict()
+
+                # 设置超时
+                if 'timeout' not in kwargs:
+                    kwargs['timeout'] = PROXY_REQUEST_TIMEOUT
+
+                # 发送请求
+                if method.upper() == 'GET':
+                    response = requests.get(url, proxies=proxies, **kwargs)
+                elif method.upper() == 'POST':
+                    response = requests.post(url, proxies=proxies, **kwargs)
+                else:
+                    raise ValueError(f"不支持的 HTTP 方法: {method}")
+
+                # 请求成功，标记代理成功
+                binding = self.binding_manager.get_binding(self.phone)
+                current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
+                self.failure_handler.handle_request_success(self.phone, current_proxy_id)
+
+                return response
+
+            except (ConnectionError, Timeout, RequestException) as e:
+                # 请求失败，使用失败处理器
+                binding = self.binding_manager.get_binding(self.phone)
+                current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
+
+                should_retry, new_proxy_id, action, msg = self.failure_handler.handle_request_failure(
+                    self.phone,
+                    current_proxy_id,
+                    str(e)
+                )
+
+                last_error = e
+
+                if not should_retry:
+                    raise NetworkError(f"网络连接失败: {str(e)}")
+
+                retry_count += 1
+
+                # 如果切换了代理，重置重试计数
+                if action in ["temp_switch", "permanent_switch", "permanent_switch_immediate"]:
+                    retry_count = 0
+
+        # 所有重试都失败
+        raise NetworkError(f"请求失败（已重试{max_retries}次）: {str(last_error)}")
 
     def save_credentials(self, token: str, sid: str, meddy_id: str) -> None:
         """
@@ -193,7 +346,7 @@ class LoginManager:
                     with open(self.credentials_file, 'r', encoding='utf-8') as f:
                         all_credentials = json.load(f)
                 except Exception as e:
-                    print(f"⚠️  警告: 读取旧凭证失败: {e}")
+                    log_info(f"⚠️  警告: 读取旧凭证失败: {e}")
                     # 继续执行，使用空字典
 
             # 更新当前手机号的凭证
@@ -233,7 +386,7 @@ class LoginManager:
         self.sid = sid
         self.meddy_id = meddy_id
 
-        print(f"✓ 凭证已保存 (手机号: {self.phone})")
+        log_info(f"✓ 凭证已保存 (手机号: {self.phone})")
 
     def load_credentials(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
@@ -260,11 +413,11 @@ class LoginManager:
                 self.sid = sid
                 self.meddy_id = meddy_id
 
-                print(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
+                log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
 
             except Exception as e:
-                print(f"✗ 加载凭证失败: {e}")
+                log_info(f"✗ 加载凭证失败: {e}")
                 return None, None, None
         else:
             # 文件存储
@@ -290,11 +443,11 @@ class LoginManager:
                 self.sid = sid
                 self.meddy_id = meddy_id
 
-                print(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
+                log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
 
             except Exception as e:
-                print(f"✗ 加载凭证失败: {e}")
+                log_info(f"✗ 加载凭证失败: {e}")
                 return None, None, None
 
     @retry_on_network_error(max_attempts=3, base_delay=1.0)
@@ -329,9 +482,9 @@ class LoginManager:
         )
         headers['Host'] = 'api2.mcd.cn'
 
-        # 发送请求（会被装饰器自动重试）
+        # 发送请求（使用代理和失败处理）
         url = API2_BASE + path
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = self._make_request_with_proxy('GET', url, headers=headers, params=params)
         # 检查 HTTP 状态码
         response.raise_for_status()  # 会抛出 HTTPError
 
@@ -382,8 +535,9 @@ class LoginManager:
         if not self.token:
             return False, "请先调用 send_verify_code 获取 token"
 
-        print(f"\n正在登录 (手机号: {self.phone})...")
-        success, sid, meddy_id, message = login(self.phone, verify_code, self.token)
+        log_info(f"\n正在登录 (手机号: {self.phone})...")
+        proxies = self._get_proxy_dict()
+        success, sid, meddy_id, message = login(self.phone, verify_code, self.token, proxies=proxies)
 
         if success:
             # 保存凭证
@@ -402,25 +556,32 @@ class LoginManager:
         Returns:
             (success, message)
         """
-        print(f"\n发送验证码到 {self.phone}...")
+        log_info(f"\n发送验证码到 {self.phone}...")
+        if not self.token:
+            self.load_credentials()
 
         # 1. 尝试使用已保存的 token（如果存在且未强制生成新设备）
         if not force_new_device and self.token:
-            print("  [1/2] 使用已保存的设备 Token（跳过激活）...")
+            log_info("  [1/2] 使用已保存的设备 Token（跳过激活）...")
             # 使用已有 token，无需激活
         else:
-            print("  [1/2] 生成新设备 Token...")
+            log_info("  [1/2] 生成新设备 Token...")
             self.token = generate_token()
 
             # 2. 激活新生成的 Token
-            print("  激活 Token...")
-            success, tid, message = activate_token(self.token)
+            log_info("  激活 Token...")
+            proxies = self._get_proxy_dict()
+            success, tid, message = activate_token(self.token, proxies=proxies)
             if not success:
                 return False, f"Token 激活失败: {message}"
 
+            # 保存新生成的 token 到 Redis（以便跨进程共享）
+            self.save_credentials(self.token, None, None)
+
         # 3. 发送验证码
-        print("  [2/2] 发送验证码...")
-        success, message = send_verification_code(self.phone, self.token)
+        log_info("  [2/2] 发送验证码...")
+        proxies = self._get_proxy_dict()
+        success, message = send_verification_code(self.phone, self.token, proxies=proxies)
         if not success:
             return False, f"发送验证码失败: {message}"
 
@@ -441,42 +602,42 @@ class LoginManager:
         Returns:
             (token, sid, meddy_id) 或 (None, None, None)
         """
-        print("=" * 80)
-        print(f"检查登录状态 (手机号: {self.phone})")
-        print("=" * 80)
+        log_info("=" * 80)
+        log_info(f"检查登录状态 (手机号: {self.phone})")
+        log_info("=" * 80)
 
         # 1. 尝试加载已保存的凭证
         token, sid, meddy_id = self.load_credentials()
 
         if token and sid:
             # 2. 验证凭证是否有效
-            print("\n验证登录状态...")
+            log_info("\n验证登录状态...")
 
             try:
                 is_valid, user_info = self.check_login_status()
 
                 if is_valid:
-                    print("\n✅ 登录状态有效")
-                    print("-" * 80)
-                    print(f"手机号: {user_info['phone']}")
-                    print(f"昵称: {user_info['name']}")
-                    print(f"积分: {user_info['points']}")
-                    print(f"身份: {user_info['identity']}")
-                    print(f"MeddyId: {user_info['meddy_id']}")
-                    print("-" * 80)
+                    log_info("\n✅ 登录状态有效")
+                    log_info("-" * 80)
+                    log_info(f"手机号: {user_info['phone']}")
+                    log_info(f"昵称: {user_info['name']}")
+                    log_info(f"积分: {user_info['points']}")
+                    log_info(f"身份: {user_info['identity']}")
+                    log_info(f"MeddyId: {user_info['meddy_id']}")
+                    log_info("-" * 80)
                     return self.token, self.sid, self.meddy_id
 
             except AuthenticationError as e:
                 # 凭证确实失效
-                print(f"\n✗ 登录状态已失效: {e}")
+                log_info(f"\n✗ 登录状态已失效: {e}")
                 if not auto_relogin:
-                    print("提示: 调用 send_verify_code() 和 do_login() 重新登录")
+                    log_info("提示: 调用 send_verify_code() 和 do_login() 重新登录")
                     return None, None, None
 
             except (NetworkError, ServerError) as e:
                 # 网络问题或服务器错误
-                print(f"\n⚠️  无法验证登录状态: {e}")
-                print("提示: 网络连接问题，请检查网络后重试")
+                log_info(f"\n⚠️  无法验证登录状态: {e}")
+                log_info("提示: 网络连接问题，请检查网络后重试")
 
                 # 网络问题时，不清空凭证，返回现有凭证
                 # （后续请求可能会成功）
@@ -484,29 +645,29 @@ class LoginManager:
 
             except Exception as e:
                 # 未预期的错误
-                print(f"\n❌ 验证登录状态时发生未知错误: {e}")
+                log_info(f"\n❌ 验证登录状态时发生未知错误: {e}")
                 return None, None, None
 
         else:
-            print("\n✗ 未找到已保存的凭证")
+            log_info("\n✗ 未找到已保存的凭证")
             if not auto_relogin:
-                print("提示: 调用 send_verify_code() 和 do_login() 进行登录")
+                log_info("提示: 调用 send_verify_code() 和 do_login() 进行登录")
                 return None, None, None
 
         # 3. 自动重新登录
         if auto_relogin:
-            print("\n" + "=" * 80)
-            print("开始重新登录流程")
-            print("=" * 80)
+            log_info("\n" + "=" * 80)
+            log_info("开始重新登录流程")
+            log_info("=" * 80)
 
             try:
                 # 发送验证码（新账号或强制新设备时生成新token，否则使用原token）
                 success, message = self.send_verify_code(force_new_device=force_new_device)
                 if not success:
-                    print(f"\n❌ {message}")
+                    log_info(f"\n❌ {message}")
                     return None, None, None
 
-                print(f"\n✅ {message}")
+                log_info(f"\n✅ {message}")
 
                 # 等待用户输入验证码
                 verify_code = input("\n请输入6位验证码: ").strip()
@@ -514,15 +675,15 @@ class LoginManager:
                 # 执行登录
                 success, message = self.do_login(verify_code)
                 if not success:
-                    print(f"\n❌ {message}")
+                    log_info(f"\n❌ {message}")
                     return None, None, None
 
-                print(f"\n✅ {message}")
+                log_info(f"\n✅ {message}")
                 return self.token, self.sid, self.meddy_id
 
             except (NetworkError, ServerError) as e:
-                print(f"\n❌ 登录失败: {e}")
-                print("提示: 网络连接问题，请稍后重试")
+                log_info(f"\n❌ 登录失败: {e}")
+                log_info("提示: 网络连接问题，请稍后重试")
                 return None, None, None
 
         return None, None, None
@@ -549,9 +710,9 @@ class LoginManager:
             # Redis 存储
             try:
                 self.redis_client.hdel(self.redis_key, self.phone)
-                print(f"✓ 已清除凭证 (手机号: {self.phone})")
+                log_info(f"✓ 已清除凭证 (手机号: {self.phone})")
             except Exception as e:
-                print(f"✗ 清除凭证失败: {e}")
+                log_info(f"✗ 清除凭证失败: {e}")
         else:
             # 文件存储
             if os.path.exists(self.credentials_file):
@@ -565,9 +726,9 @@ class LoginManager:
                         with open(self.credentials_file, 'w', encoding='utf-8') as f:
                             json.dump(all_credentials, f, indent=2, ensure_ascii=False)
 
-                        print(f"✓ 已清除凭证 (手机号: {self.phone})")
+                        log_info(f"✓ 已清除凭证 (手机号: {self.phone})")
                 except Exception as e:
-                    print(f"✗ 清除凭证失败: {e}")
+                    log_info(f"✗ 清除凭证失败: {e}")
 
 
 if __name__ == '__main__':

@@ -16,8 +16,8 @@ from config import DATA_DIR
 
 
 # API 配置
-API_BASE = 'http://43.163.92.204:5001'
-# API_BASE = 'http://127.0.0.1:5001'
+# API_BASE = 'http://43.163.92.204:5001'
+API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
 DEFAULT_PHONE = '16752934813'
 DEFAULT_LATITUDE = 31.026543
@@ -103,7 +103,7 @@ def get_login_info():
     })
 
     if not result.get('success'):
-        print(f"❌ {result.get('message', '登录失败')}")
+        print(f"❌ {result}")
         sys.exit(1)
 
     print(f"✅ 登录成功")
@@ -896,7 +896,6 @@ def payment_flow(arg2=''):
         'phone': phone,
         'order_id': order_id,
         'pay_id': pay_id,
-        'mcd_id': meddy_id
     })
 
     if not result.get('success'):

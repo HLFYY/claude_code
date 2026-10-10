@@ -23,6 +23,10 @@ from email.utils import formatdate
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
+# 导入配置
+from config import PROXY_REQUEST_TIMEOUT
+from utils import log_info
+
 # v5 RPC 客户端（可选）
 try:
     from v5_rpc_client import get_v5_sign_rpc, check_v5_rpc_health, configure_v5_rpc
@@ -52,6 +56,53 @@ API2_BASE = 'https://api2.mcd.cn'
 
 
 # ========== 工具函数 ==========
+
+def make_request(method, url, headers, params=None, data=None, proxies=None, timeout=None):
+    """
+    统一的 HTTP 请求处理函数
+
+    Args:
+        method: HTTP 方法 ('GET', 'POST', 'PUT')
+        url: 请求 URL
+        headers: 请求头字典
+        params: 查询参数字典 (可选)
+        data: 请求体字符串 (可选)
+        proxies: 代理字典 {'http': '...', 'https': '...'} (可选)
+        timeout: 超时时间（秒），默认使用 config.PROXY_REQUEST_TIMEOUT
+
+    Returns:
+        (success, result_data, message)
+    """
+    if timeout is None:
+        timeout = PROXY_REQUEST_TIMEOUT
+
+    try:
+        if method.upper() == 'GET':
+            response = requests.get(url, headers=headers, params=params, proxies=proxies, timeout=timeout)
+        elif method.upper() == 'POST':
+            response = requests.post(url, headers=headers, data=data, proxies=proxies, timeout=timeout)
+        elif method.upper() == 'PUT':
+            response = requests.put(url, headers=headers, data=data, proxies=proxies, timeout=timeout)
+        else:
+            return False, {}, f"不支持的 HTTP 方法: {method}"
+
+        result = response.json()
+
+        if result.get('success'):
+            data = result.get('data', {})
+            return True, data, result.get('message', '请求成功')
+        else:
+            return False, {}, result.get('message', '请求失败')
+
+    except requests.exceptions.Timeout:
+        return False, {}, f"请求超时 ({timeout}秒)"
+    except requests.exceptions.ProxyError:
+        return False, {}, "代理连接失败"
+    except requests.exceptions.ConnectionError:
+        return False, {}, "网络连接失败"
+    except Exception as e:
+        return False, {}, f"请求异常: {str(e)}"
+
 
 def get_current_daypart_code():
     """
@@ -268,7 +319,7 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
 
 # ========== 主要功能 ==========
 
-def activate_token(token):
+def activate_token(token, proxies=None):
     """
     步骤 1.5: Token 激活 (获取 tid)
 
@@ -276,6 +327,7 @@ def activate_token(token):
 
     Args:
         token: 设备 Token
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, tid, message)
@@ -294,26 +346,23 @@ def activate_token(token):
 
     # 发送请求
     url = f'{API_BASE}/bff/common/proxy/tid'
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            tid = result.get('data', {}).get('tid', '')
-            return True, tid, "Token 激活成功"
-        else:
-            return False, '', result.get('message', '激活失败')
-    except Exception as e:
-        return False, '', f"请求异常: {str(e)}"
+    if success:
+        tid = data.get('tid', '')
+        return True, tid, "Token 激活成功"
+    else:
+        return False, '', message
 
 
-def send_verification_code(phone, token):
+def send_verification_code(phone, token, proxies=None):
     """
     步骤 2: 发送验证码
 
     Args:
         phone: 手机号 (明文)
         token: 设备 Token
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, message)
@@ -336,19 +385,15 @@ def send_verification_code(phone, token):
 
     # 发送请求
     url = f'{API2_BASE}{path}'
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            return True, "验证码已发送"
-        else:
-            return False, result.get('message', '发送失败')
-    except Exception as e:
-        return False, f"请求异常: {str(e)}"
+    if success:
+        return True, "验证码已发送"
+    else:
+        return False, message
 
 
-def login(phone, verify_code, token):
+def login(phone, verify_code, token, proxies=None):
     """
     步骤 3: 提交登录
 
@@ -356,6 +401,7 @@ def login(phone, verify_code, token):
         phone: 手机号 (明文)
         verify_code: 短信验证码 (明文)
         token: 设备 Token
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, sid, meddy_id, message)
@@ -382,30 +428,26 @@ def login(phone, verify_code, token):
 
     # 发送请求
     url = f'{API2_BASE}{path}'
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            sid = data.get('sid', '')
-            meddy_id = data.get('meddyId', '')
-            return True, sid, meddy_id, "登录成功"
-        else:
-            return False, '', '', result.get('message', '登录失败')
-    except Exception as e:
-        return False, '', '', f"请求异常: {str(e)}"
+    if success:
+        sid = data.get('sid', '')
+        meddy_id = data.get('meddyId', '')
+        return True, sid, meddy_id, "登录成功"
+    else:
+        return False, '', '', message
 
 
 # ========== 店铺相关 API ==========
 
-def get_all_cities(token, sid):
+def get_all_cities(token, sid, proxies=None):
     """
     获取所有城市信息 (对应 curl: /bff/store/cities/group)
 
     Args:
         token: 设备 Token
         sid: 会话 SID
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, cities_data, message)
@@ -413,20 +455,15 @@ def get_all_cities(token, sid):
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/store/cities/group')
     url = f'{API_BASE}/bff/store/cities/group'
 
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取城市信息成功"
-        else:
-            return False, {}, result.get('message', '获取城市信息失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取城市信息成功"
+    else:
+        return False, {}, message
 
 
-def get_city_by_location(token, sid, latitude, longitude):
+def get_city_by_location(token, sid, latitude, longitude, proxies=None):
     """
     通过经纬度获取当前城市信息 (对应 curl: /bff/store/cities)
 
@@ -435,6 +472,7 @@ def get_city_by_location(token, sid, latitude, longitude):
         sid: 会话 SID
         latitude: 纬度
         longitude: 经度
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, city_data, message)
@@ -446,21 +484,16 @@ def get_city_by_location(token, sid, latitude, longitude):
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/store/cities', query_params=params)
     url = f'{API_BASE}/bff/store/cities'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            city = data.get('city', {})
-            return True, data, f"获取城市成功: {city.get('name', '')}"
-        else:
-            return False, {}, result.get('message', '获取城市失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        city = data.get('city', {})
+        return True, data, f"获取城市成功: {city.get('name', '')}"
+    else:
+        return False, {}, message
 
 
-def search_stores(token, sid, city_code, keyword, page_no=1, page_size=10, hot_tag_code='', be_type='', daypart_codes=''):
+def search_stores(token, sid, city_code, keyword, page_no=1, page_size=10, hot_tag_code='', be_type='', daypart_codes='', proxies=None):
     """
     通过搜索获取店铺列表 (对应 curl: /bff/store/stores)
 
@@ -474,6 +507,7 @@ def search_stores(token, sid, city_code, keyword, page_no=1, page_size=10, hot_t
         hot_tag_code: 热门标签代码
         be_type: BE类型
         daypart_codes: 时段代码
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, stores_data, message)
@@ -490,22 +524,17 @@ def search_stores(token, sid, city_code, keyword, page_no=1, page_size=10, hot_t
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/store/stores', query_params=params)
     url = f'{API_BASE}/bff/store/stores'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            stores = data.get('stores', [])
-            total_size = data.get('totalSize', 0)
-            return True, data, f"找到 {total_size} 家店铺"
-        else:
-            return False, {}, result.get('message', '搜索店铺失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        stores = data.get('stores', [])
+        total_size = data.get('totalSize', 0)
+        return True, data, f"找到 {total_size} 家店铺"
+    else:
+        return False, {}, message
 
 
-def get_nearby_stores(token, sid, latitude, longitude, show_type='2', be_type='', order_type=1, keyword=''):
+def get_nearby_stores(token, sid, latitude, longitude, show_type='2', be_type='', order_type=1, keyword='', proxies=None):
     """
     获取附近店铺
 
@@ -518,6 +547,7 @@ def get_nearby_stores(token, sid, latitude, longitude, show_type='2', be_type=''
         be_type: BE类型
         order_type: 订单类型 (1=堂食, 2=外卖)
         keyword: 搜索关键词
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, stores_list, message)
@@ -534,21 +564,16 @@ def get_nearby_stores(token, sid, latitude, longitude, show_type='2', be_type=''
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/store/stores/vicinity', query_params=params)
     url = f'{API_BASE}/bff/store/stores/vicinity'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            stores = data.get('stores', [])
-            return True, data, f"找到 {len(stores)} 家店铺"
-        else:
-            return False, [], result.get('message', '获取店铺失败')
-    except Exception as e:
-        return False, [], f"请求异常: {str(e)}"
+    if success:
+        stores = data.get('stores', [])
+        return True, data, f"找到 {len(stores)} 家店铺"
+    else:
+        return False, [], message
 
 
-def get_store_menu(token, sid, store_code, be_code='', order_type=1, daypart_code=None, order_mode='0', pin_id=''):
+def get_store_menu(token, sid, store_code, be_code='', order_type=1, daypart_code=None, order_mode='0', pin_id='', proxies=None):
     """
     获取店铺菜单 (对应 curl: /bff/spc/menu)
 
@@ -561,6 +586,7 @@ def get_store_menu(token, sid, store_code, be_code='', order_type=1, daypart_cod
         daypart_code: 时段编码 (None=自动获取)
         order_mode: 订单模式 (默认'0')
         pin_id: Pin ID (默认'')
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, menu_data, message)
@@ -584,22 +610,17 @@ def get_store_menu(token, sid, store_code, be_code='', order_type=1, daypart_cod
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/spc/menu', query_params=params)
     url = f'{API_BASE}/bff/spc/menu'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取菜单成功"
-        else:
-            return False, {}, result.get('message', '获取菜单失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取菜单成功"
+    else:
+        return False, {}, message
 
 
 def get_product_detail(token, sid, product_code, store_code, be_code='', order_type=1, daypart_code=None,
                        card_id='', coupon_code='', coupon_id='', channel_code='03', order_mode='0',
-                       page_source=1, pin_id='', product_promotions=None):
+                       page_source=1, pin_id='', product_promotions=None, proxies=None):
     """
     获取商品详情 (对应 curl: /bff/spc/products/detail/{product_code})
 
@@ -619,6 +640,7 @@ def get_product_detail(token, sid, product_code, store_code, be_code='', order_t
         page_source: 页面来源 (默认1)
         pin_id: Pin ID
         product_promotions: 商品促销信息列表
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, product_data, message)
@@ -654,22 +676,17 @@ def get_product_detail(token, sid, product_code, store_code, be_code='', order_t
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path=f'/bff/spc/products/detail/{product_code}')
     url = f'{API_BASE}/bff/spc/products/detail/{product_code}'
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取商品详情成功"
-        else:
-            return False, {}, result.get('message', '获取详情失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取商品详情成功"
+    else:
+        return False, {}, message
 
 
 # ========== 购物车相关 API ==========
 
-def get_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=None):
+def get_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=None, proxies=None):
     """
     查询购物车
 
@@ -680,6 +697,7 @@ def get_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=None
         be_code: BE编码
         order_type: 订单类型 (1=堂食, 2=外卖)
         daypart_code: 时段编码 (None=自动获取)
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, cart_data, message)
@@ -702,21 +720,16 @@ def get_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=None
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/cart/carts', query_params=params)
     url = f'{API_BASE}/bff/cart/carts'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取购物车成功"
-        else:
-            return False, {}, result.get('message', '获取购物车失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取购物车成功"
+    else:
+        return False, {}, message
 
 
 def clear_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=None,
-               store_name='', channel_code='03', order_mode='0', pin_id='', pickup_time_type=''):
+               store_name='', channel_code='03', order_mode='0', pin_id='', pickup_time_type='', proxies=None):
     """
     清空购物车 (对应 curl: /bff/cart/carts/empty)
 
@@ -732,6 +745,7 @@ def clear_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=No
         order_mode: 订单模式 (默认'0')
         pin_id: Pin ID
         pickup_time_type: 取餐时间类型
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, message)
@@ -764,16 +778,12 @@ def clear_cart(token, sid, store_code, be_code='', order_type=1, daypart_code=No
     headers = build_headers(token, sid=sid, body=body_str, method='PUT', path='/bff/cart/carts/empty')
     url = f'{API_BASE}/bff/cart/carts/empty'
 
-    try:
-        response = requests.put(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "清空购物车成功"
-        else:
-            return False, {}, result.get('message', '清空购物车失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    success, data, message = make_request('PUT', url, headers, data=body_str, proxies=proxies)
+
+    if success:
+        return True, data, "清空购物车成功"
+    else:
+        return False, {}, message
 
 
 def extract_default_modification(product_detail):
@@ -814,7 +824,7 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
                 modification=None, suggestion_embedding='',
                 store_name='', channel_code='03', order_mode='0', pin_id='', pickup_time_type='',
                 card_id='', card_type=0, coupon_code='', coupon_id='', gm_assist_service_code='',
-                membership_code='', sequence=-1, animation_id=''):
+                membership_code='', sequence=-1, animation_id='', proxies=None):
     """
     添加商品到购物车 (对应 curl: /bff/cart/carts PUT)
 
@@ -846,6 +856,7 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         membership_code: 会员代码
         sequence: 序列号
         animation_id: 动画ID
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, cart_data, message)
@@ -910,24 +921,19 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
     headers = build_headers(token, sid=sid, body=body_str, method='PUT', path='/bff/cart/carts')
     url = f'{API_BASE}/bff/cart/carts'
 
-    try:
-        response = requests.put(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('PUT', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "添加购物车成功"
-        else:
-            return False, {}, result.get('message', '添加购物车失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "添加购物车成功"
+    else:
+        return False, {}, message
 
 
 # ========== 订单相关 API ==========
 
 def get_order_validation_info(token, sid, store_code, channel_code='03', order_type=1, cart_type=1,
                                daypart_code=None, be_code='', table_id='', date='', time='',
-                               pickup_time_type='', pin_id='', order_mode=0):
+                               pickup_time_type='', pin_id='', order_mode=0, proxies=None):
     """
     获取订单验证信息 (对应 curl: /bff/order/confirmation/validationinfo)
     购物车点击去结算请求1
@@ -947,6 +953,7 @@ def get_order_validation_info(token, sid, store_code, channel_code='03', order_t
         pickup_time_type: 取餐时间类型
         pin_id: Pin ID
         order_mode: 订单模式 (默认0)
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, validation_data, message)
@@ -972,22 +979,17 @@ def get_order_validation_info(token, sid, store_code, channel_code='03', order_t
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/order/confirmation/validationinfo', query_params=params)
     url = f'{API_BASE}/bff/order/confirmation/validationinfo'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取订单验证信息成功"
-        else:
-            return False, {}, result.get('message', '获取订单验证信息失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取订单验证信息成功"
+    else:
+        return False, {}, message
 
 
 def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', daypart_code=None,
                              order_type='1', eat_type_code='eat-in', tableware_code='no',
-                             order_mode='0', pin_id='', real_total_amount='0'):
+                             order_mode='0', pin_id='', real_total_amount='0', proxies=None):
     """
     获取促销/优惠券信息 (对应 curl: /bff/order/confirmation/promotion)
     购物车点击去结算请求2
@@ -1005,6 +1007,7 @@ def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', da
         order_mode: 订单模式 (默认'0')
         pin_id: Pin ID
         real_total_amount: 实际总金额
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, promotion_data, message)
@@ -1046,20 +1049,15 @@ def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', da
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/order/confirmation/promotion')
     url = f'{API_BASE}/bff/order/confirmation/promotion'
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取促销信息成功"
-        else:
-            return False, {}, result.get('message', '获取促销信息失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取促销信息成功"
+    else:
+        return False, {}, message
 
 
-def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code=''):
+def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code='', proxies=None):
     """
     获取最近门店信息 (对应 curl: /bff/store/stores/getNearest/{store_code})
     点击去支付时验证门店
@@ -1071,6 +1069,7 @@ def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code=
         latitude: 纬度
         longitude: 经度
         be_code: BE编码
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, store_info, message)
@@ -1085,23 +1084,18 @@ def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code=
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path=f'/bff/store/stores/getNearest/{store_code}')
     url = f'{API_BASE}/bff/store/stores/getNearest/{store_code}'
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取门店信息成功"
-        else:
-            return False, {}, result.get('message', '获取门店信息失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取门店信息成功"
+    else:
+        return False, {}, message
 
 
 def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=None,
                 order_type='1', eat_type_code='eat-in', tableware_code='no',
                 order_mode='0', pin_id='', latitude=0.0, longitude=0.0,
-                date='', time='', menu_card_list=None, real_total_amount=0):
+                date='', time='', menu_card_list=None, real_total_amount=0, proxies=None):
     """
     提交订单 (对应 curl: /bff/order/orders)
     使用 v5 加密
@@ -1123,6 +1117,8 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         date: 预约日期
         time: 预约时间
         menu_card_list: 菜单卡列表
+        real_total_amount: 实际总金额
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, order_data, message)
@@ -1175,9 +1171,9 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         if success:
             use_v5 = True
             v5_signature = signature
-            print(f"✅ 使用 v5 签名")
+            log_info(f"✅ 使用 v5 签名")
         else:
-            print(f"⚠️  v5 签名获取失败({msg})，降级到 v4")
+            log_info(f"⚠️  v5 签名获取失败({msg})，降级到 v4")
 
     # 构建请求头
     if use_v5:
@@ -1200,21 +1196,16 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         # v4 签名（降级）
         headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path)
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
-        if result.get('success'):
-            data = result.get('data', {})
-            order_id = data.get('orderId')
-            pay_id = data.get('payId')
-            return True, data, f"订单提交成功，订单号: {order_id}"
-        else:
-            return False, {}, result.get('message', '提交订单失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
+
+    if success:
+        order_id = data.get('orderId')
+        return True, data, f"订单提交成功，订单号: {order_id}"
+    else:
+        return False, {}, message
 
 
-def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0):
+def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, proxies=None):
     """
     获取支付渠道 (对应 curl: /bff/cashier/channels)
 
@@ -1225,6 +1216,7 @@ def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0):
         pay_id: 支付ID
         mcd_id: 麦当劳用户ID (meddyId)
         source: 来源 (默认0)
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, channels_data, message)
@@ -1238,20 +1230,15 @@ def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0):
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/cashier/channels', query_params=params)
     url = f'{API_BASE}/bff/cashier/channels'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取支付渠道成功"
-        else:
-            return False, {}, result.get('message', '获取支付渠道失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取支付渠道成功"
+    else:
+        return False, {}, message
 
 
-def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, source=0):
+def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, source=0, proxies=None):
     """
     创建支付订单 (对应 curl: /bff/cashier/preorder)
 
@@ -1262,6 +1249,7 @@ def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, so
         pay_channel: 支付渠道 (ALI=支付宝, WX=微信, UNION=银联)
         free_pay_flg: 是否免密支付
         source: 来源 (默认0)
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, payment_data, message)
@@ -1277,20 +1265,15 @@ def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, so
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/cashier/preorder')
     url = f'{API_BASE}/bff/cashier/preorder'
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "创建支付订单成功"
-        else:
-            return False, {}, result.get('message', '创建支付订单失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "创建支付订单成功"
+    else:
+        return False, {}, message
 
 
-def get_order_list(token, sid, cursor='', page_size=10):
+def get_order_list(token, sid, cursor='', page_size=10, proxies=None):
     """
     获取账号订单列表 (对应 curl: /bff/order/orders/list)
 
@@ -1299,6 +1282,7 @@ def get_order_list(token, sid, cursor='', page_size=10):
         sid: 会话 SID
         cursor: 分页游标（空字符串表示第一页）
         page_size: 每页数量（默认10）
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, order_list_data, message)
@@ -1312,20 +1296,15 @@ def get_order_list(token, sid, cursor='', page_size=10):
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/order/orders/list')
     url = f'{API_BASE}/bff/order/orders/list'
 
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        result = response.json()
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取订单列表成功"
-        else:
-            return False, {}, result.get('message', '获取订单列表失败')
-    except Exception as e:
-        return False, {}, f"请求异常: {str(e)}"
+    if success:
+        return True, data, "获取订单列表成功"
+    else:
+        return False, {}, message
 
 
-def get_order_detail(token, sid, order_id):
+def get_order_detail(token, sid, order_id, proxies=None):
     """
     获取订单详情 (对应 curl: /bff/order/orders/{order_id})
 
@@ -1333,6 +1312,7 @@ def get_order_detail(token, sid, order_id):
         token: 设备 Token
         sid: 会话 SID
         order_id: 订单ID
+        proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
         (success, order_data, message)
@@ -1341,14 +1321,10 @@ def get_order_detail(token, sid, order_id):
     headers = build_headers(token, sid=sid, body='', method='GET', path=f'/bff/order/orders/{order_id}', query_params=params)
     url = f'{API_BASE}/bff/order/orders/{order_id}'
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
 
-        if result.get('success'):
-            data = result.get('data', {})
-            return True, data, "获取订单详情成功"
-        else:
-            return False, {}, result.get('message', '获取订单详情失败')
-    except Exception as e:
+    if success:
+        return True, data, "获取订单详情成功"
+    else:
+        return False, {}, message
         return False, {}, f"请求异常: {str(e)}"

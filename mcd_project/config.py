@@ -14,3 +14,83 @@ REDIS_SET_URL = dict(
     db=0,
     password='123.456.',
 )
+
+# ========== 代理配置 ==========
+
+# 请求超时时间（秒）
+PROXY_REQUEST_TIMEOUT = 15
+
+# 代理失败容错配置
+PROXY_FAILURE_CONFIG = {
+    # 加入观察期的失败次数阈值
+    'observation_threshold': 3,
+
+    # 观察期内直接永久换绑的失败次数阈值
+    'permanent_switch_threshold': 10,
+
+    # 观察期时长（秒）- 5分钟
+    'observation_period': 5 * 60,
+
+    # 失败计数时间窗口（秒）- 10分钟
+    # 超过此时间的失败记录会被清除
+    'failure_window': 10 * 60,
+}
+
+# 代理健康检查配置
+PROXY_HEALTH_CHECK_CONFIG = {
+    # 全量健康检查间隔（秒）- 12小时
+    'full_check_interval': 12 * 3600,
+
+    # 观察期检查间隔（秒）- 5分钟
+    'observation_check_interval': 5 * 60,
+
+    # 健康检查超时时间（秒）
+    'health_check_timeout': 10,
+
+    # 健康检查缓存TTL（秒）- 避免短时间重复检查同一代理
+    'health_check_cache_ttl': 30,
+
+    # 健康检查批次大小（避免瞬间大量请求）
+    'batch_size': 10,
+
+    # 批次间隔（秒）
+    'batch_delay': 6,
+}
+
+# 代理池配置
+PROXY_POOL_CONFIG = {
+    # 代理状态标记
+    'status': {
+        'active': 'active',      # 正常可用
+        'slow': 'slow',          # 响应慢但可用
+        'observation': 'observation',  # 观察期
+        'failed': 'failed',      # 失效
+        'disabled': 'disabled',  # 手动禁用
+    },
+
+    # 响应时间阈值（秒）
+    'slow_threshold': 3.0,  # 超过3秒标记为slow
+
+    # 连续失败多少次标记为failed
+    'max_fail_count': 5,
+
+    # 单个代理最大账号负载
+    'max_accounts_per_proxy': 5,
+
+    # Redis Key 前缀
+    'redis_prefix': 'mcd:proxy',
+}
+
+# 账号代理绑定配置
+ACCOUNT_PROXY_BINDING_CONFIG = {
+    # Redis Key
+    'redis_key': 'mcd:account_proxy_binding',
+
+    # 绑定关系过期时间（秒）- 0表示永不过期
+    'binding_ttl': 0,
+
+    # 负载均衡策略
+    'balance_strategy': 'least_bound',  # least_bound: 绑定账号数最少优先
+                                        # round_robin: 轮询
+                                        # random: 随机
+}

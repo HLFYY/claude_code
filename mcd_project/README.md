@@ -14,27 +14,64 @@
 - 自动检测登录状态
 - Token 过期自动重新登录
 
+✅ **代理池管理系统** 🎉 v2.0 新增
+- 代理池管理（增删查改、状态管理、健康检查）
+- 账号-代理长期绑定（Redis 持久化）
+- 四级智能容错（自动重试、临时切换、观察期、永久切换）
+- 城市优先分配（自动查询代理 IP 城市）
+- 负载均衡（单代理最多绑定5个账号）
+- 定时任务调度（全量检查、观察期检查、失败清理）
+- HTTP API 接口（8个代理管理接口）
+
 ✅ **API 完整实现**
 - V4 签名算法（HMAC-SHA256）
 - AES-128-ECB 加密
-- 所有核心业务接口
+- 所有核心业务接口（支持代理）
 
 ## 项目结构
 
 ```
 mcd_project/
-├── mcd_api.py              # 核心 API 功能（签名、加密、所有业务接口）
-├── login_manager.py        # 登录管理类（多账号、状态检查、凭证管理）
-├── run.py                  # 主流程脚本（店铺/点餐/支付三步流程）
-├── test_add_all_categories.py  # 测试每个分类第一个商品
-├── use_login_manager.py    # 登录管理器测试脚本
-├── demo.py                 # 清空购物车演示脚本
-├── credentials.json        # 登录凭证存储（自动生成）
-├── selected_store.json     # 当前选择的店铺信息（自动生成）
-└── order_data.json         # 待支付订单数据（自动生成）
+├── mcd_api.py                    # 核心 API 功能（签名、加密、所有业务接口，支持代理）
+├── login_manager.py              # 登录管理类（多账号、状态检查、凭证管理、自动代理）
+├── mcd_server.py                 # HTTP API 服务器（新增8个代理管理接口）
+├── config.py                     # 配置文件（包含代理配置）
+├── exceptions.py                 # 自定义异常类
+├── proxy_pool.py                 # 代理池管理器（791行）
+├── account_proxy_binding.py      # 账号代理绑定管理器（533行）
+├── proxy_failure_handler.py      # 四级容错失败处理器（278行）
+├── proxy_manager.py              # 代理管理统一入口（394行）
+├── ip_location.py                # IP 地理位置查询（119行）
+├── scheduler.py                  # 定时任务调度器（125行）
+├── utils.py                      # 公共工具函数（18行）
+├── run.py                        # 主流程脚本（店铺/点餐/支付三步流程）
+├── run_api_client.py             # HTTP API 客户端测试脚本
+├── use_login_manager.py          # 登录管理器测试脚本
+├── demo.py                       # 代理池初始化脚本
+├── requirements.txt              # 项目依赖包
+├── README.md                     # 项目使用文档（本文件）
+└── CHANGELOG.md                  # 更新日志
 ```
 
+**运行时自动生成的文件：**
+- `credentials.json` - 登录凭证存储（Redis 模式下不生成）
+- `selected_store.json` - 当前选择的店铺信息
+- `order_data.json` - 待支付订单数据
+
 ## 快速开始
+
+### 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 初始化代理池（可选）
+
+```bash
+# 编辑 demo.py 添加您的代理信息，然后运行
+python demo.py
+```
 
 ### 完整下单流程（推荐）
 
@@ -50,6 +87,8 @@ python run.py payment
 ```
 
 每步执行完会自动保存状态，下一步自动读取。所有流程开始前会自动验证登录状态。
+
+**v2.0 新增：** 所有请求自动使用账号绑定的代理，失败自动触发四级容错机制。
 
 ### 测试脚本
 
@@ -282,6 +321,171 @@ python run.py payment old
    - 支持支付宝支付
    - 生成的支付链接可在手机浏览器打开
    - 或生成二维码用支付宝扫码支付
+
+## 代理池管理系统 🎉 v2.0
+
+### 功能概览
+
+1. **代理池管理**
+   - 增删查改代理
+   - 自动查询代理 IP 城市
+   - 5种状态管理（active/slow/observation/failed/disabled）
+   - 健康检查（支持缓存、批量检查）
+
+2. **账号代理绑定**
+   - 账号-代理长期绑定（Redis 持久化）
+   - 城市优先分配（同城市优先）
+   - 负载均衡（单代理最多5个账号）
+   - 失败计数追踪（时间窗口10分钟）
+
+3. **四级智能容错**
+   - 阶段1：首次失败 → 立即重试
+   - 阶段2：连续失败3次 → 临时切换 + 观察期（5分钟）
+   - 阶段2.5：观察期内连续失败10次 → 立即永久切换
+   - 阶段3：观察期结束 → 健康检查决定（恢复/永久切换）
+
+4. **定时任务调度**
+   - 全量健康检查：每12小时
+   - 观察期检查：每5分钟
+   - 失败记录清理：每天凌晨3点
+
+### 使用示例
+
+#### 1. 添加代理到代理池
+
+```python
+from proxy_pool import ProxyPool
+
+pool = ProxyPool()
+
+# 添加代理（自动查询城市）
+proxy = pool.add_proxy(
+    host='61.155.141.105',
+    port=20080,
+    username='user',
+    password='pass',
+    protocol='http'
+)
+```
+
+#### 2. 使用代理登录（自动）
+
+```python
+from login_manager import LoginManager
+
+# 创建登录管理器（自动分配代理）
+manager = LoginManager(
+    phone="13800138000",
+    use_redis=True,
+    city="上海"  # 可选：优先使用上海的代理
+)
+
+# 登录（自动使用绑定的代理）
+token, sid, meddy_id = manager.ensure_login(auto_relogin=True)
+```
+
+#### 3. 启动 HTTP API 服务器
+
+```bash
+# 启动服务器
+python mcd_server.py
+
+# 或使用 gunicorn（推荐）
+gunicorn -w 4 -b 0.0.0.0:5001 mcd_server:app
+```
+
+#### 4. HTTP API 调用
+
+```bash
+# 查看代理池状态
+curl http://localhost:5001/api/proxy/pool/status
+
+# 添加代理
+curl -X POST http://localhost:5001/api/proxy/pool/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "host": "61.155.141.105",
+    "port": 20080,
+    "username": "user",
+    "password": "pass",
+    "protocol": "http"
+  }'
+
+# 查看账号绑定关系
+curl http://localhost:5001/api/proxy/account/binding
+
+# 获取代理池统计
+curl http://localhost:5001/api/proxy/statistics
+```
+
+#### 5. 启动定时任务调度器
+
+```bash
+# 前台运行
+python scheduler.py
+
+# 后台运行
+nohup python scheduler.py > scheduler.log 2>&1 &
+
+# 或使用 crontab
+# crontab -e
+# @reboot cd /path/to/mcd_project && python scheduler.py >> scheduler.log 2>&1
+```
+
+### HTTP API 接口列表
+
+| 接口路径 | 方法 | 功能 |
+|---------|------|------|
+| `/api/proxy/pool/status` | GET | 查看代理池状态 |
+| `/api/proxy/pool/list` | GET | 获取所有代理列表 |
+| `/api/proxy/pool/add` | POST | 添加代理到代理池 |
+| `/api/proxy/pool/remove` | POST | 移除/禁用代理 |
+| `/api/proxy/account/binding` | GET | 查看账号代理绑定关系 |
+| `/api/proxy/account/switch` | POST | 手动切换账号代理 |
+| `/api/proxy/statistics` | GET | 获取代理池统计数据 |
+| `/api/proxy/health/check` | POST | 手动触发健康检查 |
+
+### 配置说明
+
+所有配置项在 `config.py` 中可调整：
+
+```python
+# 请求超时时间（秒）
+PROXY_REQUEST_TIMEOUT = 15
+
+# 代理失败容错配置
+PROXY_FAILURE_CONFIG = {
+    'observation_threshold': 3,           # 加入观察期的失败次数阈值
+    'permanent_switch_threshold': 10,     # 观察期内永久换绑的失败次数阈值
+    'observation_period': 5 * 60,         # 观察期时长（秒）
+    'failure_window': 10 * 60,            # 失败计数时间窗口（秒）
+}
+
+# 代理池配置
+PROXY_POOL_CONFIG = {
+    'slow_threshold': 3.0,                # 响应时间阈值（秒）
+    'max_fail_count': 5,                  # 连续失败多少次标记为failed
+    'max_accounts_per_proxy': 5,          # 单个代理最大账号负载
+}
+```
+
+### 技术亮点
+
+1. **全局单例模式** - 避免重复初始化
+2. **Redis 持久化** - 所有状态数据存储在 Redis
+3. **无侵入集成** - LoginManager 自动处理，业务代码无需修改
+4. **城市感知** - 自动查询代理 IP 城市
+5. **健康检查缓存** - 30秒 TTL，避免重复检查
+6. **批量处理** - 每批10个代理，间隔6秒
+7. **日志增强** - 统一 log_info()，支持 flush=True
+
+---
+
+## 更新日志
+
+详见 [CHANGELOG.md](CHANGELOG.md)
+
+---
 
 ## License
 
