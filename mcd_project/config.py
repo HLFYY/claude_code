@@ -15,6 +15,25 @@ REDIS_SET_URL = dict(
     password='123.456.',
 )
 
+# ========== 全局代理开关 ==========
+
+# 本机开发=True / 线上服务器=False（按 hostname 判定，沿用项目惯例）
+IS_LOCAL = 'houjie-' in socket.gethostname()
+# 本机(住宅IP)不走代理，线上服务器走白名单住宅代理；也可手动覆盖为 True/False
+USE_PROXY = False
+
+# ========== 验证码(滑块)登录 worker 配置 ==========
+
+CAPTCHA_LOGIN_CONFIG = {
+    'queue_key': 'mcd:captcha:login_queue',          # worker BLPOP 的登录队列
+    'freezing_key': 'mcd:captcha:freezing:{phone}',  # 账号冻结标志
+    'status_key': 'mcd:captcha:status:{phone}',      # 发码状态 JSON
+    'freeze_ttl': 15 * 60,                            # 冻结兜底上限(秒)
+    'status_ttl': 15 * 60,                            # 状态窗口(秒)，与冻结对齐
+    'poll_interval': 3,                               # run_api_client 轮询间隔(秒)
+    'poll_timeout': 15 * 60,                          # run_api_client 轮询上限(秒)
+}
+
 # ========== 代理配置 ==========
 
 # 请求超时时间（秒）

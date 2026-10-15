@@ -18,7 +18,8 @@ import os
 import redis
 from datetime import datetime
 import inspect
-from config import CODE_DIR, LOG_DIR, REDIS_SET_URL
+import time
+from config import CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG
 from login_manager import LoginManager
 
 app = Flask(__name__)
@@ -116,6 +117,37 @@ def get_login_manager(phone, city=None):
 # 配置
 CREDENTIALS_FILE = 'data/credentials.json'
 
+# ========== 验证码(滑块)登录队列/冻结 ==========
+_cap_redis = redis.Redis(host=REDIS_SET_URL['host'], port=REDIS_SET_URL['port'],
+                         db=REDIS_SET_URL['db'], password=REDIS_SET_URL['password'], decode_responses=True)
+
+
+def _freeze_key(phone):
+    return CAPTCHA_LOGIN_CONFIG['freezing_key'].format(phone=phone)
+
+
+def _status_key(phone):
+    return CAPTCHA_LOGIN_CONFIG['status_key'].format(phone=phone)
+
+
+def is_frozen(phone):
+    """账号是否处于验证码登录冻结期"""
+    return _cap_redis.exists(_freeze_key(phone)) == 1
+
+
+def enqueue_login(phone, city=None, force_new_device=False):
+    """冻结账号(兜底TTL) + 入队交给 captcha_login_worker + 置 queued 状态"""
+    _cap_redis.setex(_freeze_key(phone), CAPTCHA_LOGIN_CONFIG['freeze_ttl'], '1')
+    _cap_redis.setex(_status_key(phone), CAPTCHA_LOGIN_CONFIG['status_ttl'],
+                     json.dumps({'status': 'queued', 'msg': '已入队', 'ts': int(time.time())}, ensure_ascii=False))
+    _cap_redis.rpush(CAPTCHA_LOGIN_CONFIG['queue_key'],
+                     json.dumps({'phone': phone, 'city': city, 'force_new_device': force_new_device}, ensure_ascii=False))
+
+
+def unfreeze_login(phone):
+    _cap_redis.delete(_freeze_key(phone))
+
+
 # ========== 登录相关接口 ==========
 
 @app.route('/api/login/send_code', methods=['POST'])
@@ -133,20 +165,14 @@ def login_send_code():
         app.logger.error(f"[send_code] ❌ 失败: {error_msg}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone, city)  # 传递 city 参数
-    login_manager.load_credentials()
-    # 发送验证码
-    success, message = login_manager.send_verify_code(force_new_device=use_new_device)
+    # 方案①：服务器不直接发码，统一入队交给 captcha_login_worker（发码+过滑块+重发），客户端轮询 /api/login/captcha_status
+    if is_frozen(phone):
+        app.logger.info(f"[send_code] {phone} 已在登录处理中，返回 queued")
+        return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '该账号正在登录处理中，请轮询状态'})
 
-    if success:
-        return jsonify({
-            'success': True,
-            'data': {'token': login_manager.token},
-            'message': message
-        })
-    else:
-        app.logger.error(f"[send_code] ❌ 失败: {message}")
-        return jsonify({'success': False, 'message': message}), 400
+    enqueue_login(phone, city=city, force_new_device=use_new_device)
+    app.logger.info(f"[send_code] {phone} 已入队验证码登录")
+    return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '已入队，请轮询 /api/login/captcha_status'})
 
 @app.route('/api/login/verify', methods=['POST'])
 def login_verify():
@@ -170,6 +196,9 @@ def login_verify():
 
     if success:
         app.logger.info(f"[login_verify] ✓ 登录成功: phone={phone}")
+        # 登录成功：解冻 + 清理验证码状态
+        unfreeze_login(phone)
+        _cap_redis.delete(_status_key(phone))
         return jsonify({
             'success': True,
             'data': {
@@ -182,6 +211,18 @@ def login_verify():
     else:
         app.logger.error(f"[login_verify] ❌ 登录失败: phone={phone}, 原因: {message}")
         return jsonify({'success': False, 'message': message}), 400
+
+@app.route('/api/login/captcha_status', methods=['GET'])
+def login_captcha_status():
+    """查询验证码(滑块)登录处理状态：queued/sending/code_sent/failed/none"""
+    phone = request.args.get('phone')
+    if not phone:
+        return jsonify({'success': False, 'message': '缺少 phone 参数'}), 400
+    raw = _cap_redis.get(_status_key(phone))
+    if not raw:
+        return jsonify({'success': True, 'data': {'status': 'none'}, 'message': '无状态(未入队或已过期)'})
+    return jsonify({'success': True, 'data': json.loads(raw)})
+
 
 @app.route('/api/login/status', methods=['GET'])
 def login_status():
@@ -271,6 +312,10 @@ def universal_mcd_api(function_name):
     if not phone:
         return jsonify({'success': False, 'message': '缺少登录信息: 需要 phone 或 (token+sid)'}), 400
 
+    # 账号正在验证码登录处理中 → 冻结，拦下业务请求
+    if is_frozen(phone):
+        return jsonify({'success': False, 'data': {'status': 'logging_in'}, 'message': '账号登录处理中，请稍后重试'}), 423
+
     login_manager = get_login_manager(phone, city)  # 传递 city 参数
     token, sid, meddy_id_from_redis = login_manager.load_credentials()
 
@@ -287,7 +332,7 @@ def universal_mcd_api(function_name):
         params['mcd_id'] = meddy_id_from_redis
     # 5. 自动获取代理（如果有 phone 参数且函数支持 proxies）
     proxy_used = None
-    if phone and 'proxies' not in params:
+    if USE_PROXY and phone and 'proxies' not in params:
         try:
             if 'proxies' in sig.parameters:
                 # 使用全局单例获取账号绑定的代理

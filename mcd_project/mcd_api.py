@@ -92,7 +92,7 @@ def make_request(method, url, headers, params=None, data=None, proxies=None, tim
             data = result.get('data', {})
             return True, data, result.get('message', '请求成功')
         else:
-            return False, {}, result.get('message', '请求失败')
+            return False, {}, f"{result.get('code', '')}, {result.get('message', '请求失败')}"
 
     except requests.exceptions.Timeout:
         return False, {}, f"请求超时 ({timeout}秒)"
@@ -390,7 +390,7 @@ def send_verification_code(phone, token, proxies=None):
     if success:
         return True, "验证码已发送"
     else:
-        return False, message
+        return False, f"message:{message}, data:{data}"
 
 
 def login(phone, verify_code, token, proxies=None):

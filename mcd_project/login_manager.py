@@ -17,7 +17,7 @@ from typing import Optional, Tuple, Dict
 from functools import wraps
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
-from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT
+from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT, USE_PROXY
 from mcd_api import (
     generate_token,
     activate_token,
@@ -209,6 +209,10 @@ class LoginManager:
         Returns:
             {'http': 'http://user:pass@host:port', 'https': '...'}
         """
+        # 全局开关：不使用代理时直连
+        if not USE_PROXY:
+            return {}
+
         # 获取当前应该使用的代理（可能是主代理或临时代理）
         binding = self.binding_manager.get_binding(self.phone)
 

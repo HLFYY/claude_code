@@ -8,6 +8,7 @@
 import sys
 import json
 import os
+import time
 import traceback
 
 import requests
@@ -18,8 +19,8 @@ DATA_DIR = os.path.expanduser('~/datas/mcd')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
-API_BASE = 'http://43.163.92.204:5001'
-# API_BASE = 'http://127.0.0.1:5001'
+# API_BASE = 'http://43.163.92.204:5001'
+API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
 DEFAULT_PHONE = '16752934813'
 DEFAULT_CITY = '南京'
@@ -80,32 +81,44 @@ def get_login_info():
     # 需要登录
     print(f"⚠️  未登录，开始登录流程...")
 
-    # 发送验证码
-    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city})
+    # 发送验证码（入队，由 captcha_login_worker 自动过滑块后触发发码）
+    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city, 'use_new_device': True})
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '发送验证码失败')}")
         sys.exit(1)
 
-    token = result.get('data', {}).get('token')
-    reused = result.get('data', {}).get('reused', False)
+    print(f"⏳ {result.get('message', '已入队')}，等待自动过滑块发码...")
 
-    if reused:
-        print(f"✅ 验证码已发送（使用已有设备）")
+    # 轮询发码状态（queued/sending/code_sent/failed），最多等 15 分钟
+    poll_interval, poll_timeout, waited = 3, 15 * 60, 0
+    while waited < poll_timeout:
+        st = api_call('/api/login/captcha_status', params={'phone': phone})
+        sdata = st.get('data', {}) if st.get('success') else {}
+        status = sdata.get('status')
+        if status == 'code_sent':
+            print(f"✅ 验证码已发送 ({sdata.get('msg', '')})")
+            break
+        if status == 'failed':
+            print(f"❌ 过滑块/发码失败: {sdata.get('msg', '')}")
+            sys.exit(1)
+        print(f"   状态: {status or 'none'} ... 已等待 {waited}s", flush=True)
+        time.sleep(poll_interval)
+        waited += poll_interval
     else:
-        print(f"✅ 验证码已发送")
+        print("❌ 等待发码超时(15 分钟)")
+        sys.exit(1)
 
-    # 输入验证码
+    # 输入验证码（人工回填手机收到的短信 code）
     code = input("请输入验证码: ").strip()
     if not code:
         print("❌ 验证码不能为空")
         sys.exit(1)
 
-    # 验证登录
+    # 验证登录（token 由服务端从 Redis 复用，无需客户端传）
     result = api_call('/api/login/verify', method='POST', data={
         'phone': phone,
         'verify_code': code,
-        'token': token,
         'city': proxy_city
     })
 
