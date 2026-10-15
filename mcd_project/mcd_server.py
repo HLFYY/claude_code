@@ -82,7 +82,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),  # 输出到标准输出（会被 crontab 重定向）
-        logging.FileHandler(os.path.join(LOG_DIR, 'mcd_server.log'), encoding='utf-8')  # 同时写入文件
+        # logging.FileHandler(os.path.join(LOG_DIR, 'mcd_server.log'), encoding='utf-8')  # 同时写入文件
     ]
 )
 

@@ -22,6 +22,7 @@ API_BASE = 'http://43.163.92.204:5001'
 # API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
 DEFAULT_PHONE = '16752934813'
+DEFAULT_CITY = '南京'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
@@ -51,10 +52,13 @@ def api_call(endpoint, method='GET', data=None, params=None):
 def get_login_info():
     """获取登录信息"""
     phone = input(f"请输入手机号 (回车使用默认 {DEFAULT_PHONE}): ").strip()
+    proxy_city = input(f"请输入城市 (回车使用默认 {DEFAULT_CITY}): ").strip()
     if not phone:
         phone = DEFAULT_PHONE
+    if not proxy_city:
+        proxy_city = DEFAULT_CITY
 
-    print(f"\n使用手机号: {phone}")
+    print(f"\n使用手机号: {phone}, 代理城市: {proxy_city}")
     print("正在检查登录状态...")
 
     # 检查登录状态
@@ -77,7 +81,7 @@ def get_login_info():
     print(f"⚠️  未登录，开始登录流程...")
 
     # 发送验证码
-    result = api_call('/api/login/send_code', method='POST', data={'phone': phone})
+    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city})
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '发送验证码失败')}")
@@ -101,7 +105,8 @@ def get_login_info():
     result = api_call('/api/login/verify', method='POST', data={
         'phone': phone,
         'verify_code': code,
-        'token': token
+        'token': token,
+        'city': proxy_city
     })
 
     if not result.get('success'):
