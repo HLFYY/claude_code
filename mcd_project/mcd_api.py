@@ -15,6 +15,8 @@ import hashlib
 import base64
 import uuid
 import json
+import time
+import random
 from urllib.parse import quote
 
 import requests
@@ -53,6 +55,15 @@ SIGNED_HEADERS = ['ct', 'language', 'p', 'sid', 'sv', 'token', 'v', 'x-mcd-gw-v'
 # API 端点
 API_BASE = 'https://api.mcd.cn'
 API2_BASE = 'https://api2.mcd.cn'
+
+# 当前请求的数美设备指纹 d（按请求隔离，LoginManager 加载凭证后设置；build_headers 兜底使用）
+import contextvars
+_active_d = contextvars.ContextVar('active_d', default='')
+
+
+def set_active_d(d):
+    """设置当前请求使用的 d（数美设备指纹）；空则清除。供 LoginManager/server 在取到账号凭证后调用。"""
+    _active_d.set(d or '')
 
 
 # ========== 工具函数 ==========
@@ -249,7 +260,8 @@ def generate_x_hmac_digest(body, sign_key):
     return base64.b64encode(signature).decode('ascii')
 
 
-def build_headers(token, sid='', body=None, method='GET', path='/', query_params=None):
+def build_headers(token, sid='', body=None, method='GET', path='/', query_params=None,
+                  tid='', st=None, nonce=None, d='', biz_scenario='102', biz_from='1006'):
     """
     构建完整的请求头
 
@@ -260,6 +272,12 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         method: HTTP 方法 (GET/POST/PUT)
         path: API 路径
         query_params: 查询参数字典 (用于签名，会自动排序)
+        tid: Token 激活返回的 tid（真机登录场景会带，非签名头）
+        st: 秒级时间戳（默认当前时间，非签名头）
+        nonce: 防重放随机数（默认自动生成，非签名头）
+        d: 数美设备指纹 deviceId（真机 'B'+deviceId，非签名头，空则不带）
+        biz_scenario / biz_from: 业务场景码；登录/发码场景传 500 / 1011，默认业务 102 / 1006
+    注：tid/st/nonce/d/biz_* 均不在 authorization 签名范围内，增减不影响 HMAC。
 
     Returns:
         完整的请求头字典
@@ -292,6 +310,13 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
     body_str = body if body else ''
     x_hmac_digest = generate_x_hmac_digest(body_str, V4SK)
 
+    # 未显式传 d 时，用当前请求设置的 d（LoginManager 从账号凭证加载后设置）
+    d = d or _active_d.get()
+
+    # st / nonce（非签名头，默认自动生成，模拟真机）
+    st_val = str(st if st is not None else int(time.time()))
+    nonce_val = str(nonce) if nonce is not None else f"{int(time.time() * 1000)}{random.randint(100000, 999999)}"
+
     # 返回完整请求头
     result = {
         'Host': 'api.mcd.cn',
@@ -307,12 +332,19 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         'mcdtoken': token,
         'authorization': authorization,
         'x-hmac-digest': x_hmac_digest,
-        'biz_scenario': '102',
-        'biz_from': '1006',
+        'biz_scenario': biz_scenario,
+        'biz_from': biz_from,
+        'st': st_val,
+        'nonce': nonce_val,
         'routingid': '',
         'meddyid': '',
         'Content-Type': 'application/json',
     }
+    # tid / d 仅在有值时带上（真机登录场景）
+    if tid:
+        result['tid'] = tid
+    if d:
+        result['d'] = d
 
     return result
 

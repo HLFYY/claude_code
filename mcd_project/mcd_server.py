@@ -19,7 +19,7 @@ import redis
 from datetime import datetime
 import inspect
 import time
-from config import CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG
+from config import CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis
 from login_manager import LoginManager
 
 app = Flask(__name__)
@@ -118,8 +118,7 @@ def get_login_manager(phone, city=None):
 CREDENTIALS_FILE = 'data/credentials.json'
 
 # ========== 验证码(滑块)登录队列/冻结 ==========
-_cap_redis = redis.Redis(host=REDIS_SET_URL['host'], port=REDIS_SET_URL['port'],
-                         db=REDIS_SET_URL['db'], password=REDIS_SET_URL['password'], decode_responses=True)
+_cap_redis = make_redis()  # 带超时/重试/keepalive
 
 
 def _freeze_key(phone):
@@ -138,6 +137,8 @@ def is_frozen(phone):
 def enqueue_login(phone, city=None, force_new_device=False):
     """冻结账号(兜底TTL) + 入队交给 captcha_login_worker + 置 queued 状态"""
     _cap_redis.setex(_freeze_key(phone), CAPTCHA_LOGIN_CONFIG['freeze_ttl'], '1')
+    # 入队即置处理心跳：防"刚入队还没被 worker 取走"时被业务接口误判僵尸解冻；worker 取到后会持续刷新
+    _cap_redis.setex(_processing_key(phone), CAPTCHA_LOGIN_CONFIG['processing_ttl'], str(int(time.time())))
     _cap_redis.setex(_status_key(phone), CAPTCHA_LOGIN_CONFIG['status_ttl'],
                      json.dumps({'status': 'queued', 'msg': '已入队', 'ts': int(time.time())}, ensure_ascii=False))
     _cap_redis.rpush(CAPTCHA_LOGIN_CONFIG['queue_key'],
@@ -146,6 +147,30 @@ def enqueue_login(phone, city=None, force_new_device=False):
 
 def unfreeze_login(phone):
     _cap_redis.delete(_freeze_key(phone))
+
+
+def _processing_key(phone):
+    return CAPTCHA_LOGIN_CONFIG['processing_key'].format(phone=phone)
+
+
+def worker_alive():
+    """worker 进程是否在跑（全局心跳未过期）"""
+    return _cap_redis.exists(CAPTCHA_LOGIN_CONFIG['worker_alive_key']) == 1
+
+
+def processing_exists(phone):
+    """该账号是否正在被 worker 处理/排队（按手机号的处理心跳未过期）"""
+    return _cap_redis.exists(_processing_key(phone)) == 1
+
+
+def _status_of(phone):
+    raw = _cap_redis.get(_status_key(phone))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw).get('status')
+    except Exception:
+        return None
 
 
 # ========== 登录相关接口 ==========
@@ -166,12 +191,20 @@ def login_send_code():
         return jsonify({'success': False, 'message': error_msg}), 400
 
     # 方案①：服务器不直接发码，统一入队交给 captcha_login_worker（发码+过滑块+重发），客户端轮询 /api/login/captcha_status
-    if is_frozen(phone):
-        app.logger.info(f"[send_code] {phone} 已在登录处理中，返回 queued")
-        return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '该账号正在登录处理中，请轮询状态'})
+    if not worker_alive():
+        app.logger.error(f"[send_code] {phone} worker 未运行，拒绝入队")
+        return jsonify({'success': False, 'message': '登录服务(captcha worker)未运行，请先启动 captcha_login_worker 再试'}), 503
 
+    # 只有"真正在处理中"(有处理心跳 且 状态是排队/发码中)才不重复入队；
+    # 其余情况(上次 code_sent 已发完待验证 / failed / 僵尸冻结 / 全新)都视为用户想重发 → 清旧状态并重新入队
+    status = _status_of(phone)
+    if is_frozen(phone) and processing_exists(phone) and status in ('queued', 'sending'):
+        app.logger.info(f"[send_code] {phone} 正在处理中(status={status})，返回 queued")
+        return jsonify({'success': True, 'data': {'status': status}, 'message': '该账号正在登录处理中，请轮询状态'})
+
+    _cap_redis.delete(_status_key(phone))  # 清掉上次残留的 code_sent，避免轮询误判"已发送"而实际没重发
     enqueue_login(phone, city=city, force_new_device=use_new_device)
-    app.logger.info(f"[send_code] {phone} 已入队验证码登录")
+    app.logger.info(f"[send_code] {phone} 已(重新)入队验证码登录 (prev status={status})")
     return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '已入队，请轮询 /api/login/captcha_status'})
 
 @app.route('/api/login/verify', methods=['POST'])
@@ -312,9 +345,17 @@ def universal_mcd_api(function_name):
     if not phone:
         return jsonify({'success': False, 'message': '缺少登录信息: 需要 phone 或 (token+sid)'}), 400
 
-    # 账号正在验证码登录处理中 → 冻结，拦下业务请求
+    # 账号在验证码登录冻结期 → 按手机号的处理心跳判断是真在处理还是僵尸冻结
     if is_frozen(phone):
-        return jsonify({'success': False, 'data': {'status': 'logging_in'}, 'message': '账号登录处理中，请稍后重试'}), 423
+        status = _status_of(phone)
+        if status == 'code_sent':
+            return jsonify({'success': False, 'data': {'status': 'code_sent'}, 'message': '验证码已发送，待完成登录(verify)'}), 423
+        if processing_exists(phone) and worker_alive():
+            return jsonify({'success': False, 'data': {'status': 'logging_in'}, 'message': '账号登录处理中，请稍后重试'}), 423
+        # 僵尸冻结（该账号没在处理 / worker 没在跑）→ 自动解冻后继续本次请求
+        unfreeze_login(phone)
+        _cap_redis.delete(_processing_key(phone))
+        app.logger.warning(f"[{function_name}] {phone} 僵尸冻结(status={status}, worker_alive={worker_alive()})，已自动解冻并继续")
 
     login_manager = get_login_manager(phone, city)  # 传递 city 参数
     token, sid, meddy_id_from_redis = login_manager.load_credentials()

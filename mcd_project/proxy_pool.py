@@ -21,7 +21,8 @@ from config import (
     REDIS_SET_URL,
     PROXY_POOL_CONFIG,
     PROXY_HEALTH_CHECK_CONFIG,
-    PROXY_REQUEST_TIMEOUT
+    PROXY_REQUEST_TIMEOUT,
+    make_redis,
 )
 from ip_location import query_ip_city
 from utils import log_info
@@ -32,14 +33,8 @@ class ProxyPool:
 
     def __init__(self):
         """初始化代理池"""
-        # Redis 连接
-        self.redis_client = redis.Redis(
-            host=REDIS_SET_URL['host'],
-            port=REDIS_SET_URL['port'],
-            db=REDIS_SET_URL['db'],
-            password=REDIS_SET_URL['password'],
-            decode_responses=True
-        )
+        # Redis 连接（带超时/重试/keepalive）
+        self.redis_client = make_redis()
 
         # Redis Key
         self.pool_key = f"{PROXY_POOL_CONFIG['redis_prefix']}:pool"

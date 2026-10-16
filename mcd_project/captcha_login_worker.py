@@ -18,12 +18,15 @@
   浏览器默认按 hostname：本机开发有头(方便看)、线上服务器无头；--show 强制有头，--headless 强制无头
 """
 import io
+import os
 import re
 import sys
 import json
 import time
+import shutil
 import base64
 import random
+import tempfile
 from urllib.parse import urlparse
 
 import redis
@@ -33,7 +36,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage._units.actions import Actions
 from ddddocr import DdddOcr
 
-from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG
+from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis
 from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, generate_token, activate_token
 from login_manager import LoginManager
 from utils import log_info
@@ -49,9 +52,9 @@ window.deliverNativeParams(JSON.stringify({{organization:'{SM_ORG}',appId:'defau
 return (typeof window.deliverNativeParams);
 '''
 
-_redis = redis.Redis(host=REDIS_SET_URL['host'], port=REDIS_SET_URL['port'],
-                     db=REDIS_SET_URL['db'], password=REDIS_SET_URL['password'], decode_responses=True)
+_redis = make_redis()  # 带超时/重试/keepalive，Redis 慢也不卡 60s
 _ocr = DdddOcr(det=False, ocr=False, show_ad=False)
+_last_beat = 0.0  # beat 节流用
 
 
 # ---------- Redis 状态/冻结 ----------
@@ -64,6 +67,55 @@ def set_status(phone, status, msg='', rid=''):
 
 def unfreeze(phone):
     _redis.delete(CAPTCHA_LOGIN_CONFIG['freezing_key'].format(phone=phone))
+
+
+# ---------- 心跳（防"冻了但 worker 没在跑"）----------
+def touch_worker_alive():
+    _redis.setex(CAPTCHA_LOGIN_CONFIG['worker_alive_key'],
+                 CAPTCHA_LOGIN_CONFIG['worker_alive_ttl'], str(int(time.time())))
+
+
+def touch_processing(phone):
+    _redis.setex(CAPTCHA_LOGIN_CONFIG['processing_key'].format(phone=phone),
+                 CAPTCHA_LOGIN_CONFIG['processing_ttl'], str(int(time.time())))
+
+
+def clear_processing(phone):
+    _redis.delete(CAPTCHA_LOGIN_CONFIG['processing_key'].format(phone=phone))
+
+
+def beat(phone):
+    """处理某账号时上报心跳：同时刷新全局 worker_alive 和该账号 processing。
+    节流：两次写最小间隔 beat_min_interval 秒，减少对慢 Redis 的压力。"""
+    global _last_beat
+    now = time.time()
+    if now - _last_beat < CAPTCHA_LOGIN_CONFIG['beat_min_interval']:
+        return
+    _last_beat = now
+    touch_worker_alive()
+    touch_processing(phone)
+
+
+def cleanup_zombie_freezes():
+    """启动时清理上次 worker 崩溃残留的僵尸冻结：有 freezing、但没有 processing 且状态非 code_sent。"""
+    try:
+        pattern = CAPTCHA_LOGIN_CONFIG['freezing_key'].format(phone='*')
+        proc_tpl = CAPTCHA_LOGIN_CONFIG['processing_key']
+        status_tpl = CAPTCHA_LOGIN_CONFIG['status_key']
+        cleared = 0
+        for key in _redis.scan_iter(match=pattern, count=100):
+            phone = key.split(':')[-1]
+            if _redis.exists(proc_tpl.format(phone=phone)):
+                continue  # 正在处理，保留
+            raw = _redis.get(status_tpl.format(phone=phone))
+            status = json.loads(raw).get('status') if raw else None
+            if status == 'code_sent':
+                continue  # 已发码待 verify，保留冻结
+            _redis.delete(key)
+            cleared += 1
+        log_info(f"[worker] 启动清理僵尸冻结: {cleared} 个")
+    except Exception as e:
+        log_info(f"[worker] 清理僵尸冻结失败: {e}")
 
 
 # ---------- 数美滑块(DrissionPage) ----------
@@ -112,14 +164,52 @@ def _slide_once(page):
     return (risk.group(1) if risk else None), (rid.group(1) if rid else None)
 
 
-def get_pass_rid(browser_proxy=None, headless=True, max_try=5):
+def make_proxy_auth_extension(host, port, user, pwd):
+    """生成临时 Chrome 扩展：用 chrome.proxy 配代理 + onAuthRequired 回填账密。返回扩展目录。"""
+    d = tempfile.mkdtemp(prefix='pxauth_')
+    manifest = {
+        "name": "pxauth", "version": "1.0", "manifest_version": 2,
+        "permissions": ["proxy", "webRequest", "webRequestBlocking", "<all_urls>", "tabs"],
+        "background": {"scripts": ["background.js"]},
+    }
+    bg = (
+        'var cfg={mode:"fixed_servers",rules:{singleProxy:{scheme:"http",host:"%s",port:%s},'
+        'bypassList:["localhost","127.0.0.1"]}};'
+        'chrome.proxy.settings.set({value:cfg,scope:"regular"},function(){});'
+        'chrome.webRequest.onAuthRequired.addListener('
+        'function(details){return {authCredentials:{username:"%s",password:"%s"}};},'
+        '{urls:["<all_urls>"]},["blocking"]);'
+    ) % (host, port, user, pwd)
+    with open(os.path.join(d, 'manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump(manifest, f)
+    with open(os.path.join(d, 'background.js'), 'w', encoding='utf-8') as f:
+        f.write(bg)
+    return d
+
+
+def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None):
+    """proxy_parts: {host,port,user,pwd} 或 None。
+    有账密且 PROXY_BROWSER_AUTH=True → 动态扩展带账密；否则白名单(只用 IP:端口)。"""
     co = ChromiumOptions()
     co.auto_port(True)  # 独立端口+临时用户目录，避免连到残留浏览器
+    ext_dir = None
+    use_ext = bool(proxy_parts and proxy_parts.get('user') and PROXY_BROWSER_AUTH)
     if headless:
-        co.headless(True)
+        if use_ext:
+            co.set_argument('--headless=new')  # 扩展需 new headless
+        else:
+            co.headless(True)
         co.set_argument('--window-size=1280,800')
-    if browser_proxy:
-        co.set_proxy(browser_proxy)  # 白名单 IP:端口，无账密
+    if proxy_parts:
+        if use_ext:
+            ext_dir = make_proxy_auth_extension(proxy_parts['host'], proxy_parts['port'],
+                                                proxy_parts['user'], proxy_parts['pwd'])
+            co.add_extension(ext_dir)
+            co.set_argument('--disable-features=DisableLoadExtensionCommandLineSwitch')  # 允许 --load-extension
+            log_info(f"[worker] 浏览器走账密代理(扩展) {proxy_parts['host']}:{proxy_parts['port']}")
+        else:
+            co.set_proxy(f"http://{proxy_parts['host']}:{proxy_parts['port']}")  # 白名单
+            log_info(f"[worker] 浏览器走白名单代理 {proxy_parts['host']}:{proxy_parts['port']}")
     page = ChromiumPage(co)
     try:
         page.get(SM_URL)
@@ -127,6 +217,11 @@ def get_pass_rid(browser_proxy=None, headless=True, max_try=5):
         page.run_js(DELIVER_JS)
         time.sleep(5)
         for i in range(1, max_try + 1):
+            if on_beat:
+                try:
+                    on_beat()  # 过滑块每次尝试上报心跳（最耗时段，避免被判僵尸）
+                except Exception:
+                    pass
             if not page.ele('.shumei_captcha_slide_btn', timeout=5):
                 time.sleep(3); continue
             risk, rid = _slide_once(page)
@@ -139,20 +234,36 @@ def get_pass_rid(browser_proxy=None, headless=True, max_try=5):
         return None
     finally:
         page.quit()
+        if ext_dir:
+            shutil.rmtree(ext_dir, ignore_errors=True)
 
 
 # ---------- 发码 ----------
-def browser_proxy_from(proxies):
-    """requests 代理字典 → 浏览器用的 http://host:port(去账密，靠白名单)"""
+def browser_proxy_parts(proxies):
+    """requests 代理字典 → {host,port,user,pwd}（供浏览器用：有账密走扩展，无则白名单）"""
     if not proxies:
         return None
     u = urlparse(proxies.get('http') or proxies.get('https'))
-    return f"http://{u.hostname}:{u.port}" if u.hostname else None
+    if not u.hostname:
+        return None
+    return {'host': u.hostname, 'port': u.port, 'user': u.username, 'pwd': u.password}
 
 
-def raw_send(phone, token, proxies, sec_verify=None):
+def _proxy_hp(proxies):
+    """代理 host:port(隐藏账密)，无代理返回 直连"""
+    if not proxies:
+        return '直连'
+    u = urlparse(proxies.get('http') or proxies.get('https'))
+    if not u.hostname:
+        return '直连'
+    return f"{u.username + '@' if u.username else ''}{u.hostname}:{u.port}"
+
+
+def raw_send(phone, token, proxies, tid='', d='', sec_verify=None):
     body = json.dumps({"regionCode": "86", "tel": aes_encrypt(phone, AES_KEY), "type": 1}, separators=(',', ':'))
-    h = build_headers(token, sid='', body=body, method='POST', path=SEND_PATH)
+    # 登录/发码场景头：biz 500/1011 + tid + st/nonce(自动) + d(有则带)，尽量贴近真机
+    h = build_headers(token, sid='', body=body, method='POST', path=SEND_PATH,
+                      tid=tid, d=d, biz_scenario='500', biz_from='1011')
     h['Host'] = 'api2.mcd.cn'
     if sec_verify:
         h['x-mcd-sec-verify'] = sec_verify
@@ -160,37 +271,56 @@ def raw_send(phone, token, proxies, sec_verify=None):
 
 
 def handle_login(phone, city=None, force_new_device=False, headless=True):
-    set_status(phone, 'sending', '开始发码')
-    manager = LoginManager(phone, use_redis=True, city=city)
-    proxies = manager._get_proxy_dict() or None  # None=直连；USE_PROXY 关时为 None
-    if force_new_device or not manager.token:
-        manager.token = generate_token()
-        ok, tid, msg = activate_token(manager.token, proxies=proxies)
+    beat(phone)  # 开始处理，上报心跳
+    try:
+        set_status(phone, 'sending', '开始发码')
+        manager = LoginManager(phone, use_redis=True, city=city)
+        proxies = manager._get_proxy_dict() or None  # None=直连；USE_PROXY 关时为 None
+        newly = force_new_device or not manager.token
+        if newly:
+            manager.token = generate_token()
+        # 激活拿 tid（登录场景头用）；新 token 激活失败则中止，复用 token 失败则 tid 置空继续
+        ok, tid, amsg = activate_token(manager.token, proxies=proxies)
+        beat(phone)  # activate 后
+        if newly and not ok:
+            set_status(phone, 'failed', f'token激活失败:{amsg}'); unfreeze(phone); return
         if not ok:
-            set_status(phone, 'failed', f'token激活失败:{msg}'); unfreeze(phone); return
+            tid = ''
         manager.save_credentials(manager.token, None, None)  # 存 token 供 verify 复用
-    token = manager.token
+        token = manager.token
 
-    r1 = raw_send(phone, token, proxies)
-    code = r1.get('code')
-    if r1.get('success') or code == 200:
-        set_status(phone, 'code_sent', '无滑块直接发送'); return  # 保持冻结到 verify
-    if code != 420:
-        set_status(phone, 'failed', f"{code}:{r1.get('message')}"); unfreeze(phone); return
+        # 打印本次账号相关数据
+        log_info(f"[worker] 账号数据 phone={phone} city={city} newly={newly} "
+                 f"token={token} tid={tid or '(无)'} "
+                 f"d={manager.d or '(无)'} sid={'有' if manager.sid else '无'} "
+                 f"proxy={_proxy_hp(proxies)}")
 
-    sc = (r1.get('data') or {}).get('securityContext', {})
-    punish_id, verify_sdk = sc.get('punishId'), sc.get('verifySdk')
-    rid = get_pass_rid(browser_proxy=browser_proxy_from(proxies), headless=headless)
-    if not rid:
-        set_status(phone, 'failed', '滑块多次未通过'); unfreeze(phone); return
+        r1 = raw_send(phone, token, proxies, tid=tid)
+        beat(phone)  # 发码后
+        code = r1.get('code')
+        if r1.get('success') or code == 200:
+            set_status(phone, 'code_sent', '无滑块直接发送'); return  # 保持冻结到 verify
+        if code != 420:
+            set_status(phone, 'failed', f"{code}:{r1.get('message')}"); unfreeze(phone); return
 
-    ts = int(time.time() * 1000)
-    sec = base64.b64encode(f"{punish_id};{verify_sdk};{ts};{rid}".encode()).decode()
-    r2 = raw_send(phone, token, proxies, sec_verify=sec)
-    if r2.get('success') or r2.get('code') == 200:
-        set_status(phone, 'code_sent', '滑块通过已发码', rid=rid)  # 保持冻结到 verify
-    else:
-        set_status(phone, 'failed', f"重发失败 {r2.get('code')}:{r2.get('message')}"); unfreeze(phone)
+        sc = (r1.get('data') or {}).get('securityContext', {})
+        punish_id, verify_sdk = sc.get('punishId'), sc.get('verifySdk')
+        log_info(f"[worker] {phone} 命中 420  punishId={punish_id} verifyType={sc.get('verifyType')} verifySdk={verify_sdk}")
+        rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
+                           on_beat=lambda: beat(phone))  # 过滑块每次尝试刷心跳
+        if not rid:
+            set_status(phone, 'failed', '滑块多次未通过'); unfreeze(phone); return
+
+        beat(phone)  # 重发前
+        ts = int(time.time() * 1000)
+        sec = base64.b64encode(f"{punish_id};{verify_sdk};{ts};{rid}".encode()).decode()
+        r2 = raw_send(phone, token, proxies, tid=tid, sec_verify=sec)
+        if r2.get('success') or r2.get('code') == 200:
+            set_status(phone, 'code_sent', f'滑块通过已发码 rid={rid}', rid=rid)  # 保持冻结到 verify
+        else:
+            set_status(phone, 'failed', f"重发失败 {r2.get('code')}:{r2.get('message')}"); unfreeze(phone)
+    finally:
+        clear_processing(phone)  # 处理结束(成功/失败/异常)清掉该账号处理心跳
 
 
 # ---------- 主循环 ----------
@@ -202,8 +332,10 @@ def main():
     if '--headless' in sys.argv:
         headless = True
     log_info(f"[worker] 启动，IS_LOCAL={IS_LOCAL} USE_PROXY={USE_PROXY} headless={headless}，监听 {CAPTCHA_LOGIN_CONFIG['queue_key']}")
+    cleanup_zombie_freezes()  # 启动清理上次崩溃残留的僵尸冻结
     while True:
-        item = _redis.blpop(CAPTCHA_LOGIN_CONFIG['queue_key'], timeout=30)
+        touch_worker_alive()  # 每轮上报全局心跳（含空闲），BLPOP 超时短，保证及时刷新
+        item = _redis.blpop(CAPTCHA_LOGIN_CONFIG['queue_key'], timeout=CAPTCHA_LOGIN_CONFIG['blpop_timeout'])
         if not item:
             continue
         try:

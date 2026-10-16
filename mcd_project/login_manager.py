@@ -17,13 +17,14 @@ from typing import Optional, Tuple, Dict
 from functools import wraps
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
-from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT, USE_PROXY
+from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT, USE_PROXY, make_redis
 from mcd_api import (
     generate_token,
     activate_token,
     send_verification_code,
     login,
     build_headers,
+    set_active_d,
     API2_BASE
 )
 from exceptions import (
@@ -157,19 +158,14 @@ class LoginManager:
 
         # Redis 客户端（如果使用 Redis）
         if self.use_redis:
-            self.redis_client = redis.Redis(
-                host=REDIS_SET_URL['host'],
-                port=REDIS_SET_URL['port'],
-                db=REDIS_SET_URL['db'],
-                password=REDIS_SET_URL['password'],
-                decode_responses=True,
-            )
+            self.redis_client = make_redis()  # 带超时/重试/keepalive
             self.redis_key = 'mcd:credentials'
 
         # 当前账号凭证
         self.token: Optional[str] = None
         self.sid: Optional[str] = None
         self.meddy_id: Optional[str] = None
+        self.d: Optional[str] = None  # 数美设备指纹(由 set_device 写入凭证)，请求头 d
 
         # ====== 新增：代理管理 ======
         # 使用传入的实例或创建新实例
@@ -326,11 +322,21 @@ class LoginManager:
             meddy_id: MeddyId
         """
         if self.use_redis:
+            # 保留已存的 d（数美设备指纹，由 set_device 写入，登录保存时别弄丢）
+            d_keep = self.d
+            if d_keep is None:
+                try:
+                    _old = self.redis_client.hget(self.redis_key, self.phone)
+                    if _old:
+                        d_keep = json.loads(_old).get('d')
+                except Exception:
+                    pass
             # Redis 存储
             credential_data = {
                 'token': token,
                 'sid': sid,
                 'meddy_id': meddy_id,
+                'd': d_keep,
                 'saved_at': datetime.now().isoformat()
             }
             try:
@@ -353,11 +359,13 @@ class LoginManager:
                     log_info(f"⚠️  警告: 读取旧凭证失败: {e}")
                     # 继续执行，使用空字典
 
-            # 更新当前手机号的凭证
+            # 更新当前手机号的凭证（保留已存的 d）
+            d_keep = self.d if self.d is not None else all_credentials.get(self.phone, {}).get('d')
             all_credentials[self.phone] = {
                 'token': token,
                 'sid': sid,
                 'meddy_id': meddy_id,
+                'd': d_keep,
                 'saved_at': datetime.now().isoformat()
             }
 
@@ -389,6 +397,8 @@ class LoginManager:
         self.token = token
         self.sid = sid
         self.meddy_id = meddy_id
+        self.d = d_keep
+        set_active_d(self.d)  # 设为当前请求使用的 d
 
         log_info(f"✓ 凭证已保存 (手机号: {self.phone})")
 
@@ -399,6 +409,8 @@ class LoginManager:
         Returns:
             (token, sid, meddy_id) 或 (None, None, None)
         """
+        self.d = None
+        set_active_d('')  # 先重置，避免同 worker 上个账号的 d 残留
         if self.use_redis:
             # Redis 存储
             try:
@@ -416,6 +428,8 @@ class LoginManager:
                 self.token = token
                 self.sid = sid
                 self.meddy_id = meddy_id
+                self.d = cred.get('d')
+                set_active_d(self.d)  # 设为当前请求使用的 d
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
@@ -446,6 +460,8 @@ class LoginManager:
                 self.token = token
                 self.sid = sid
                 self.meddy_id = meddy_id
+                self.d = cred.get('d')
+                set_active_d(self.d)  # 设为当前请求使用的 d
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id

@@ -18,7 +18,8 @@ from typing import Optional, Dict, Any, List
 from config import (
     REDIS_SET_URL,
     ACCOUNT_PROXY_BINDING_CONFIG,
-    PROXY_FAILURE_CONFIG
+    PROXY_FAILURE_CONFIG,
+    make_redis,
 )
 from proxy_pool import ProxyPool
 from utils import log_info
@@ -34,14 +35,8 @@ class AccountProxyBinding:
         Args:
             proxy_pool: ProxyPool 实例（可选，不传则自动创建）
         """
-        # Redis 连接
-        self.redis_client = redis.Redis(
-            host=REDIS_SET_URL['host'],
-            port=REDIS_SET_URL['port'],
-            db=REDIS_SET_URL['db'],
-            password=REDIS_SET_URL['password'],
-            decode_responses=True
-        )
+        # Redis 连接（带超时/重试/keepalive）
+        self.redis_client = make_redis()
 
         # ProxyPool 实例（使用传入的或创建新的）
         if proxy_pool is not None:

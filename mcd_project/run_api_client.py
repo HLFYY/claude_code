@@ -36,6 +36,7 @@ def api_call(endpoint, method='GET', data=None, params=None):
     """通用 API 调用"""
     url = f"{API_BASE}{endpoint}"
 
+    response = None
     try:
         if method == 'POST':
             response = requests.post(url, json=data, timeout=30, proxies={'http': None, 'https': None})
@@ -44,6 +45,16 @@ def api_call(endpoint, method='GET', data=None, params=None):
 
         response.raise_for_status()
         return response.json()
+
+    except requests.exceptions.HTTPError:
+        # HTTP 4xx/5xx：打印状态码 + 完整响应体，并尽量把服务端返回的 JSON 原样带回（含 message）
+        sc = response.status_code if response is not None else '?'
+        body = response.text if response is not None else ''
+        print(f"❌ API HTTP {sc}  {method} {url}\n   响应体: {body}")
+        try:
+            return response.json()
+        except Exception:
+            return {'success': False, 'status_code': sc, 'message': f'HTTP {sc}', 'raw': body}
 
     except requests.exceptions.RequestException as e:
         print(f"❌ API 请求失败: {traceback.format_exc()}")
@@ -82,7 +93,7 @@ def get_login_info():
     print(f"⚠️  未登录，开始登录流程...")
 
     # 发送验证码（入队，由 captcha_login_worker 自动过滑块后触发发码）
-    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city, 'use_new_device': True})
+    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city})
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '发送验证码失败')}")
@@ -91,7 +102,7 @@ def get_login_info():
     print(f"⏳ {result.get('message', '已入队')}，等待自动过滑块发码...")
 
     # 轮询发码状态（queued/sending/code_sent/failed），最多等 15 分钟
-    poll_interval, poll_timeout, waited = 3, 15 * 60, 0
+    poll_interval, poll_timeout, waited = 10, 15 * 60, 0
     while waited < poll_timeout:
         st = api_call('/api/login/captcha_status', params={'phone': phone})
         sdata = st.get('data', {}) if st.get('success') else {}
