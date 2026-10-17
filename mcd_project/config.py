@@ -138,7 +138,7 @@ PROXY_POOL_CONFIG = {
     'max_fail_count': 5,
 
     # 单个代理最大账号负载
-    'max_accounts_per_proxy': 5,
+    'max_accounts_per_proxy': 10,
 
     # Redis Key 前缀
     'redis_prefix': 'mcd:proxy',

@@ -261,15 +261,16 @@ def login_captcha_status():
 def login_status():
     """检测登录状态"""
     phone = request.args.get('phone')
+    city = request.args.get('city')  # 带上 city：首次会据此分配指定城市代理并建绑定
 
-    app.logger.info(f"[login_status] 请求参数: phone={phone}")
+    app.logger.info(f"[login_status] 请求参数: phone={phone}, city={city}")
 
     if not phone:
         error_msg = '缺少 phone 参数'
         app.logger.error(f"[login_status] ❌ 参数错误: {error_msg}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone)
+    login_manager = get_login_manager(phone, city)
 
     # 加载凭证
     token, sid, meddy_id = login_manager.load_credentials()

@@ -27,6 +27,7 @@ import shutil
 import base64
 import random
 import tempfile
+import traceback
 from urllib.parse import urlparse
 
 import redis
@@ -133,16 +134,53 @@ def get_tracks(distance):
     return trace
 
 
+# 失败现场取证目录（服务器上滑块抓不到 fverify 时用）
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captcha_debug')
+
+
+def _dbg_dump(page, tag):
+    """失败现场取证：截图 + 存 HTML + 打印 url/title。返回截图路径。"""
+    shot = None
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        name = f'{tag}_{time.strftime("%H%M%S")}.png'
+        page.get_screenshot(path=DEBUG_DIR, name=name)
+        shot = os.path.join(DEBUG_DIR, name)
+    except Exception as e:
+        log_info(f"[worker][dbg] 截图失败: {e}")
+    try:
+        html_path = os.path.join(DEBUG_DIR, f'{tag}_{time.strftime("%H%M%S")}.html')
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(page.html or '')
+    except Exception as e:
+        log_info(f"[worker][dbg] 存HTML失败: {e}")
+    try:
+        log_info(f"[worker][dbg] url={page.url} title={page.title!r} 截图={shot}")
+    except Exception:
+        pass
+    return shot
+
+
 def _slide_once(page):
-    bg_ele = page.ele('.shumei_captcha_loaded_img_bg')
-    fg_ele = page.ele('.shumei_captcha_loaded_img_fg')
-    bg_bytes = requests.get(bg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
-    fg_bytes = requests.get(fg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
+    bg_ele = page.ele('.shumei_captcha_loaded_img_bg', timeout=3)
+    fg_ele = page.ele('.shumei_captcha_loaded_img_fg', timeout=3)
+    if not bg_ele or not fg_ele:
+        log_info(f"[worker][dbg] 滑块图元素缺失 bg={bool(bg_ele)} fg={bool(fg_ele)}")
+        return None, None
+    try:
+        bg_bytes = requests.get(bg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
+        fg_bytes = requests.get(fg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
+    except Exception as e:
+        log_info(f"[worker][dbg] 下载滑块图失败(requests 直连该服务器可能不通): {e}")
+        return None, None
     res = _ocr.slide_match(fg_bytes, bg_bytes, simple_target=True)
     native_w = Image.open(io.BytesIO(bg_bytes)).size[0]
-    zoom = bg_ele.size[0] / native_w
+    disp_w = bg_ele.size[0]
+    zoom = disp_w / native_w
     distance = res['target'][0] * zoom
     distance -= random.randint(0, max(1, int(distance * 0.02)))
+    log_info(f"[worker][dbg] slide_match target={res['target']} native_w={native_w} "
+             f"disp_w={disp_w} zoom={zoom:.3f} distance={distance:.0f}")
     tracks = get_tracks(distance)
 
     btn = page.ele('.shumei_captcha_slide_btn')
@@ -154,13 +192,16 @@ def _slide_once(page):
         ac.move(tr, random.randint(-4, 4), duration=0.05)
     time.sleep(random.uniform(0.1, 0.2))
     ac.release(btn)
-    pkt = page.listen.wait(timeout=12)
+    pkt = page.listen.wait(timeout=18)  # 服务器代理慢，放宽到 18s
     page.listen.stop()
     if not pkt:
+        log_info("[worker][dbg] 未捕获到 ca/v2/fverify（滑动可能未触发校验 / 响应超时 / 页面没正常加载）")
         return None, None
     body = pkt.response.body if isinstance(pkt.response.body, str) else str(pkt.response.body)
     risk = re.search(r'riskLevel"\s*:\s*"(\w+)"', body)
     rid = re.search(r'[?&]rid=([0-9a-zA-Z]+)', pkt.url)
+    if not risk:
+        log_info(f"[worker][dbg] fverify 已捕获但未解出 riskLevel，body 前200: {body[:200]}")
     return (risk.group(1) if risk else None), (rid.group(1) if rid else None)
 
 
@@ -187,18 +228,20 @@ def make_proxy_auth_extension(host, port, user, pwd):
     return d
 
 
-def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None):
+def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='sm'):
     """proxy_parts: {host,port,user,pwd} 或 None。
-    有账密且 PROXY_BROWSER_AUTH=True → 动态扩展带账密；否则白名单(只用 IP:端口)。"""
+    有账密且 PROXY_BROWSER_AUTH=True → 动态扩展带账密；否则白名单(只用 IP:端口)。
+    tag: 失败截图/HTML 文件名前缀（一般传 phone），便于服务器上定位现场。"""
     co = ChromiumOptions()
     co.auto_port(True)  # 独立端口+临时用户目录，避免连到残留浏览器
     ext_dir = None
     use_ext = bool(proxy_parts and proxy_parts.get('user') and PROXY_BROWSER_AUTH)
+    # Linux 服务器(尤其 root)起 Chrome 必需；mac 下也无害
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-dev-shm-usage')  # 容器 /dev/shm 太小会崩
     if headless:
-        if use_ext:
-            co.set_argument('--headless=new')  # 扩展需 new headless
-        else:
-            co.headless(True)
+        co.set_argument('--headless=new')  # 新无头(扩展/服务器都更稳)
+        co.set_argument('--disable-gpu')
         co.set_argument('--window-size=1280,800')
     if proxy_parts:
         if use_ext:
@@ -212,10 +255,19 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None):
             log_info(f"[worker] 浏览器走白名单代理 {proxy_parts['host']}:{proxy_parts['port']}")
     page = ChromiumPage(co)
     try:
-        page.get(SM_URL)
+        try:
+            page.get(SM_URL)
+        except Exception as e:
+            log_info(f"[worker][dbg] 打开数美页面失败(代理/网络不通?): {e}")
+            _dbg_dump(page, f'{tag}_openfail')
+            return None
         time.sleep(2)
         page.run_js(DELIVER_JS)
         time.sleep(5)
+        # 首屏取证：确认滑块是否真的渲染出来（服务器上常见就是根本没出滑块）
+        if not page.ele('.shumei_captcha_slide_btn', timeout=8):
+            log_info("[worker][dbg] 首屏 8s 未出现滑块按钮，dump 现场")
+            _dbg_dump(page, f'{tag}_noslider')
         for i in range(1, max_try + 1):
             if on_beat:
                 try:
@@ -224,10 +276,16 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None):
                     pass
             if not page.ele('.shumei_captcha_slide_btn', timeout=5):
                 time.sleep(3); continue
-            risk, rid = _slide_once(page)
+            try:
+                risk, rid = _slide_once(page)
+            except Exception as e:
+                log_info(f"[worker][dbg] 滑动#{i} 异常: {e}\n{traceback.format_exc()}")
+                _dbg_dump(page, f'{tag}_exc{i}')
+                risk, rid = None, None
             log_info(f"[worker] 滑动#{i} risk={risk} rid={rid}")
             if risk == 'PASS' and rid:
                 return rid
+            _dbg_dump(page, f'{tag}_fail{i}')  # 失败现场：截图+HTML
             rf = page.ele('.shumei_captcha_img_refresh_btn', timeout=3)
             if rf:
                 rf.click(); time.sleep(3)
@@ -307,7 +365,7 @@ def handle_login(phone, city=None, force_new_device=False, headless=True):
         punish_id, verify_sdk = sc.get('punishId'), sc.get('verifySdk')
         log_info(f"[worker] {phone} 命中 420  punishId={punish_id} verifyType={sc.get('verifyType')} verifySdk={verify_sdk}")
         rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
-                           on_beat=lambda: beat(phone))  # 过滑块每次尝试刷心跳
+                           on_beat=lambda: beat(phone), tag=phone)  # 过滑块每次尝试刷心跳
         if not rid:
             set_status(phone, 'failed', '滑块多次未通过'); unfreeze(phone); return
 

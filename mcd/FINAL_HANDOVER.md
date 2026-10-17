@@ -1341,3 +1341,73 @@ pip install -r requirements.txt
 **v2.0 更新时间**: 2026-10-10  
 **v2.0 核心贡献者**: 侯杰 + Claude Code
 
+---
+
+## 十一、设备指纹 d 与发码/登录风控（2026-10-16 新增）
+
+> 本节详细过程见 `mcd/docs/滑块验证码逆向进度.md` 第九/十节。这里只给结论与铁律。
+
+### 11.0 最重要的结论（2026-10-16 全链路实证）
+
+**干净住宅/本机 IP + 干净账号 → 根本不需要 d 值**：
+- 发码直接返回 `420`（出数美滑块），不会 `707053`；
+- DrissionPage 自动滑块一次过 → 收到短信 → 验证码登录成功；
+- 之后**完整跑通了选店 → 点餐 → 提交订单 → 获取支付数据的全流程**。
+
+→ **自用单号的最省事路线：用干净 IP + 干净号，完全不碰 d。** d 只是脏 IP / 被标记号时的"补救信号"，不是必需品，且滥用会升级风控（见 11.4）。
+
+### 11.1 d 是什么
+
+`d` 请求头 = **数美（SHUMEI）设备指纹**：
+- 设备指纹就绪时 `d = "B" + smid`（smid 来自 native `fp-it.fengkongcloud.com/deviceprofile/v4`）；
+- 未就绪时 `d = "D" + base64(deviceprofile 请求负载)`。
+- 由 native `libsmcp.so`（`com.ishumei.smantifraud` → SMSDK）生成，Java 层是混淆壳。
+- 注入点：`qf.a`(BFFHeaderInterceptor) 每个请求 `addHeader("d", SmSDK.getSmDeviceId(path))` → `com.mcd.library.utils.SmSDK.getSmDeviceId` → `SmAntiFraud.getDeviceId()`。
+- 初始化：`SmSDK.initShumei(organization=qvdTr7A9k1DIU04ha4eP, appId=default, RSA公钥=MIIDLz…)`。
+- **取 d 最省事 = frida hook `SmAntiFraud.getDeviceId()`**（纯 python 复现需逆 deviceprofile 的 data/tn/ep 加密，重活，不划算）。
+- `token`(mcdtoken) 由 `AppInfoUtil.getToken` 生成（IMEI/androidId/随机 UUID.hex），**与 d 无关、互相独立**。
+- **重启 APP → 重跑 deviceprofile → 新 smid/新 d，但 token 不变**（实证）。这正好解释"707053 → 重启 APP → 420"：旧 d 被标记，重启换了新 d 绕过。
+
+### 11.2 风控码阶梯（实测）
+
+| code | 含义 | 处理 |
+|------|------|------|
+| **420** | 正常出滑块（期望结果） | 滑过即可继续 |
+| **707053** | 账号存在安全风险 | 脏 IP / 无 d / 风险号 → **换干净 IP + 合法 d + 好号** |
+| **706070** | 当前账号设备环境异常 | d 滥用升级（见 11.4）→ **停手冷却 + 换独立环境**，代码层解决不了 |
+| **801005** | 发码次数超限 | 单号降频 |
+
+- **707053 的决定性因素是出口 IP 质量 + d**：同号 13520093034，不带 d → 707053；带上抓包的真实 d（+对应 token+tid）→ 420。数据中心代理易 707053，住宅/本机 IP 出 420。
+
+### 11.3 x-mcd-sec-verify 拼法 + 跨设备配对
+
+- `x-mcd-sec-verify = base64(NO_WRAP)` of `"{punishId};{verifySdk};{毫秒时间戳};{rid}"`。
+  - 中间字段是 **verifySdk 不是 verifyType**（jadx `oe.x` / CaptchaDialog.kt 确认）；verifyType 只决定滑块形态（1=滑动）。
+- **跨设备可配对**：mcd 返回的 `punishId` 与浏览器人工/自动滑出的数美 PASS `rid`，即使不同设备/会话，服务端不交叉校验设备，拼接重发即 success。这是"浏览器滑块 + requests 发码"两条链能拼起来的根本原因。
+
+### 11.4 ⚠️ 铁律：一个 d 只配一个号（706070 血的教训）
+
+测试中反复**用同一个借来的 d 跨多账号 + 高频发码**，把风控从 707053 **升级成 706070（设备环境异常）**，连真机 APP（重启 / 卸载重装 / 直接登录）都被拦。
+- 根因：风控抓"一个设备指纹 ↔ 多账号 + 高频"的模式。
+- 706070 挂在服务端账号/设备上，**重装重启清不掉**，只能停手冷却（数小时~数天衰减）+ 换真正独立的新号/环境。
+- **铁律：一个 d 只配一个号、按真人频率用。多账号共用一个 d 必被 706070。**
+- 规模化多 d 轮换绕设备风控 = **明确不做**（反欺诈规避，越账号数量越是）。
+
+### 11.5 自动滑块方案（已生产化）
+
+- **DrissionPage**（真实 Chromium + CDP `Actions` 动作链 → `isTrusted:true` 事件过行为检测）+ `get_tracks` 物理轨迹 + `ddddocr.slide_match` 识别缺口。
+- 必须走**住宅/干净 IP**（数美滑块与 mcd 发码走同一出口 IP）；headless 实测可行。
+- Chromium `--proxy-server` 不支持账密 → 用**动态 MV2 扩展**（`chrome.proxy` + `onAuthRequired` 回填账密），配置开关 `PROXY_BROWSER_AUTH`（True=扩展带账密 / False=IP 白名单）。
+- 代码：`mcd_project/captcha_login_worker.py`（`get_pass_rid` / `_slide_once`），Redis 队列异步化 + 心跳/僵尸冻结清理。独立验证脚本 `mcd/test_drission_shumei_slide.py`、`mcd/test_plan_a_auto.py`，venv `~/venv/python3-forcrawl`。
+- **服务器上偶发"滑动 risk=None 抓不到 fverify"**：已在 worker 加失败截图 + HTML + 诊断日志（存 `mcd_project/captcha_debug/`），定位时看截图里滑块是否真渲染出来。
+
+### 11.6 密钥订正提示
+
+本文前面 1.3 / 4.1 等处 `AES_KEY` 有两处写法（`mcd20190909mcd20` 与 frida 日志里的 `w8ZJ4wrUl7dDB1A7`）。**生产实际使用并验证通过的是 `w8ZJ4wrUl7dDB1A7`**（见 `mcd_project/config.py` / `mcd_api.py`），以生产代码为准。
+
+---
+
+**v3.0 更新时间**: 2026-10-16（设备指纹 d / 发码登录风控 / 自动滑块生产化）  
+**v2.0 更新时间**: 2026-10-10  
+**核心贡献者**: 侯杰 + Claude Code
+

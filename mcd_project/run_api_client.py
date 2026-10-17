@@ -19,11 +19,11 @@ DATA_DIR = os.path.expanduser('~/datas/mcd')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
-# API_BASE = 'http://43.163.92.204:5001'
-API_BASE = 'http://127.0.0.1:5001'
+API_BASE = 'http://43.163.92.204:5001'
+# API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
-DEFAULT_PHONE = '16752934813'
-DEFAULT_CITY = '南京'
+DEFAULT_PHONE = '18019701277'
+DEFAULT_CITY = '天津'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
@@ -74,7 +74,7 @@ def get_login_info():
     print("正在检查登录状态...")
 
     # 检查登录状态
-    result = api_call('/api/login/status', params={'phone': phone})
+    result = api_call('/api/login/status', params={'phone': phone, 'city': proxy_city})
     if result.get('success') and result.get('data', {}).get('is_logged_in'):
         print(f"✅ 已登录")
         print(result)

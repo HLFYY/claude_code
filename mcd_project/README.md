@@ -322,6 +322,38 @@ python run.py payment old
    - 生成的支付链接可在手机浏览器打开
    - 或生成二维码用支付宝扫码支付
 
+## 登录风控与滑块验证码 🎉 v3.0（2026-10-16）
+
+> 完整逆向过程见 `../mcd/docs/滑块验证码逆向进度.md`，结论与铁律见 `../mcd/FINAL_HANDOVER.md` 第十一节。
+
+### 一句话结论
+
+**干净住宅/本机 IP + 干净账号 → 发码直接出滑块（code 420），自动滑过即可登录，全链路（选店→下单→支付数据）已跑通，不需要 d 值。**
+
+### 发码/登录风控码
+
+| code | 含义 | 处理 |
+|------|------|------|
+| `420` | 正常出滑块（期望） | 滑过继续 |
+| `707053` | 账号安全风险 | 换干净 IP + 合法 d + 好号 |
+| `706070` | 设备环境异常 | 停手冷却 + 换独立环境（代码解决不了） |
+| `801005` | 发码超限 | 单号降频 |
+
+### 设备指纹 d
+
+- `d` = 数美设备指纹（`"B"+smid` 或 `"D"+base64(...)`），native 生成，取值最省事是 frida hook `SmAntiFraud.getDeviceId()`。
+- `d` 与 `token` 相互独立；**重启 APP 换新 d，token 不变**。
+- 代码里 `d` **存在才加入请求**（`LoginManager` 从凭证读 `self.d` → `set_active_d()` → `build_headers` 用 ContextVar 注入），requests 结构不变。
+- ⚠️ **铁律：一个 d 只配一个号、按真人频率用**。同一个 d 跨多账号/高频会被升级到 706070，重装重启都清不掉。规模化多 d 轮换 = 不做。
+
+### 自动过滑块（生产化）
+
+- `captcha_login_worker.py`：DrissionPage（真实 Chromium + CDP Actions，事件 `isTrusted:true`）+ `ddddocr` 识别缺口 + 物理轨迹，Redis 队列异步执行，带心跳/僵尸冻结清理。
+- 必须走**住宅/干净 IP**，滑块与发码走同一出口 IP；headless 可行。
+- 浏览器账密代理：配置 `PROXY_BROWSER_AUTH`（True=动态扩展带账密 / False=IP 白名单）。
+- `x-mcd-sec-verify` = `base64("{punishId};{verifySdk};{毫秒时间戳};{rid}")`；mcd 的 punishId 与数美 PASS 的 rid **跨设备可配对**重发。
+- 失败排查：worker 在滑块失败时自动存截图 + HTML 到 `captcha_debug/`。
+
 ## 代理池管理系统 🎉 v2.0
 
 ### 功能概览

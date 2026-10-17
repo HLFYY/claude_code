@@ -33,7 +33,7 @@ const MSAO_WORKERS = [0x16d30, 0x175f8];
 // statically: its fall-through materializes a marker, clears SP/LR, and jumps
 // to an unmapped low address; target is the original safe continuation.
 const PATCH_ALL_PROVEN_TRAPS = true;
-const VERBOSE = false;
+const VERBOSE = true;  // 打开以便区分"在跑(会打 patched=NN)"与"卡住(只停在 waiting)"
 
 // The one check that deliberately kills the parent with direct getppid/kill
 // syscalls. It has no zero-SP crash prelude, so it is kept separately.
