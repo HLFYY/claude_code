@@ -1,0 +1,54 @@
+{"success":true,"code":200,"data":{
+  "requestLimit": {
+    "GET /bff/ecmall/aggregation/theme/list": 0,
+    "GET /bff/ecmall/aggregation/shuffling": 0,
+    "GET /bff/ecmall/seckill/list": 0,
+    "GET /bff/ecmall/aggregation/spu": 0,
+    "GET /bff/ecmall/detail/": 0,
+    "GET /bff/ecmall/detail/spec/": 0,
+    "GET /bff/ecmall/spu/share/": 0,
+    "POST /bff/ectrade/settle/detail": 0,
+    "GET /bff/store/cities": 0,
+    "GET /bff/member/addresses": 0,
+    "POST /bff/member/addresses": 0,
+    "PUT /bff/member/addresses/": 0,
+    "POST /bff/ectrade/order/create": 0,
+    "GET /bff/cashier/channels": 0,
+    "POST /bff/cashier/preorder": 0,
+    "GET /bff/ectrade/order/list": 0,
+    "GET /bff/ectrade/order/detail": 0
+  },
+  "tdSignConfig": {
+      "enabled": true,
+      "rules": [
+          { "method": "POST", "path": "/bff/order/orders", "ratio": 100 },
+          { "method": "POST", "path": "/bff/passport/login/refresh", "ratio": 0 },
+          { "method": "POST", "path": "/bff/member/mwallet/upg/recharge", "ratio": 100 },
+          { "method": "POST", "path": "/bff/member/mwallet/giftcard/recharge", "ratio": 100 },
+          { "method": "POST", "path": "/bff/member/mwallet/recharge/card", "ratio": 100 },
+          { "method": "POST", "path": "/bff/market/task/center/store/acceptTask", "ratio": 100 }
+      ]
+  },
+  "ecsConfig": {
+    "queryFromCDNCode": "",
+    "needReturnBackToTab": true,
+    "requestDelayTime": 0
+  },
+  "cmsConfig": {
+    "queryDetailFromCDNId": "vZBy61"
+  },
+  "mPageConfig": {
+    "queryFromCDNId": "",
+    "queryFromCDNKey": ""
+  },
+  "dtTimeDelta": {
+    "101": 60,
+    "102": 60
+  },
+  "storeWhitelistConfig": {
+    "searchKey": "悟空,wukong"
+  },
+  "arConfig": {
+    "showScanTab": false
+  }
+}}  
