@@ -219,5 +219,5 @@ def run_scheduler():
 
 if __name__ == '__main__':
     run_scheduler()
-    # cleanup_failure_records()
+    # sync_proxy_binding_count()
 

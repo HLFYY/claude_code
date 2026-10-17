@@ -25,6 +25,7 @@ from mcd_api import (
     login,
     build_headers,
     set_active_d,
+    set_active_tid,
     API2_BASE
 )
 from exceptions import (
@@ -165,7 +166,10 @@ class LoginManager:
         self.token: Optional[str] = None
         self.sid: Optional[str] = None
         self.meddy_id: Optional[str] = None
-        self.d: Optional[str] = None  # 数美设备指纹(由 set_device 写入凭证)，请求头 d
+        self.d: Optional[str] = None  # 数美设备指纹(设备池自动领取/set_device 写入)，请求头 d
+        self.device_id: Optional[str] = None  # 设备池中的设备唯一 id(绑定来源,便于失效换设备)
+        self.tid: Optional[str] = None          # Token 激活标识(7天有效,ensure_tid 刷新)
+        self.tid_expire: Optional[float] = None  # tid 过期时间戳(秒)
 
         # ====== 新增：代理管理 ======
         # 使用传入的实例或创建新实例
@@ -312,6 +316,119 @@ class LoginManager:
         # 所有重试都失败
         raise NetworkError(f"请求失败（已重试{max_retries}次）: {str(last_error)}")
 
+    def ensure_device(self, force_new: bool = False) -> Optional[str]:
+        """确保账号已绑定数美设备指纹 d：没有(或 force_new)就从设备池领一个并写入凭证。
+        - 新账号：首次调用即领一个设备
+        - 已有账号但无 d：自动补领并更新到登录信息
+        - force_new=True：换新设备(旧设备标记失效)，对接 send_code 的 use_new_device
+        返回 d；设备池空或不可用时返回当前 self.d(可能为 None)。"""
+        if self.d and self.token and not force_new:
+            return self.d
+        try:
+            from device_pool_redis import claim, release
+        except Exception as e:
+            log_info(f"✗ 设备池不可用，无法为 {self.phone} 分配设备: {e}")
+            return self.d
+        old_device_id = self.device_id
+        dev = claim(self.phone)
+        if not dev:
+            log_info(f"✗ 设备池无空闲设备，账号 {self.phone} 暂未分配 d（请先 refill 补池）")
+            return self.d
+        if force_new and old_device_id:          # 换设备：旧的标记失效,不回收
+            try:
+                release(old_device_id)
+            except Exception:
+                pass
+        self.d = dev['d']
+        self.token = dev.get('token') or self.token   # 用设备池固定 token(与 d 成一套)
+        self.device_id = dev['id']
+        set_active_d(self.d)
+        self._persist_device(dev['d'], dev['id'])
+        log_info(f"✓ 账号 {self.phone} 绑定设备 {dev['id']} (model={dev.get('model')}) token={str(self.token)[:8]}… d={dev['d'][:16]}…")
+        return self.d
+
+    def _update_credential(self, fields: dict) -> None:
+        """把若干字段合并进凭证(保留其它字段)；token 以当前 self.token 为准(设备池固定 token)。"""
+        now = datetime.now().isoformat()
+        if self.use_redis:
+            try:
+                old = self.redis_client.hget(self.redis_key, self.phone)
+                cred = json.loads(old) if old else {}
+            except Exception:
+                cred = {}
+            cred.update(fields)
+            if self.token:
+                cred['token'] = self.token
+            cred.setdefault('sid', self.sid)
+            cred.setdefault('meddy_id', self.meddy_id)
+            cred['saved_at'] = now
+            try:
+                self.redis_client.hset(self.redis_key, self.phone, json.dumps(cred, ensure_ascii=False))
+            except Exception as e:
+                log_info(f"✗ 写入凭证失败: {e}")
+        else:
+            all_c = {}
+            if os.path.exists(self.credentials_file):
+                try:
+                    with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                        all_c = json.load(f)
+                except Exception:
+                    all_c = {}
+            cred = all_c.get(self.phone, {})
+            cred.update(fields)
+            if self.token:
+                cred['token'] = self.token
+            cred.setdefault('sid', self.sid)
+            cred.setdefault('meddy_id', self.meddy_id)
+            cred['saved_at'] = now
+            all_c[self.phone] = cred
+            try:
+                os.makedirs(os.path.dirname(self.credentials_file), exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                 dir=os.path.dirname(self.credentials_file), delete=False) as tf:
+                    json.dump(all_c, tf, indent=2, ensure_ascii=False)
+                    tmp = tf.name
+                shutil.move(tmp, self.credentials_file)
+            except Exception as e:
+                log_info(f"✗ 写入凭证失败: {e}")
+
+    def _persist_device(self, d: str, device_id: str) -> None:
+        """把 d/device_id/token(设备池固定 token) 写入凭证。"""
+        self._update_credential({'d': d, 'device_id': device_id})
+
+    def _persist_tid(self, tid: str, tid_expire: float) -> None:
+        """把 tid/tid_expire 写入凭证。"""
+        self._update_credential({'tid': tid, 'tid_expire': tid_expire})
+
+    def ensure_tid(self, force: bool = False) -> Optional[str]:
+        """确保 tid 有效(7天)。过期或 force 时用设备 token 重新激活(activate_token /bff/common/proxy/tid)。
+        tid 是设备级、7天有效的会话凭证——在账号用设备时激活/刷新,不在造设备时。返回 tid。"""
+        import time as _t
+        now = _t.time()
+        if not force and self.tid and self.tid_expire and now < float(self.tid_expire):
+            set_active_tid(self.tid)
+            return self.tid                        # 7天内复用
+        if not self.token:
+            self.ensure_device()                   # 没 token 先领设备(拿固定 token)
+        if not self.token:
+            log_info(f"✗ 账号 {self.phone} 无 token，无法激活 tid")
+            return self.tid
+        try:
+            proxies = self._get_proxy_dict()
+            success, tid, message = activate_token(self.token, proxies=proxies)
+        except Exception as e:
+            log_info(f"✗ tid 激活异常: {e}")
+            return self.tid
+        if success and tid:
+            self.tid = tid
+            self.tid_expire = now + 7 * 86400      # 与真机 TidManager 一致:7天有效
+            set_active_tid(self.tid)
+            self._persist_tid(self.tid, self.tid_expire)
+            log_info(f"✓ 账号 {self.phone} 激活 tid={str(tid)[:12]}… (7天有效)")
+        else:
+            log_info(f"✗ tid 激活失败: {message}")
+        return self.tid
+
     def save_credentials(self, token: str, sid: str, meddy_id: str) -> None:
         """
         保存登录凭证到文件或 Redis（原子写入，支持多账号）
@@ -337,6 +454,9 @@ class LoginManager:
                 'sid': sid,
                 'meddy_id': meddy_id,
                 'd': d_keep,
+                'device_id': self.device_id,
+                'tid': self.tid,
+                'tid_expire': self.tid_expire,
                 'saved_at': datetime.now().isoformat()
             }
             try:
@@ -366,6 +486,9 @@ class LoginManager:
                 'sid': sid,
                 'meddy_id': meddy_id,
                 'd': d_keep,
+                'device_id': self.device_id,
+                'tid': self.tid,
+                'tid_expire': self.tid_expire,
                 'saved_at': datetime.now().isoformat()
             }
 
@@ -410,7 +533,10 @@ class LoginManager:
             (token, sid, meddy_id) 或 (None, None, None)
         """
         self.d = None
+        self.tid = None
+        self.tid_expire = None
         set_active_d('')  # 先重置，避免同 worker 上个账号的 d 残留
+        set_active_tid('')
         if self.use_redis:
             # Redis 存储
             try:
@@ -429,7 +555,11 @@ class LoginManager:
                 self.sid = sid
                 self.meddy_id = meddy_id
                 self.d = cred.get('d')
+                self.device_id = cred.get('device_id')
+                self.tid = cred.get('tid')
+                self.tid_expire = cred.get('tid_expire')
                 set_active_d(self.d)  # 设为当前请求使用的 d
+                set_active_tid(self.tid)
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
@@ -461,7 +591,11 @@ class LoginManager:
                 self.sid = sid
                 self.meddy_id = meddy_id
                 self.d = cred.get('d')
+                self.device_id = cred.get('device_id')
+                self.tid = cred.get('tid')
+                self.tid_expire = cred.get('tid_expire')
                 set_active_d(self.d)  # 设为当前请求使用的 d
+                set_active_tid(self.tid)
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
@@ -580,26 +714,18 @@ class LoginManager:
         if not self.token:
             self.load_credentials()
 
-        # 1. 尝试使用已保存的 token（如果存在且未强制生成新设备）
-        if not force_new_device and self.token:
-            log_info("  [1/2] 使用已保存的设备 Token（跳过激活）...")
-            # 使用已有 token，无需激活
-        else:
-            log_info("  [1/2] 生成新设备 Token...")
-            self.token = generate_token()
+        # 1. 绑定设备：token/d 来自设备池(一设备一套固定值)。force_new_device=True 换新设备。
+        log_info("  [1/3] 绑定设备(设备池固定 token+d)...")
+        self.ensure_device(force_new=force_new_device)
+        if not self.token:
+            return False, "无可用设备(设备池空)，请先 refill 补池"
 
-            # 2. 激活新生成的 Token
-            log_info("  激活 Token...")
-            proxies = self._get_proxy_dict()
-            success, tid, message = activate_token(self.token, proxies=proxies)
-            if not success:
-                return False, f"Token 激活失败: {message}"
-
-            # 保存新生成的 token 到 Redis（以便跨进程共享）
-            self.save_credentials(self.token, None, None)
+        # 2. 激活 tid：7天有效,过期/换设备自动刷新(用时激活,不在造设备时)
+        log_info("  [2/3] 激活 tid(7天有效,自动复用/刷新)...")
+        self.ensure_tid(force=force_new_device)
 
         # 3. 发送验证码
-        log_info("  [2/2] 发送验证码...")
+        log_info("  [3/3] 发送验证码...")
         proxies = self._get_proxy_dict()
         success, message = send_verification_code(self.phone, self.token, proxies=proxies)
         if not success:

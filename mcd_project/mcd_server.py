@@ -202,6 +202,15 @@ def login_send_code():
         app.logger.info(f"[send_code] {phone} 正在处理中(status={status})，返回 queued")
         return jsonify({'success': True, 'data': {'status': status}, 'message': '该账号正在登录处理中，请轮询状态'})
 
+    # 确保账号已绑定数美设备指纹 d：新账号自动从设备池领一个;已有但无 d 的也自动补领并写入凭证。
+    # use_new_device=True 时换新设备(旧设备标记失效)。失败不阻断发码(worker 侧仍会用现有 d)。
+    try:
+        _lm = get_login_manager(phone, city)
+        _d = _lm.ensure_device(force_new=use_new_device)
+        app.logger.info(f"[send_code] {phone} 设备绑定 d={'有' if _d else '无(池空?)'} device_id={_lm.device_id}")
+    except Exception as e:
+        app.logger.warning(f"[send_code] {phone} 设备绑定失败(继续入队): {e}")
+
     _cap_redis.delete(_status_key(phone))  # 清掉上次残留的 code_sent，避免轮询误判"已发送"而实际没重发
     enqueue_login(phone, city=city, force_new_device=use_new_device)
     app.logger.info(f"[send_code] {phone} 已(重新)入队验证码登录 (prev status={status})")
@@ -224,6 +233,7 @@ def login_verify():
 
     login_manager = get_login_manager(phone, city)  # 传递 city 参数
     login_manager.load_credentials()
+    login_manager.ensure_device()  # 确保有设备指纹 d(没有则从设备池补领),否则登录会被判设备异常
     # 调用登录
     success, message = login_manager.do_login(verify_code)
 

@@ -37,7 +37,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage._units.actions import Actions
 from ddddocr import DdddOcr
 
-from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis
+from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis, DATA_DIR
 from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, generate_token, activate_token
 from login_manager import LoginManager
 from utils import log_info
@@ -135,7 +135,7 @@ def get_tracks(distance):
 
 
 # 失败现场取证目录（服务器上滑块抓不到 fverify 时用）
-DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captcha_debug')
+DEBUG_DIR = os.path.join(DATA_DIR, 'captcha_debug')
 
 
 def _dbg_dump(page, tag):

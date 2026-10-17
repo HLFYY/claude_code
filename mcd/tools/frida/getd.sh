@@ -55,7 +55,7 @@ for try in 1 2 3 4 5; do
   [ -z "$PID" ] && { echo "    app 没起来，重试"; continue; }
   echo "[*] pid=$PID  attach + 注入(bypass + $(basename "$HOOK"))…"
   echo "    提示：手机需【已解锁+已联网】，在 app 里走登录/发码或点 tab 才会触发 [d-dump]"
-  if "$PY" "$FDRV" attach "$PID" "$WAIT" "$BYPASS" "$HOOK"; then
+  if FRIDA_DEV="$DEV" "$PY" "$FDRV" attach "$PID" "$WAIT" "$BYPASS" "$HOOK"; then
     exit 0
   fi
   echo "    注入失败（多半被反frida杀/抢晚了），重试…"

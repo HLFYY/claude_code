@@ -59,11 +59,18 @@ API2_BASE = 'https://api2.mcd.cn'
 # 当前请求的数美设备指纹 d（按请求隔离，LoginManager 加载凭证后设置；build_headers 兜底使用）
 import contextvars
 _active_d = contextvars.ContextVar('active_d', default='')
+# 当前请求使用的 tid（Token 激活返回；7天有效，由 LoginManager.ensure_tid 设置）
+_active_tid = contextvars.ContextVar('active_tid', default='')
 
 
 def set_active_d(d):
     """设置当前请求使用的 d（数美设备指纹）；空则清除。供 LoginManager/server 在取到账号凭证后调用。"""
     _active_d.set(d or '')
+
+
+def set_active_tid(tid):
+    """设置当前请求使用的 tid（Token 激活标识）；空则清除。"""
+    _active_tid.set(tid or '')
 
 
 # ========== 工具函数 ==========
@@ -312,6 +319,8 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
 
     # 未显式传 d 时，用当前请求设置的 d（LoginManager 从账号凭证加载后设置）
     d = d or _active_d.get()
+    # 未显式传 tid 时，用当前请求设置的 tid（Token 激活返回，真机登录场景带）
+    tid = tid or _active_tid.get()
 
     # st / nonce（非签名头，默认自动生成，模拟真机）
     st_val = str(st if st is not None else int(time.time()))

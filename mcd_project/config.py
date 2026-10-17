@@ -157,3 +157,16 @@ ACCOUNT_PROXY_BINDING_CONFIG = {
                                         # round_robin: 轮询
                                         # random: 随机
 }
+
+# ========== 数美设备身份池配置 ==========
+# 设备 = 一套自洽假设备指纹经 app 注册得到的独立 smid(d="B"+smid)。
+# 空闲队列用 List 保证"先生成先取"(FIFO);每设备全部参数用 Hash 存,取用不删除只标记账号。
+DEVICE_POOL_CONFIG = {
+    'free_key': 'mcd:device:free',                  # List: 空闲设备 id 队列(RPUSH 入队, LPOP 领用=FIFO)
+    'info_key': 'mcd:device:info',                  # Hash: field=设备id, value=该设备全部参数JSON(单 key,避免 key 膨胀)
+    'account_key': 'mcd:device:account:{account}',  # List: 账号领用过的设备 id(一账号可多设备)
+    'index_key': 'mcd:device:index',                # Set: 已有 smid(生成时查重,避免重复设备)
+    'min_free': 30,                                 # 最小空闲设备数,低于则补足
+    'build_batch_cap': 10,                          # 单轮补池上限(防一次造太多/触发风控)
+    'check_interval': 15 * 60,                      # 巡检补池间隔(秒)
+}

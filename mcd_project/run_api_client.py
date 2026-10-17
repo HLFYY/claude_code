@@ -19,10 +19,10 @@ DATA_DIR = os.path.expanduser('~/datas/mcd')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
-API_BASE = 'http://43.163.92.204:5001'
-# API_BASE = 'http://127.0.0.1:5001'
+# API_BASE = 'http://43.163.92.204:5001'
+API_BASE = 'http://127.0.0.1:5001'
 # 默认配置
-DEFAULT_PHONE = '18019701277'
+DEFAULT_PHONE = '18356966159'
 DEFAULT_CITY = '天津'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
