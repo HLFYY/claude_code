@@ -213,6 +213,13 @@ class LoginManager:
         if not USE_PROXY:
             return None
 
+        # 全程短效模式：不绑静态，所有请求走短效代理
+        #   send_code(is_send_code=True) 每次换新；其他接口用指定城市(self.city) 复用(短效池轮巡)
+        from config import PROXY_MODE
+        if PROXY_MODE == 'always_short':
+            from utils import get_short_proxy
+            return get_short_proxy(self.city, as_dict=True, force_new=is_send_code)
+
         binding = self.binding_manager.get_binding(self.phone)
         if not binding:
             # 仅【未绑定】时才判断登录态：self.sid 有值直接认已登录(不查Redis)；

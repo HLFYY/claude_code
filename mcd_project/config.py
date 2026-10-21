@@ -52,6 +52,12 @@ IS_LOCAL = 'houjie-' in socket.gethostname()
 # 本机(住宅IP)不走代理，线上服务器走白名单住宅代理；也可手动覆盖为 True/False
 USE_PROXY = True
 
+# 代理模式（USE_PROXY=True 时生效）：
+#   'static_after_login' = 登录成功后绑定静态代理，之后所有请求走静态（原逻辑）
+#   'always_short'       = 全程短效代理，不绑静态；/api/login/send_code 每次换新代理，
+#                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
+PROXY_MODE = 'always_short'
+
 # 浏览器(自动化过滑块)代理认证方式：
 #   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
 #   False = 白名单(浏览器只用 IP:端口，代理侧按 IP 放行)
