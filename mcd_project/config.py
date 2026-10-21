@@ -56,7 +56,7 @@ USE_PROXY = True
 #   'static_after_login' = 登录成功后绑定静态代理，之后所有请求走静态（原逻辑）
 #   'always_short'       = 全程短效代理，不绑静态；/api/login/send_code 每次换新代理，
 #                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
-PROXY_MODE = 'always_short'
+PROXY_MODE = 'static_after_login'
 
 # 浏览器(自动化过滑块)代理认证方式：
 #   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
