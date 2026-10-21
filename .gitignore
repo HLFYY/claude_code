@@ -8,6 +8,8 @@ __pycache__/
 # 忽略当前目录下的某个文件夹
 .claude/
 .idea/
+# agent 记忆目录：含密钥/IP/设备序列号，不要提交
+.workbuddy/
 .stock/cache/
 .stock/cache_sina/
 

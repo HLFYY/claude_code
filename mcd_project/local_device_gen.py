@@ -11,6 +11,7 @@ import os
 import json
 import time
 import random
+import uuid
 
 import requests
 
@@ -20,7 +21,10 @@ import utils
 import mcd_api
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE = json.load(open(os.path.join(HERE, 'shumei_shortbox_template.json'), encoding='utf-8'))
+# 干净 shortbox 模板:来自能过风控的多多云手机(2026-10-21 hook)。
+# 实测:用它本地造的 d 发码得 420(出滑块可过);旧 Pixel 模板(shumei_shortbox_template.json)则 706070。
+_TPL_NAME = 'shumei_shortbox_template_cloud.json'
+TEMPLATE = json.load(open(os.path.join(HERE, _TPL_NAME), encoding='utf-8'))
 
 REGISTER_URL = "https://fp-it.fengkongcloud.com/deviceprofile/v4"
 REGISTER_HEADERS = {
@@ -42,6 +46,8 @@ def gen_shortbox():
     box['a40'] = now - random.randint(1000, 99999)
     base = 1577836800000 + random.randint(0, 60 * 86400) * 1000
     box['a125'] = {"fit": base, "lut": base + random.randint(0, 30 * 86400) * 1000}  # 安装/更新时间
+    if 'a103' in box:
+        box['a103'] = str(uuid.uuid4())                  # 每安装唯一 uuid(云模板带, 逐台刷新)
     return box, m
 
 

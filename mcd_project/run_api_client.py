@@ -20,10 +20,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
 API_BASE = 'http://43.163.92.204:5001'
-# API_BASE = 'http://127.0.0.1:5001'
+# API_BASE = 'http://43.163.92.204:5001'
+API_BASE = 'http://dns.xme.fan:5001'
 # 默认配置
-DEFAULT_PHONE = '18356966159'
-DEFAULT_CITY = '天津'
+DEFAULT_PHONE = '17717295039'
+DEFAULT_CITY = '南京'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
@@ -32,8 +33,17 @@ PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
 PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
 
+_CURRENT_CITY = None  # 登录时设为代理城市；always_short 模式下 /api/mcd/ 业务接口自动带上,用指定城市短效代理复用
+
+
 def api_call(endpoint, method='GET', data=None, params=None):
-    """通用 API 调用"""
+    """通用 API 调用。always_short 代理模式:/api/mcd/ 业务接口自动注入当前城市(city)。"""
+    # 业务接口自动带城市(短效代理按城市复用);登录接口自己已传 city,用 setdefault 不覆盖
+    if endpoint.startswith('/api/mcd/') and _CURRENT_CITY:
+        if method == 'POST':
+            data = dict(data or {}); data.setdefault('city', _CURRENT_CITY)
+        else:
+            params = dict(params or {}); params.setdefault('city', _CURRENT_CITY)
     url = f"{API_BASE}{endpoint}"
 
     response = None
@@ -69,6 +79,9 @@ def get_login_info():
         phone = DEFAULT_PHONE
     if not proxy_city:
         proxy_city = DEFAULT_CITY
+
+    global _CURRENT_CITY
+    _CURRENT_CITY = proxy_city  # 业务接口(/api/mcd/)将自动带这个城市(always_short 短效代理按城市复用)
 
     print(f"\n使用手机号: {phone}, 代理城市: {proxy_city}")
     print("正在检查登录状态...")

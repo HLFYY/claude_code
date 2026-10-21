@@ -1,0 +1,142 @@
+{
+ "a1": "all",
+ "a4": "5",
+ "a2": "MU9cQxOAkWQGiAC8COjN5Nh4L2iaADzJD7MCXHgI2I0SIMfNVTY9B1+SfH1pjG7YPpj/pglZi/2gO8Ms0n21kw==",
+ "a6": "android",
+ "a9": 1792572725050,
+ "a10": "10",
+ "a7": "3.17.0",
+ "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+ "a64": {
+  "suc": "1",
+  "enable": "1",
+  "service": [
+   "com.android.safetyregulatoryinfo/com.cyjh.config.apps.service.ConfigAccessibilityService",
+   "com.android.tv/.ToolAccessibilityService"
+  ]
+ },
+ "a56": "O=McDonalds, L=Oak Brook, ST=IL, C=US",
+ "a45": "46001",
+ "a131": "cn",
+ "a72": {
+  "temp": 295,
+  "vol": 4193,
+  "level": 56,
+  "scale": 100,
+  "status": 2
+ },
+ "a15": "false",
+ "a18": {
+  "ro.boot.hardware": "mt6765",
+  "gsm.sim.state": "LOADED",
+  "gsm.operator.alpha": "China Unicom",
+  "sys.usb.state": "mtp",
+  "ro.debuggable": "0"
+ },
+ "a24": "f567703eed47a6d7",
+ "a29": "MOLY.LR12A.R2.TC3.UNI.SP.V4.P121,MOLY.LR12A.R2.TC3.UNI.SP.V4.P121",
+ "a11": "default",
+ "a57": 932402847,
+ "a60": "u0_a108",
+ "a63": [
+  "InputMethodInfo{com.sohu.inputmethod.sogou/.SogouIME, settings: com.sohu.inputmethod.sogou.SogouIMESettingsLauncher}",
+  "InputMethodInfo{com.android.adbkeyboard/.AdbIME, settings: com.android.adbkeyboard.InputSettings}",
+  "InputMethodInfo{com.android.inputmethod.latin/.LatinIME, settings: com.android.inputmethod.latin.settings.SettingsActivity}",
+  "InputMethodInfo{com.sec.android.inputmethod/com.lbd.ddyime.ime.SoftKeyboard, settings: com.lbd.ddyime.ime.ImePreferences}",
+  "InputMethodInfo{com.android.inputmethod/com.lbd.ddyime.ime.SoftKeyboard, settings: com.lbd.ddyime.ime.ImePreferences}",
+  "InputMethodInfo{com.moyu.assist/com.ime.input.InputKb, settings: null}"
+ ],
+ "a34": 2256000,
+ "a36": "720,1280,320",
+ "a32": 8,
+ "a46": {
+  "cpu_abi": "arm64-v8a",
+  "fingerprint": "HONOR/MOA-AL00/HWMOA-M:10/HONORMOA-AL00/3.1.0.201C00:user/release-keys",
+  "radioVersion": "MOLY.LR12A.R2.TC3.UNI.SP.V4.P121,MOLY.LR12A.R2.TC3.UNI.SP.V4.P121",
+  "model": "MOA-AL00",
+  "cpu_abi2": "",
+  "brand": "HONOR",
+  "board": "MOA",
+  "manufacturer": "HUAWEI"
+ },
+ "a48": 4294967296,
+ "a37": 102,
+ "a38": "7.0.43.1",
+ "a44": "WIFI",
+ "a39": "com.mcdonalds.gma.cn",
+ "a40": 1777546712757,
+ "a144": "45:268;33:27;36:41;63:27;120:40;103:177;102:91;107:69;159:186;162:65;60:299;97:52;115:177;",
+ "a132": "cn",
+ "a135": 0,
+ "a136": "build1",
+ "a139": 0,
+ "a142": 1,
+ "a133": 845,
+ "a70": 33245147136,
+ "a71": 36672405504,
+ "a69": 31349321728,
+ "a73": 0,
+ "a75": 0,
+ "a74": 0,
+ "a113": 0,
+ "a85": [
+  "bootId",
+  "tel",
+  "sensor",
+  "gps",
+  "apps"
+ ],
+ "a164": 0,
+ "a167": 787552,
+ "a157": 0,
+ "a171": 15026012928,
+ "a168": 787552,
+ "a172": {
+  "s": "4355;",
+  "n": "Game China Virtual Input Device.3;"
+ },
+ "a170": 15026012928,
+ "a117": false,
+ "a120": {
+  "tt": 5824355938,
+  "mr": 0,
+  "tr": 5570143083,
+  "mt": 0
+ },
+ "a121": 0,
+ "a125": {
+  "fit": 1792562283467,
+  "lut": 1792562283467
+ },
+ "a126": "BMU9cQxOAkWQGiAC8COjN5Nh4L2iaADzJD7MCXHgI2I0SIMfNVTY9B1+SfH1pjG7YPpj/pglZi/2gO8Ms0n21kw==",
+ "a127": 536,
+ "a130": 10,
+ "a84": "AgC/0z5G1LJoFEeDrl1KfgsSWt3qjApj/RxJHD+jdis=___",
+ "a80": "1792572723916-86280",
+ "a83": "0001100",
+ "a96": "qvdTr7A9k1DIU04ha4eP",
+ "a93": 1,
+ "a97": "MU9cQxOAkWQGiAC8COjN5Nh4L2iaADzJD7MCXHgI2I0SIMfNVTY9B1+SfH1pjG7YPpj/pglZi/2gO8Ms0n21kw==",
+ "a103": "92049229-5555-4672-b8c2-246dc74b5521",
+ "a86": "1101010",
+ "a90": 33,
+ "a92": "720,1280",
+ "a88": "locateServiceName:android.os.BinderProxy|phoneServiceName:android.os.BinderProxy",
+ "a155": 0,
+ "a141": 0,
+ "a154": {
+  "ver": "2.2.201",
+  "label": "Launcher3",
+  "pkg": "com.android.launcher2"
+ },
+ "a163": "d18cf8039aa6499e8f8e9b6628c888e1",
+ "a165": 0,
+ "a160": 0,
+ "a161": 0,
+ "a162": [
+  "hu"
+ ],
+ "a173": 10,
+ "a175": 50268,
+ "a174": 0
+}

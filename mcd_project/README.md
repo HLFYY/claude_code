@@ -480,6 +480,28 @@ $PY device_pool_redis.py stats
 
 ---
 
+## 云手机抓干净 shortbox 模板 🎉 v5.1（2026-10-21）
+
+> 针对上面根因①:在**能过数美风控的多多云手机**上 hook 出干净 box/shortbox 明文,替换掉被 frida 污染的 Pixel 模板。
+> 完整方法/用法见 `../mcd/tools/frida/云手机dumpbox用法.md`;连接见 `../mcd/docs/Mac连接Windows共享adb手机.md`。
+>
+> **★结论(2026-10-21 实测)**:706070 根因是 **d 的设备信誉**,不是 IP。换上这份干净云模板后,**本地造的 d 发码得 420(出滑块可过),不再 706070**;神龙代理 IP 无关。`local_device_gen.TEMPLATE` 已默认切到 `shumei_shortbox_template_cloud.json`。
+> ⚠️ 签名版本坑:我们的密钥 `V4AK=HJ7..` 属 **7.0.41.0**,`v`/`p` 必须保持 `7.0.41.0`/`102`(声明 43.1 会被网关 403,因无 5DLU 密钥);`biz_scenario=500/biz_from=1011` 不参与签名,已对齐真机。
+
+### 产出(实测)
+
+- `shumei_shortbox_template_cloud.json`(29字段,注册实际用它) / `shumei_fullbox_cloud.json`(82字段,参考)。
+- **干净 vs 旧 Pixel 脏模板差异**:`a18` 由 `{ABSENT, adb}`→`{LOADED, mtp}`;**多出 `a2/a97`(同一 base64 签名值)、`a103`(uuid)**;`a167/a168` 由 0→787552;`a4`、`a85(+apps)`、`a121/a135` 也不同。即旧模板不止 a18 脏,还缺字段 + 有可疑零值。
+- ⚠️ `a2/a97` 疑似对 box 的签名,换 a24/a46 后可能要重算,**勿直接抄,待 jadx 验证**。
+
+### 方法要点(别重试很多次)
+
+- **两套防护**:数美(云手机过)vs app 原生壳 `libmsaoaidsec`(反frida,检测到就故意崩)。
+- **配方**:`spawn + frida_bypass_combined_local.js + hook_dump_box_plain.js(单脚本) + 重试竞速`。只能 2 个脚本(DexHelper patch 要在 25ms 内赢竞速,多脚本必崩);frida-server **不用改名**,但 **frida 不认 ADB_SERVER_SOCKET**,远程设备要跑 `adb_relay.py` 把本机 5037 中继到 Windows adb server。
+- 一键:`FRIDA_DEV=127.0.0.1:63373 PY mcd/tools/frida/dumpbox_cloud.py 12 30 <outdir>`,全自动主动触发注册,抓到 v1 入参自动解析存 JSON。
+
+---
+
 ## 代理池管理系统 🎉 v2.0
 
 ### 功能概览

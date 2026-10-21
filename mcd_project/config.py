@@ -56,7 +56,7 @@ USE_PROXY = True
 #   'static_after_login' = 登录成功后绑定静态代理，之后所有请求走静态（原逻辑）
 #   'always_short'       = 全程短效代理，不绑静态；/api/login/send_code 每次换新代理，
 #                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
-PROXY_MODE = 'static_after_login'
+PROXY_MODE = 'always_short'
 
 # 浏览器(自动化过滑块)代理认证方式：
 #   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
@@ -172,8 +172,8 @@ DEVICE_POOL_CONFIG = {
     'info_key': 'mcd:device:info',                  # Hash: field=设备id, value=该设备全部参数JSON(单 key,避免 key 膨胀)
     'account_key': 'mcd:device:account:{account}',  # List: 账号领用过的设备 id(一账号可多设备)
     'index_key': 'mcd:device:index',                # Set: 已有 smid(生成时查重,避免重复设备)
-    'min_free': 10,                                 # 最小空闲设备数,低于则补足
-    'build_batch_cap': 5,                          # 单轮补池上限(防一次造太多/触发风控)
+    'min_free': 6,                                 # 最小空闲设备数,低于则补足
+    'build_batch_cap': 2,                          # 单轮补池上限(防一次造太多/触发风控)
     'check_interval': 15 * 60,                      # 巡检补池间隔(秒)
     'build_mode': 'local',                          # 'frida'=真机frida造 / 'local'=本地纯HTTP造(mcd_shumei_d+注册接口,不要真机)
 }

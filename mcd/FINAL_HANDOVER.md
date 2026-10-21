@@ -1591,3 +1591,24 @@ $PY mcd_project/device_pool_redis.py stats
 - `utils.extract_short_proxy_by_city(city)` / `get_short_proxy(city,count,force_new,as_dict)`：神龙短效按城市提取(area=国标6位码/sign不绑area/白名单模式)，Redis 池 RPOPLPUSH 多进程轮巡，不支持城市取最近(haversine)。配置 config.SHENLONG_*/SHORT_PROXY_CONFIG/SHENLONG_SUPPORTED/CITY_GEO。上海短效IP实测存活~3分钟。
 - `login_manager.get_login_proxy(is_send_code)`：USE_PROXY=False直连；已绑定→静态；未登录(sid空)→短效(发码force_new/其余复用轮巡)；登录成功(sid)后才绑静态(无可用代理抛错→dispatch 503)。绑定时机从"构造即绑"改为"登录成功后"。
 - `device_builder.register_one` 加 ensure_frida_server(仿 getd.sh 自启 frida-server 15.1.17，没起则 root 启动)。
+
+### 14.4 云手机 hook 干净 shortbox 模板（2026-10-21，针对根因①）
+
+在**能过数美风控的多多云手机(MOA-AL00/Android10)** 上 hook 出干净 box/shortbox 明文,替换被 frida 污染的 Pixel 模板。**完整用法见 `tools/frida/云手机dumpbox用法.md`**。
+
+- **连接**:云手机只在 Windows 客户端暴露,Mac 借 Windows adb server(见 `docs/Mac连接Windows共享adb手机.md`)。**frida 不认 ADB_SERVER_SOCKET**(写死连本机5037),需跑 `tools/frida/adb_relay.py <win-ip> 5555 5037` 把本机5037中继到 Windows,frida 才能 `-U` 枚举到云手机。云手机 adb shell 已 root,frida-server 直接 setsid 跑、**不用改名**。
+- **两套防护**:数美(云手机过滑块/发码)vs app 原生壳 `libmsaoaidsec`(反frida,检测到 frida-server 进程/27042 或注入就故意崩)。手动开 app 在 frida-server 开着时也会崩。
+- **成功配方**:`spawn + frida_bypass_combined_local.js(绕壳) + hook_dump_box_plain.js(单脚本dump v1入参) + 重试竞速`。bypass 在 linker call_constructors 期 patch 85 个崩溃守卫(`patched=85`);全新注册路径有守卫不在列表→确定性崩,靠重试某轮赢竞速。**只能 2 个脚本**:DexHelper patch 要在 25ms 轮询里赶在陷阱前完成,多一个 hook 脚本抢 JS 线程→每次必崩,所以 dump 全并进一个脚本。
+- **一键**:`FRIDA_DEV=127.0.0.1:63373 PY tools/frida/dumpbox_cloud.py 12 30 <outdir>` → 自动 spawn+bypass+hook+重试,主动调 getVData 逼注册,抓到 v1 入参解析存 `cloud_v1_arg{1,2,3}.json`(arg2=shortbox 注册用)。
+- **crypto 边界实证**:明文JSON→**native(libsmsdk) deflate**(Java层Deflater不触发)→AES/CBC/PKCS5(key=16B字串经RSA-OAEP封)→RSA/ECB/OAEP-SHA256封32B seed。
+- **干净 vs 旧脏模板**:`a18` `{ABSENT,adb}`→`{LOADED,mtp}`;多出 `a2/a97`(同base64签名)、`a103`(uuid);`a167/a168` 0→787552;`a4`/`a85(+apps)`/`a121/a135` 不同。产出 `mcd_project/shumei_shortbox_template_cloud.json`(29字段) / `shumei_fullbox_cloud.json`(82字段)。
+- ⚠️ `a2/a97` 疑似对 box 的签名,换 a24/a46 后可能要重算,勿直接抄——**待 jadx 验证**。
+- 工具:`tools/frida/hook_dump_box_plain.js` / `dumpbox_cloud.py` / `adb_relay.py` / `云手机dumpbox用法.md`。
+
+### 14.5 ★706070 定性 + 本地铸干净 d 跑通(2026-10-21,最终结论)
+
+- **706070 vs 420 的分水岭 = `d`(设备信誉),不是 IP。** mitm 抓到云手机能过的发码(`POST api2.mcd.cn/bff/passport/verifyCode/sms/send`,420→过滑块带 `x-mcd-sec-verify`→200);把云手机干净 d/token/tid 塞进我们的请求 + 神龙代理发真号 → **420**(非706070)。神龙 IP、请求构造都没问题,瓶颈一直是自造 d 被标记。
+- **本地铸干净 d 跑通**:`local_device_gen.TEMPLATE` 换成 `shumei_shortbox_template_cloud.json`(干净云模板)后,本地造的 d 发码也 **420**(旧 Pixel 模板则 706070)。即云手机只需一次性提模板,之后本地批量铸干净 d。a2/a97 静态复制未被拒、tid=00003TuN 通用值、每台刷 a103=uuid4。
+- ⚠️ **签名版本坑**:`v`/`p` 必须保持 `7.0.41.0`/`102`(与密钥 `V4AK=HJ7..` 匹配);对齐成 43.1/105 会被网关 403(无 5DLU 密钥)。`biz_scenario=500/biz_from=1011` 不签名、已对齐。
+- 脚本:`scratchpad` 的 `test_clean_d.py`(注入指定d发码判定)、`test_local_clean_template.py`(本地造d+激活+发码判定);mitm:`tools/mitm/mitm_mcd.py`。
+- 剩下:把干净模板接进 `device_pool_redis` 批量补池 + 配 `captcha_login_worker` 过滑块 → 端到端发码。
