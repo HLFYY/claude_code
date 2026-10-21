@@ -191,56 +191,72 @@ class LoginManager:
             from proxy_failure_handler import ProxyFailureHandler
             self.failure_handler = ProxyFailureHandler()
 
-        # 为当前账号分配代理
-        self._assign_proxy()
-
+        # 注意：不再"构造即绑定"静态代理。绑定时机改为【登录成功后】(见 get_login_proxy)。
         # 自动加载已保存的凭证（如果存在）
         self.load_credentials()
 
-    def _assign_proxy(self) -> None:
-        """为当前账号分配代理"""
-        proxy_info = self.binding_manager.get_or_assign_proxy(self.phone, city=self.city)
-        self.current_proxy_id = proxy_info['id']
-
-    def _get_proxy_dict(self) -> Dict[str, str]:
+    def get_login_proxy(self, is_send_code: bool = False) -> Optional[Dict[str, str]]:
         """
-        获取当前代理的 requests proxies 字典
+        本次请求应使用的代理(requests proxies 字典)，或 None=直连。【统一入口】
 
-        Returns:
-            {'http': 'http://user:pass@host:port', 'https': '...'}
+        规则：
+          - USE_PROXY=False          → None（静态/短效都不用，直连）
+          - 已绑定静态代理           → 静态代理
+          - 未绑定 + 已登录(sid 有)  → 登录成功，绑定静态代理后用静态；
+                                        无可用静态代理则抛异常(暴露问题，提示补充代理资源)
+          - 未绑定 + 未登录(sid 空)  → 短效代理 get_short_proxy(city)；
+                                        is_send_code=True 强制新代理(force_new)，否则复用轮巡
+
+        Args:
+            is_send_code: 是否发码(login_send_code)场景(每次必须新短效代理)。
         """
-        # 全局开关：不使用代理时直连
         if not USE_PROXY:
-            return {}
+            return None
 
-        # 获取当前应该使用的代理（可能是主代理或临时代理）
         binding = self.binding_manager.get_binding(self.phone)
-
         if not binding:
-            return {}
+            # 仅【未绑定】时才判断登录态：self.sid 有值直接认已登录(不查Redis)；
+            # 为空才兜底实时查一次 Redis 凭证的 sid，避免缓存实例 self.sid 陈旧导致误判。
+            logged_in = bool(self.sid)
+            if not logged_in and self.use_redis:
+                try:
+                    raw = self.redis_client.hget(self.redis_key, self.phone)
+                    logged_in = bool(raw and json.loads(raw).get('sid'))
+                except Exception:
+                    pass
+            if logged_in:
+                # 登录成功后才绑定静态代理；无可用代理时 get_or_assign_proxy 抛异常(不兜底，暴露问题)
+                self.binding_manager.get_or_assign_proxy(self.phone, city=self.city)
+                binding = self.binding_manager.get_binding(self.phone)
+            else:
+                # 未登录 → 短效代理(白名单 ip:port)
+                from utils import get_short_proxy
+                return get_short_proxy(self.city, as_dict=True, force_new=is_send_code)
 
-        # 如果在观察期，使用临时代理
+        return self._static_proxy_dict(binding)
+
+    def _static_proxy_dict(self, binding: Dict) -> Dict[str, str]:
+        """由绑定信息构建静态代理 requests 字典；代理不存在返回 {}。"""
+        # 观察期用临时代理，否则主代理
         if binding.get('in_observation') and binding.get('temp_proxy_id'):
             proxy_id = binding['temp_proxy_id']
         else:
             proxy_id = binding['proxy_id']
 
-        # 从代理池获取代理信息
         proxy = self.proxy_pool.get_proxy(proxy_id)
-
         if not proxy:
             return {}
 
-        # 构建代理 URL
         if proxy.get('username') and proxy.get('password'):
             proxy_url = f"{proxy['protocol']}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
         else:
             proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
 
-        return {
-            'http': proxy_url,
-            'https': proxy_url
-        }
+        return {'http': proxy_url, 'https': proxy_url}
+
+    def _get_proxy_dict(self) -> Dict[str, str]:
+        """兼容旧调用：requests proxies 字典({} 表示直连)。内部走 get_login_proxy(非发码场景)。"""
+        return self.get_login_proxy(is_send_code=False) or {}
 
     def _make_request_with_proxy(
         self,
@@ -284,34 +300,32 @@ class LoginManager:
                 else:
                     raise ValueError(f"不支持的 HTTP 方法: {method}")
 
-                # 请求成功，标记代理成功
+                # 请求成功：仅"已绑定静态代理"时走失败处理器统计(短效代理不纳入观察期/换绑)
                 binding = self.binding_manager.get_binding(self.phone)
-                current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
-                self.failure_handler.handle_request_success(self.phone, current_proxy_id)
+                if binding:
+                    current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
+                    self.failure_handler.handle_request_success(self.phone, current_proxy_id)
 
                 return response
 
             except (ConnectionError, Timeout, RequestException) as e:
-                # 请求失败，使用失败处理器
-                binding = self.binding_manager.get_binding(self.phone)
-                current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
-
-                should_retry, new_proxy_id, action, msg = self.failure_handler.handle_request_failure(
-                    self.phone,
-                    current_proxy_id,
-                    str(e)
-                )
-
                 last_error = e
-
-                if not should_retry:
-                    raise NetworkError(f"网络连接失败: {str(e)}")
-
-                retry_count += 1
-
-                # 如果切换了代理，重置重试计数
-                if action in ["temp_switch", "permanent_switch", "permanent_switch_immediate"]:
-                    retry_count = 0
+                binding = self.binding_manager.get_binding(self.phone)
+                if binding:
+                    # 已绑定静态代理：走失败处理器(观察期/换绑)
+                    current_proxy_id = binding['temp_proxy_id'] if binding.get('in_observation') else binding['proxy_id']
+                    should_retry, new_proxy_id, action, msg = self.failure_handler.handle_request_failure(
+                        self.phone, current_proxy_id, str(e)
+                    )
+                    if not should_retry:
+                        raise NetworkError(f"网络连接失败: {str(e)}")
+                    retry_count += 1
+                    # 切换了代理则重置重试计数
+                    if action in ["temp_switch", "permanent_switch", "permanent_switch_immediate"]:
+                        retry_count = 0
+                else:
+                    # 短效代理(未绑定)：简单重试，不走观察期/换绑
+                    retry_count += 1
 
         # 所有重试都失败
         raise NetworkError(f"请求失败（已重试{max_retries}次）: {str(last_error)}")

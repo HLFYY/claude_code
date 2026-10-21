@@ -88,38 +88,55 @@ def release(did):
 
 
 def refill_once():
-    """空闲低于 min_free 则补足差额(单轮不超过 build_batch_cap)。造设备需真机+frida。"""
+    """空闲低于 min_free 则补足差额(单轮不超过 build_batch_cap)。
+    build_mode(config): 'frida'=真机frida造 / 'local'=本地纯HTTP造(mcd_shumei_d,不要真机)。"""
     free = count_free()
     need = C['min_free'] - free
     if need <= 0:
         print("[refill] 空闲 %d ≥ 最小 %d,无需补" % (free, C['min_free']), flush=True)
         return 0
     need = min(need, C['build_batch_cap'])
-    print("[refill] 空闲 %d < 最小 %d,本轮造 %d 个" % (free, C['min_free'], need), flush=True)
+    mode = C.get('build_mode', 'frida')
+    print("[refill] 空闲 %d < 最小 %d,本轮造 %d 个 (mode=%s)" % (free, C['min_free'], need, mode), flush=True)
 
-    # 延迟 import:造设备依赖 frida+真机,仅补池端需要;领用端(claim)不触发,照样无需 frida。
-    # device_builder 就在本目录(mcd_project),直接 import,不用改 sys.path。
-    from device_builder import gen_profile, register_one
+    # 延迟 import:local 走 mcd_shumei_d+注册接口(纯HTTP);frida 走 device_builder(真机)。领用端(claim)都不触发。
+    if mode == 'local':
+        from local_device_gen import register_local
+    else:
+        from device_builder import gen_profile, register_one
 
     made = 0
     for i in range(need):
-        p = gen_profile()
-        print("  [%d/%d] model=%s android_id=%s 注册中…" % (i + 1, need, p['_model'], p['android_id']), flush=True)
-        d = register_one(p)
-        if not d:
-            print("     ✗ 注册超时,跳过", flush=True); continue
-        smid = d[1:]
-        if r().sismember(C['index_key'], smid):
-            print("     ⚠ smid 重复,跳过", flush=True); continue
-        entry = {
-            'id': uuid.uuid4().hex[:12], 'model': p['_model'], 'android_id': p['android_id'],
-            'token': p.get('token'),  # 该设备固定 token(与 d/android_id 同属永久身份)
-            'props': p['props'], 'smid': smid, 'd': d,
-            'created': int(time.time()), 'status': 'free', 'account': '',
-        }
+        if mode == 'local':
+            res = register_local()                     # 本地造:模板换身份字段→make_box→注册(走新短效代理)
+            if not res:
+                print("  [%d/%d] ✗ 本地造设备失败,跳过" % (i + 1, need), flush=True); continue
+            d, smid = res['d'], res['smid']
+            if r().sismember(C['index_key'], smid):
+                print("     ⚠ smid 重复,跳过", flush=True); continue
+            entry = {
+                'id': uuid.uuid4().hex[:12], 'model': res['model'], 'android_id': res['android_id'],
+                'token': res['token'], 'smid': smid, 'd': d, 'shortbox': res['shortbox'],
+                'source': 'local', 'created': int(time.time()), 'status': 'free', 'account': '',
+            }
+        else:
+            p = gen_profile()
+            print("  [%d/%d] model=%s android_id=%s 注册中…" % (i + 1, need, p['_model'], p['android_id']), flush=True)
+            d = register_one(p)
+            if not d:
+                print("     ✗ 注册超时,跳过", flush=True); continue
+            smid = d[1:]
+            if r().sismember(C['index_key'], smid):
+                print("     ⚠ smid 重复,跳过", flush=True); continue
+            entry = {
+                'id': uuid.uuid4().hex[:12], 'model': p['_model'], 'android_id': p['android_id'],
+                'token': p.get('token'), 'props': p['props'], 'smid': smid, 'd': d,
+                'source': 'frida', 'created': int(time.time()), 'status': 'free', 'account': '',
+            }
         store_entry(entry); made += 1
-        print("     ✓ 入库 id=%s d=%s…" % (entry['id'], d[:22]), flush=True)
-        time.sleep(random.randint(60, 90))
+        print("     ✓ 入库 id=%s d=%s… (source=%s)" % (entry['id'], d[:22], entry['source']), flush=True)
+        if mode != 'local':
+            time.sleep(random.randint(60, 90))         # 真机造间隔防风控;本地各走不同代理,无需
     print("[refill] 本轮新增 %d,当前空闲 %d" % (made, count_free()), flush=True)
     return made
 
@@ -141,6 +158,34 @@ def stats():
     print("空闲 %d | 历史总量(smid数) %d | 最小阈值 %d" % (free, total, C['min_free']))
 
 
+def test_sendcode(phone):
+    """本地造一个 B 开头设备 → 发送验证码,验证 d 端到端有效性。
+    注册与发码【共用同一个短效代理IP】(同一台设备同一网络,一致性更强)。"""
+    from local_device_gen import register_local, new_short_proxy
+    import mcd_api
+    print("[test] 本地造 B 设备 + 发码验证 phone=%s" % phone, flush=True)
+
+    proxies, pinfo = new_short_proxy()                  # 注册+发码共用这一个出口IP
+    if not proxies:
+        print("[test] ✗ 短效代理提取失败,重跑 test"); return
+    print("[test] 本次代理(注册+发码共用): %s" % pinfo, flush=True)
+
+    res = register_local(proxies=proxies, pinfo=pinfo)  # 注册用该代理
+    print(res)
+    if not res:
+        print("[test] ✗ 造设备失败(该代理可能不可用,重跑 test)"); return
+    print("[test] ✓ 造出设备 model=%s\n       d=%s" % (res['model'], res['d']), flush=True)
+
+    mcd_api.set_active_d(res['d'])                       # 注入本地造的 d,build_headers 自动带 d 头
+    ok, tid, amsg = mcd_api.activate_token(res['token'], proxies=proxies)      # 同代理
+    print("[test] activate_token: ok=%s tid=%s %s" % (ok, tid, amsg), flush=True)
+    if ok:
+        mcd_api.set_active_tid(tid)
+    ok2, msg2 = mcd_api.send_verification_code(phone, res['token'], proxies=proxies)  # 同代理
+    print("[test] send_verification_code: ok=%s | %s" % (ok2, msg2), flush=True)
+    print("[test] 判据: 已发送/420(滑块)/707053(IP) = d有效; 706070/账号安全问题 = d无效", flush=True)
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__); return 2
@@ -160,6 +205,8 @@ def main():
         release(sys.argv[2])
     elif c == 'stats':
         stats()
+    elif c == 'test':
+        test_sendcode(sys.argv[2] if len(sys.argv) > 2 else '13800138000')
     else:
         print("未知命令:", c); print(__doc__); return 2
     return 0

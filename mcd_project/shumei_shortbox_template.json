@@ -1,0 +1,45 @@
+{
+  "a1": "all",
+  "a4": "1",
+  "a6": "android",
+  "a9": 1792486185524,
+  "a10": "10",
+  "a7": "3.17.0",
+  "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+  "a18": {
+    "gsm.sim.state": "ABSENT",
+    "sys.usb.state": "adb"
+  },
+  "a24": "0cd11b6e342750c2",
+  "a60": "u0_a194",
+  "a46": {
+    "model": "KB2000",
+    "serial": "",
+    "brand": "OnePlus",
+    "manufacturer": "OnePlus",
+    "fingerprint": "OnePlus/kebab/OnePlus8T:11/RKQ1.201105.002/2109091800:user/release-keys"
+  },
+  "a38": "7.0.41.0",
+  "a44": "WIFI",
+  "a39": "com.mcdonalds.gma.cn",
+  "a40": 1792469376894,
+  "a135": 1,
+  "a136": "build1",
+  "a133": 2816,
+  "a85": [
+    "bootId",
+    "tel",
+    "sensor",
+    "gps"
+  ],
+  "a167": 0,
+  "a168": 0,
+  "a121": 1,
+  "a125": {
+    "fit": 1580267826000,
+    "lut": 1580527708000
+  },
+  "a127": 122,
+  "a96": "qvdTr7A9k1DIU04ha4eP",
+  "a155": 1
+}

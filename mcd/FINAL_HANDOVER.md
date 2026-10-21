@@ -1526,6 +1526,16 @@ adb shell "su -c 'setsid /data/local/tmp/frida-server-15.1.17-android-arm64 >/de
 
 **核心结论**：设备池 / token / tid / ensure_device / 直连开关 等本次工程全部验证正确（假号端到端 code_sent 为证）；真正的卡点是 **① 数美账号↔设备绑定历史风控（707053，换 IP/设备都绕不过）② 滑块行为检测拒绝自动轨迹（REJECT）**——都属风控策略/滑块逆向范畴，非本套代码问题。
 
+### 13.6.1 706070「设备环境异常」与 pm clear(关键,2026-10-17 补)
+
+造设备若复用 app 旧存储,数美会读到本地残留的**被标记设备状态** → 发码返回 `706070`(真机手动登录也一样)。**造一台真正的全新设备必须两步**:
+1. spawn 前 `adb -s <序列号> shell pm clear com.mcdonalds.gma.cn` —— 清空 app 全部存储(SharedPreferences/数据库/数美私有目录缓存),回到全新设备状态;
+2. resume 后点隐私协议"同意"弹窗 —— 否则数美不 `initShumei`、不注册 smid(会卡在 `D`+vdata 拿不到 `B`)。
+
+实测对比:**不 pm clear → 706070;pm clear + 点同意 + 伪造设备 → 拿到干净 smid、发码 code_sent 正常**。已固化进 `device_builder.register_one`(默认 `pm_clear=True` + `_agree_popup` 自动点同意:uiautomator 动态找"同意"bounds,回退固定坐标 540,1340;换机型需调坐标)。
+
+> 所以之前把 707053/706070 都归因"账号/真机被拉黑"不全对:706070 这条其实是**本地存储残留**,pm clear 后即清白——真正造全新设备是可行的。
+
 ### 13.7 工具与文件清单
 
 - `mcd/tools/frida/`：`hook_fake_device.js`（伪造设备注入+token注入+请求头dump）、`hook_d_active.js`（RPC 取 d）、`hook_collect_probe.js`（采集维度探针）、`hook_crypto_probe.js`（加密边界探针）、`hook_token.js`（token 来源）、`fdrv.py`（注入驱动，本次补写，多设备须按序列号 `FRIDA_DEV` 选 Android）、`getd.sh`
@@ -1554,3 +1564,30 @@ $PY mcd_project/device_pool_redis.py stats
 **v2.0 更新时间**: 2026-10-10  
 **核心贡献者**: 侯杰 + Claude Code
 
+
+---
+
+## 十四、本地造设备 + 706070 终极认知（2026-10-20/21，v7.0）
+
+### 14.1 本地纯 HTTP 造数美设备（不用真机/frida）
+
+- `mcd_project/mcd_shumei_d.py` 复刻数美 vdata 加密打包(deflate wbits=-15 + AES-256-CBC + RSA-OAEP，逆自 libsmsdk short-box compress3/encode2；publickey() 已适配 pycryptodome 3.9.8，RSA.import_key 直接吃数美 X.509 证书)。
+- 注册接口(抓包 mitmproxy_flows/flows_20260914 得)：`POST https://fp-it.fengkongcloud.com/deviceprofile/v4`，body=box{organization/os/appId/encode:2/compress:3/data/tn/ep}，Content-Type: application/octet-stream，**无签名头**；响应 `{"code":1100,"detail":{"deviceId":"..."}}`，**d = "B"+deviceId**(code 1902=字段不全被拒)。
+- 明文设备 JSON(a1~a175) 在 Java 层 `com.ishumei.smantifraud.dfp.SMSDK.v1` 入参(hook_fake_device_v2.js 的 DUMP_V1 开关 dump [v1-IN-BOX]完整 / [v1-IN-SHORTBOX]短版)；注册用 shortbox(26字段，usingShortBoxData)。a136=build1 与脚本匹配。
+- 流程：hook 一次拿 shortbox 模板(shumei_shortbox_template.json) → 替换身份字段(a24 android_id/a46 机型/a9/a40/a125 时间) → make_box → POST → B。生成器 local_device_gen.py(替换字段 + 新短效代理注册 + 失败换代理重试)。
+- 集成 device_pool_redis：config.DEVICE_POOL_CONFIG['build_mode']='local'(默认)/'frida'，refill/claim/serve 用法不变；`python device_pool_redis.py test <真号>` = 本地造B+发码验证。
+- shortbox 不含 a84(Widevine) 等硬件根字段 → 可批量造独立设备、绕开真机**注册环节**的 706070。
+
+### 14.2 706070 终极认知（更正 v4.0「pm clear 规避」旧结论）
+
+- v4.0 曾写"pm clear 规避 706070"——**只对注册环节成立**。实测注册 code 1100 成功、d 有效，但**发码仍 706070**。
+- 排查全清单都排除：a18(adb/无SIM，A/B实测改了没用)、移动流量、号历史(新旧真号全706070)、发码请求头(qf.a BFFHeaderInterceptor 加 d/token/tid/... + qf.b MCDBasicHeaderInterceptor 只加 UA/v)、本地 vs 真机(都706070)、tid(00003TuN 正常值)。
+- 真机(Pixel/Mi6/华为非root/全新Google)、本地造的、所有真号 → **全706070**；唯一能过的是白名单测试号 13800138000；天津朋友正常真机(没碰过测试环境)能过。
+- **结论：706070 是数美发码时的服务端「设备指纹组合 / IP / 行为环境」风控，不是单个客户端字段能解决。** 本地造 d(注册)技术成功，但 706070 卡在发码风控层，真机也绕不过，超出"造 d"范围。
+- 两个待验证根因(需干净 root 真机 + 干净住宅 IP)：① shortbox 模板来自被 frida 反复注册的 Pixel，不变字段组合被数美关联到已标记设备 → 需干净真机重新 hook 一份模板；② 神龙代理 IP 被识别为代理 + 刚注册秒发码无正常使用行为。
+
+### 14.3 短效代理 + 登录代理接入（utils / login_manager 新增）
+
+- `utils.extract_short_proxy_by_city(city)` / `get_short_proxy(city,count,force_new,as_dict)`：神龙短效按城市提取(area=国标6位码/sign不绑area/白名单模式)，Redis 池 RPOPLPUSH 多进程轮巡，不支持城市取最近(haversine)。配置 config.SHENLONG_*/SHORT_PROXY_CONFIG/SHENLONG_SUPPORTED/CITY_GEO。上海短效IP实测存活~3分钟。
+- `login_manager.get_login_proxy(is_send_code)`：USE_PROXY=False直连；已绑定→静态；未登录(sid空)→短效(发码force_new/其余复用轮巡)；登录成功(sid)后才绑静态(无可用代理抛错→dispatch 503)。绑定时机从"构造即绑"改为"登录成功后"。
+- `device_builder.register_one` 加 ensure_frida_server(仿 getd.sh 自启 frida-server 15.1.17，没起则 root 启动)。

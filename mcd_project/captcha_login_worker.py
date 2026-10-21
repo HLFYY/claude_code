@@ -333,7 +333,9 @@ def handle_login(phone, city=None, force_new_device=False, headless=True):
     try:
         set_status(phone, 'sending', '开始发码')
         manager = LoginManager(phone, use_redis=True, city=city)
-        proxies = manager._get_proxy_dict() or None  # None=直连；USE_PROXY 关时为 None
+        # 发码场景：未绑定→每次新短效代理(force_new)；已绑定→静态；USE_PROXY 关=None 直连。
+        # 整个发码流程(activate/发码/滑块/重发)全程复用这同一个 proxies，保证 IP 一致性。
+        proxies = manager.get_login_proxy(is_send_code=True)
         newly = force_new_device or not manager.token
         if newly:
             manager.token = generate_token()

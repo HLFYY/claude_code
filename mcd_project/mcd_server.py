@@ -384,30 +384,17 @@ def universal_mcd_api(function_name):
         params['mcd_id'] = meddy_id_from_redis
     # 5. 自动获取代理（如果有 phone 参数且函数支持 proxies）
     proxy_used = None
-    if USE_PROXY and phone and 'proxies' not in params:
+    if USE_PROXY and phone and 'proxies' not in params and 'proxies' in sig.parameters:
+        # 统一入口：已绑定→静态；未绑定+已登录→绑定静态(无可用代理会抛错)；未绑定+未登录→短效复用
         try:
-            if 'proxies' in sig.parameters:
-                # 使用全局单例获取账号绑定的代理
-                binding_mgr = get_binding_manager()
-                pool = get_proxy_pool()
-
-                # 获取账号的代理绑定
-                binding = binding_mgr.get_binding(phone)
-                if binding:
-                    proxy_id = binding.get('proxy_id') or binding.get('temp_proxy_id')
-                    if proxy_id:
-                        proxy_url = pool.get_proxy_url(proxy_id)
-                        if proxy_url:
-                            # 构造 requests 库需要的代理字典格式
-                            proxy_dict = {
-                                'http': proxy_url,
-                                'https': proxy_url
-                            }
-                            params['proxies'] = proxy_dict
-                            proxy_used = proxy_dict
+            proxy_dict = login_manager.get_login_proxy(is_send_code=False)
         except Exception as e:
-            # 代理获取失败不影响主流程，记录日志即可
-            app.logger.warning(f"获取代理失败: {str(e)}")
+            # 登录成功后无可用静态代理 → 报错暴露，提示补充代理资源(不降级直连)
+            app.logger.error(f"[{function_name}] {phone} 代理分配失败: {str(e)}")
+            return jsonify({'success': False, 'message': f'代理分配失败(请补充代理资源): {str(e)}'}), 503
+        if proxy_dict:
+            params['proxies'] = proxy_dict
+            proxy_used = proxy_dict
 
     # 打印请求参数（包括自动获得的代理）
     log_params = params.copy()

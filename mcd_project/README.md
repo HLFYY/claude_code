@@ -430,6 +430,53 @@ $PY device_pool_redis.py stats
 - `17717295039` → **707053**：换代理 / 直连住宅 IP / 全新设备 / token-d 成套 **都不变** → 老账号 + 陌生设备的**数美关联风控**（手机能登是因手机是信任设备），非代码问题。
 - `18356966159` → **420 出滑块** → worker 滑动 #1~#4 全 `REJECT`：滑块**行为检测**拒绝自动轨迹（滑块逆向难点，独立问题）。
 - 结论：设备池 / token / tid 工程全部正确；卡点是数美账号↔设备关联风控 + 滑块轨迹，属风控策略 / 滑块逆向范畴。
+- `706070`「设备环境异常」：⚠️ **旧结论"pm clear 规避"已更正**——pm clear 只规避**注册**环节，**发码仍 706070**，详见下方 v5.0 章节。
+
+---
+
+## 本地造设备 🎉 v5.0（2026-10-21）
+
+> 不用真机/frida，纯 Python + HTTP 本地批量造数美设备 d。核心文件 `mcd_shumei_d.py` / `shumei_shortbox_template.json` / `local_device_gen.py`。
+
+### 原理（已跑通，不用真机）
+
+```
+真机 hook 一次拿 shortbox 模板(shumei_shortbox_template.json, 26字段)
+  → 替换身份字段(a24 android_id / a46 机型 / a9/a40/a125 时间)
+  → mcd_shumei_d.make_box 打包(deflate + AES-256-CBC + RSA-OAEP)
+  → POST https://fp-it.fengkongcloud.com/deviceprofile/v4 (走新短效代理,无签名头)
+  → 响应 {"code":1100,"detail":{"deviceId":"..."}} → d = "B"+deviceId
+```
+明文设备 JSON(a1~a175) = Java 层 `com.ishumei.smantifraud.dfp.SMSDK.v1` 入参（`hook_fake_device_v2.js` 的 `DUMP_V1` 开关 dump `[v1-IN-BOX]`/`[v1-IN-SHORTBOX]`，注册实际用 shortbox）。shortbox **不含 a84(Widevine) 等硬件根字段**，故可批量造独立设备、绕开真机**注册环节**的 706070。
+
+### device_pool_redis 集成（调用方式不变）
+
+- `config.DEVICE_POOL_CONFIG['build_mode']` = `'local'`(默认,本地造) / `'frida'`(真机造)；`refill`/`claim`/`serve` 用法不变。
+- 新增 `python device_pool_redis.py test <真实手机号>` = 本地造 B 设备 + 走发码验证。
+
+### 短效代理（utils / config 新增）
+
+- `utils.get_short_proxy(city=None, count=1, force_new=False, as_dict=False)` / `extract_short_proxy_by_city(city)`：神龙短效按城市提取(area=国标6位码/sign不绑area/白名单)，Redis 池 `RPOPLPUSH` 多进程轮巡，不支持城市自动取最近(haversine)。
+- 配置：`config.SHENLONG_*`、`SHORT_PROXY_CONFIG`、`SHENLONG_SUPPORTED`(城市→国标码)、`CITY_GEO`(经纬度)。
+- 登录代理接入：`login_manager.get_login_proxy` —— 登录成功(sid)后才绑静态代理；未登录用短效(发码 force_new、其余复用)。
+- `device_builder.register_one` 新增 `ensure_frida_server`(仿 getd.sh 自启 frida-server 15.1.17)。
+
+### ⚠️ 706070 认知更正（重要，推翻 v4.0 旧结论）
+
+实测：本地造 d **注册 code 1100 成功、d 格式有效**，但**发码仍 706070**。排查全清单都不是主因：
+
+| 排查项 | 结论 |
+|---|---|
+| a18(adb / 无 SIM) | A/B 实测改了没用 ❌ |
+| 移动流量开关 | shortbox 注册不含网络字段 ❌ |
+| 号历史(新旧真号) | 全 706070 ❌ |
+| 发码请求头(qf.a + qf.b) | 只差无关的 UA/v ❌ |
+| 本地 vs 真机 | 都 706070 ❌ |
+| tid | 00003TuN 正常值 ❌ |
+
+真机(Pixel/Mi6/华为非root/全新 Google)、本地造的、所有真号**全 706070**，唯一能过的是**白名单测试号 13800138000**；天津朋友正常真机(没碰过测试环境)能过。
+
+**结论：706070 是数美发码时的服务端「设备指纹组合 / IP / 行为环境」风控，不是单个客户端字段能解决；真机也绕不过，超出"造 d"范围。** 两个待验证根因(需干净 root 真机 + 干净住宅 IP)：① shortbox 模板来自被 frida 反复注册的 Pixel，不变字段组合被关联到已标记设备 → 需干净真机重新 hook 模板；② 神龙代理 IP 被识别 + 刚注册秒发码无正常行为。
 
 ---
 
