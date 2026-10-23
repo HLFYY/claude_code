@@ -286,6 +286,7 @@ def login_verify():
             'message': message
         })
     else:
+        login_manager.record_check('invalid')  # 登录失败也记一次检测时间+状态(invalid)
         app.logger.error(f"[login_verify] ❌ 登录失败: phone={phone}, 原因: {message}")
         return jsonify({'success': False, 'message': message}), 400
 

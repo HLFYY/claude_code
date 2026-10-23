@@ -22,7 +22,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # API_BASE = 'http://127.0.0.1:5001'
 API_BASE = 'http://dns.xme.fan:5001'
 # 默认配置
-DEFAULT_PHONE = '17717295039'
+DEFAULT_PHONE = '18356966159'
 DEFAULT_PROVINCE = '江苏'
 DEFAULT_CITY = '南京'
 DEFAULT_LATITUDE = 31.026543
@@ -35,7 +35,7 @@ PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 # True = 登录/下单请求都带上省份+城市; False = 都不带(由服务端取凭证里已绑定的省市)
 SEND_LOCATION = False
 # 代理源:用来测不同代理。'zdtps'=站大爷 / 'shenlong'=神龙 / ''=不传(用服务端默认 zdtps)
-PROXY_SOURCE = 'shenlong'
+PROXY_SOURCE = 'zdtps'
 
 
 _CURRENT_CITY = None      # 登录时设为代理城市；always_short 下 /api/mcd/ 业务接口自动带上
