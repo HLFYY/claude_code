@@ -26,6 +26,17 @@ __pycache__/
 *.mitm
 *.pkl
 
-# 忽略带版本号后缀的 .so 文件，保留纯 .so
+# 二进制产物：体积大，且都能从本地 APK 重新提取/脱壳，不入库
 **/*.so.*
-!**/*.so
+*.so
+*.dex
+
+# ---- 逆向产物（本地保留，不提交）----
+# 由 APK 脱壳/DEX 导出得到，可重跑工具链再生
+mcd/resources/decorticate/
+# 从 APK 提取的 .so 库集合
+mcd/resources/so/
+# APK 附带的 frida-gadget 等二进制
+mcd/resources/apk/
+# 大体积抓包/二进制落盘目录（保留 logs 里的文本证据）
+mcd/resources/*.bin
