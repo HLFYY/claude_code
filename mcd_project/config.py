@@ -199,8 +199,8 @@ SHENLONG_EXTRACT_PARAMS = {
 
 # 短效代理池(Redis)配置
 SHORT_PROXY_CONFIG = {
-    'pool_key': 'mcd:proxy:short:{city}',  # List: 该城市未过期代理池; RPOPLPUSH 原子轮巡(多进程安全), 整池 TTL 到期自动清->重提
-    'ttl': 150,                            # 秒, 实测存活~3min 留余量
+    'pool_key': 'mcd:proxy:short:{city}',  # (旧,现 get_short_proxy 自行拼 mkt:prod:<商户>:proxy:pool:<源>:<地域>)
+    'expire': 180,                         # 代理过期时间(秒);实际池 TTL = expire-20 = 160,与神龙短效(~3min)一致
     # 提取数量由 get_short_proxy(count=) 传参(默认1),不放配置
 }
 
@@ -249,4 +249,72 @@ CITY_GEO = {
     '昆明': (102.83, 24.88), '南宁': (108.37, 22.82), '合肥': (117.23, 31.82),
     '南昌': (115.86, 28.68), '太原': (112.55, 37.87), '贵阳': (106.63, 26.65),
     '兰州': (103.84, 36.06), '海口': (110.33, 20.03),
+}
+
+# 城市 -> 省份(用于凭证迁移时按 city 补全 province;覆盖神龙支持城市 + 常见大城市)。
+# 省份用简称(与下单/发码传参习惯一致);未命中返回 ''(由调用方处理)。
+CITY_PROVINCE = {
+    # 直辖市
+    '上海': '上海', '北京': '北京', '天津': '天津', '重庆': '重庆',
+    # 江苏
+    '南京': '江苏', '苏州': '江苏', '无锡': '江苏', '南通': '江苏',
+    # 浙江
+    '宁波': '浙江', '嘉兴': '浙江', '绍兴': '浙江', '杭州': '浙江',
+    # 山东
+    '济南': '山东', '烟台': '山东', '青岛': '山东',
+    # 广东
+    '广州': '广东', '珠海': '广东', '深圳': '广东',
+    # 广西
+    '桂林': '广西', '南宁': '广西',
+    # 福建
+    '厦门': '福建', '福州': '福建', '泉州': '福建',
+    # 河北
+    '石家庄': '河北', '唐山': '河北', '廊坊': '河北', '秦皇岛': '河北',
+    # 辽宁
+    '大连': '辽宁', '鞍山': '辽宁', '锦州': '辽宁', '沈阳': '辽宁',
+    # 湖北
+    '襄阳': '湖北', '咸宁': '湖北', '武汉': '湖北',
+    # 湖南
+    '益阳': '湖南', '郴州': '湖南', '长沙': '湖南',
+    # 四川
+    '成都': '四川', '绵阳': '四川',
+    # 海南
+    '三亚': '海南', '海口': '海南',
+    # 其它常见
+    '西安': '陕西', '郑州': '河南', '哈尔滨': '黑龙江', '长春': '吉林',
+    '昆明': '云南', '合肥': '安徽', '南昌': '江西', '太原': '山西',
+    '贵阳': '贵州', '兰州': '甘肃',
+}
+
+# ========== 商户 / 代理源 ==========
+# mcd_server 新增 3 个参数的默认值：merchant_id(商户ID)、proxy_source(代理源)、province(省份,无默认,按需传)。
+MERCHANT_ID_DEFAULT = '100001'       # 商户ID默认值(mcd_server 不传 merchant_id 时用它)
+PROXY_SOURCE_DEFAULT = 'zdtps'       # 默认代理源(站大爷); 可传 proxy_source 覆盖(如 'shenlong')
+
+# 业务 Redis key 模板(按商户隔离)。{merchant_id} 由调用方 format。
+CREDENTIALS_KEY_TMPL = 'mkt:prod:{merchant_id}:credentials'  # 登录凭证 Hash(field=手机号)
+PROXY_CONFIG_KEY_TMPL = 'mkt:prod:{merchant_id}:proxy'       # 代理源配置 Hash(field=源名, value=该源配置JSON)
+
+# 代理源默认配置：value 形式统一为 {type, ...该源提取/鉴权字段}。
+#   首次由 utils.seed_proxy_sources() 写入 Redis(PROXY_CONFIG_KEY_TMPL)；Redis 缺字段时也用作兜底。
+#   新增代理源 = 这里加一项 + 在 utils 实现对应 _<type>_extract()。
+PROXY_SOURCES_DEFAULT = {
+    # 站大爷短效(纯生版): GetIP 提取 + www.zdopen.com 白名单。adr 传 "省,市"(逗号分隔关键词,代码按省+市→仅省回退)。
+    # 此 schema 与线上 Redis(mkt:prod:100001:proxy / zdtps)一致,仅作 Redis 不可用时的兜底;utils._zdtps_conn 负责规整。
+    'zdtps': {
+        'v': 1, 'type': 'zdtps', 'name': '站大爷',
+        'url': ('http://s205.zdtps.com:8080/GetIP/?inst_id=202610200944475892&akey=5996ef446b274762'
+                '&count=1&adr=%E4%B8%8A%E6%B5%B7&dedup=0&timespan=3&type=1'),  # timespan=3 存活等级(1-5),与神龙~3min一致
+        'whitelist': 'http://www.zdopen.com/ShortEdgeProxy/SetIpWhiteList/',
+        'need_whitelist': True, 'format': 'txt',
+        'params': {'akey': '5996ef446b274762', 'host': 's205.zdtps.com:8080',
+                   'inst_id': '202610200944475892', 'path': '/GetIP/'},
+    },
+    # 神龙短效: 原逻辑(city->国标area码, sign 通用)。沿用上面 SHENLONG_* 常量。
+    'shenlong': {
+        'type': 'shenlong',
+        'extract_url': SHENLONG_EXTRACT_URL,
+        'keys': SHENLONG_KEYS,
+        'params': dict(SHENLONG_EXTRACT_PARAMS),
+    },
 }

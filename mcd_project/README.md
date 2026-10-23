@@ -32,6 +32,18 @@
 - AES-128-ECB 加密
 - 所有核心业务接口（支持代理）
 
+✅ **商户隔离 / 多代理源 / 省市绑定 / 用量统计** 🎉 v2.1 新增
+- **凭证按商户隔离**：`mkt:prod:<商户>:credentials`（`merchant_id` 默认 100001，可传入）
+- **短效代理源可选**：`zdtps`（站大爷，默认）/ `shenlong`（神龙），配置存 Redis Hash `mkt:prod:<商户>:proxy`，启动自动 seed；zdtps `timespan=3`，池 TTL = `expire`(180) − 20 = 160s，与神龙 ~3min 一致
+- **账号省/市绑定**：登录/下单按"没传取凭证、传了用传入"定生效省市，首次自动绑定；换城市调 `POST /api/login/bind_city`
+- **cookie 检测时间+状态**：凭证记 `checked_at`（区别于 cookie 保存时间 `saved_at`）/ `check_status`(valid/invalid/error)，有 sid 也能识别掉线
+- **短效代理白名单管理**（站大爷 Get/Add/Del）+ 本机出口 IP 探测（`/api/proxy/egress_ip`）
+- **短效代理用量统计**：取代理时按 源+省+市+日期 累计 请求数(req)/消耗代理数(proxy)，`GET /api/proxy/stats`（默认近7天，可 days/date/源省市过滤）
+- **查询账号数据**：`GET /api/accounts`（传 phone 查单个、不传查全部）
+- 客户端 `run_api_client.py`：`SEND_LOCATION` 开关控制是否带省市（省份默认江苏、城市默认南京），`PROXY_SOURCE` 常量选代理源（zdtps/shenlong）方便测不同代理
+
+> 详细接口见 `麦当劳API接口文档.md`。迁移旧凭证：`python -c "import utils; utils.migrate_credentials('100001')"`（只同步有 sid 的，按 city 补 province）。
+
 ## 项目结构
 
 ```

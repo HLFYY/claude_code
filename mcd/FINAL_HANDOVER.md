@@ -5,8 +5,8 @@
 **项目名称**: 麦当劳中国 App API 加密与签名逆向
 **项目周期**: 2026-09-14 至 2026-09-24
 **完成度**: 100% (所有功能已实现并验证)
-**最后更新**: 2026-10-10
-**文档版本**: v6.0 (代理池管理系统)
+**最后更新**: 2026-10-23
+**文档版本**: v7.0 (商户隔离 / 多代理源 / 省市绑定 / 用量统计)
 
 ---
 
@@ -55,6 +55,18 @@ cat mcd_project/login_manager.py
 - ✅ **四级智能容错** - 自动重试、临时切换、观察期、永久切换
 - ✅ **定时任务调度** - 全量检查、观察期检查、失败清理
 - ✅ **HTTP API 接口** - 8个代理管理接口（详见 `CHANGELOG.md`）
+
+**🎉 v2.1 新增：商户隔离 / 多代理源 / 省市绑定 / 用量统计** (2026-10-23)
+- ✅ **凭证按商户隔离** - key 改为 `mkt:prod:<商户>:credentials`（`merchant_id` 默认 100001，mcd_server 可传入）。迁移：`utils.migrate_credentials('100001')`（只同步有 sid 的，按 city 补 province，旧 key 保留）
+- ✅ **短效代理源可选（统一取代理逻辑）** - `zdtps`(站大爷,默认)/`shenlong`(神龙)，配置存 Redis Hash `mkt:prod:<商户>:proxy`（启动自动 seed，只补缺失）。zdtps 按 `adr="省,市"` 提取，取不到退仅省；`timespan=3`；池 TTL = `expire`(config 默认180) − 20 = 160s，与神龙 ~3min 一致
+- ✅ **账号省/市绑定** - 登录/下单按"没传取凭证已绑定、传了用传入"定生效省市；首次(未绑定)自动写入绑定；已绑定换城市须调 `POST /api/login/bind_city`
+- ✅ **cookie 检测时间+状态** - 凭证新增 `checked_at`（区别于 cookie 保存时间 `saved_at`）/ `check_status`(valid/invalid/error)；登录成功、查状态时写入，有 sid 也能识别掉线
+- ✅ **站大爷白名单管理** - `GET/POST /api/proxy/whitelist[/add|/del]`（AddWhiteIp 不带 IP=加本机当前出口 IP；Del 用 `ipList`）+ `GET /api/proxy/egress_ip` 探测本机出口 IP
+- ✅ **短效代理用量统计** - 取代理时按 `源+省+市+日期` 累计 `req`(请求数,含复用)/`proxy`(消耗/新提取数)，存 Hash `mkt:prod:<商户>:proxy:stat:<源>:<省>:<市>`；`GET /api/proxy/stats`（默认近7天，`days`/`date`/源省市 过滤）
+- ✅ **查询账号数据** - `GET /api/accounts`（传 phone 查单个、不传查全部，返回凭证 value 列表）
+- ✅ **客户端** - `run_api_client.py` 加 `SEND_LOCATION` 开关（True 带省市/False 不带）+ `PROXY_SOURCE` 常量选代理源（zdtps/shenlong，测不同代理）+ 省份默认江苏、城市默认南京
+- ✅ **Redis 同步脚本** - `mcd/tools/sync_redis_online_to_local.py`：线上 mcd*/mkt* 单向同步到本地（只读线上，写死方向，禁止反向）
+- 📄 接口详情见 `mcd_project/麦当劳API接口文档.md`（v2.1 已更新）
 
 **完整三步流程**：
 - ✅ **店铺选择流程** (`python run.py store`)

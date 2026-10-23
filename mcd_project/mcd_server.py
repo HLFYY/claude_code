@@ -19,8 +19,10 @@ import redis
 from datetime import datetime
 import inspect
 import time
-from config import CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis
+from config import (CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis,
+                    MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, CREDENTIALS_KEY_TMPL)
 from login_manager import LoginManager
+import utils
 
 app = Flask(__name__)
 
@@ -96,10 +98,12 @@ werkzeug_logger.setLevel(logging.INFO)
 # 使用 Redis 存储的 LoginManager
 login_manager_cache = {}
 
-def get_login_manager(phone, city=None):
+def get_login_manager(phone, city=None, province=None, merchant_id=None, proxy_source=None):
     """获取或创建指定手机号的 LoginManager 实例（使用 Redis）"""
-    # 缓存 key 包含 city 信息，避免同一手机号不同城市共享实例
-    cache_key = f"{phone}:{city}" if city else phone
+    merchant_id = merchant_id or MERCHANT_ID_DEFAULT
+    proxy_source = proxy_source or PROXY_SOURCE_DEFAULT
+    # 缓存 key 含 商户/城市/省份/代理源，避免不同参数共享实例(凭证 key 随商户不同)
+    cache_key = f"{phone}:{merchant_id}:{city}:{province}:{proxy_source}"
 
     if cache_key not in login_manager_cache:
         # 传入全局单例，避免重复初始化
@@ -107,6 +111,7 @@ def get_login_manager(phone, city=None):
             phone,
             use_redis=True,
             city=city,  # 传递城市参数
+            merchant_id=merchant_id, province=province, proxy_source=proxy_source,
             proxy_pool=get_proxy_pool(),
             binding_manager=get_binding_manager(),
             failure_handler=get_failure_handler()
@@ -114,11 +119,25 @@ def get_login_manager(phone, city=None):
         login_manager_cache[cache_key] = manager
     return login_manager_cache[cache_key]
 
+
+def _biz_params(src):
+    """从请求参数(dict/args)取 商户/省份/代理源 3 个新参数(缺省走 config 默认)。返回 (province, merchant_id, proxy_source)。"""
+    get = src.get
+    return (get('province'),
+            get('merchant_id') or MERCHANT_ID_DEFAULT,
+            get('proxy_source') or PROXY_SOURCE_DEFAULT)
+
 # 配置
 CREDENTIALS_FILE = 'data/credentials.json'
 
 # ========== 验证码(滑块)登录队列/冻结 ==========
 _cap_redis = make_redis()  # 带超时/重试/keepalive
+
+# 启动时把代理源默认配置补进 Redis(mkt:prod:<默认商户>:proxy),只补缺失不覆盖已改的。
+try:
+    utils.seed_proxy_sources(MERCHANT_ID_DEFAULT)
+except Exception as _e:
+    print(f'⚠️  seed 代理源跳过: {_e}', flush=True)
 
 
 def _freeze_key(phone):
@@ -134,15 +153,18 @@ def is_frozen(phone):
     return _cap_redis.exists(_freeze_key(phone)) == 1
 
 
-def enqueue_login(phone, city=None, force_new_device=False):
-    """冻结账号(兜底TTL) + 入队交给 captcha_login_worker + 置 queued 状态"""
+def enqueue_login(phone, city=None, force_new_device=False, province=None, merchant_id=None, proxy_source=None):
+    """冻结账号(兜底TTL) + 入队交给 captcha_login_worker + 置 queued 状态。
+    province/merchant_id/proxy_source 一并入队,worker 发码时用同一商户(凭证 key 一致)、同一代理源/地域。"""
     _cap_redis.setex(_freeze_key(phone), CAPTCHA_LOGIN_CONFIG['freeze_ttl'], '1')
     # 入队即置处理心跳：防"刚入队还没被 worker 取走"时被业务接口误判僵尸解冻；worker 取到后会持续刷新
     _cap_redis.setex(_processing_key(phone), CAPTCHA_LOGIN_CONFIG['processing_ttl'], str(int(time.time())))
     _cap_redis.setex(_status_key(phone), CAPTCHA_LOGIN_CONFIG['status_ttl'],
                      json.dumps({'status': 'queued', 'msg': '已入队', 'ts': int(time.time())}, ensure_ascii=False))
     _cap_redis.rpush(CAPTCHA_LOGIN_CONFIG['queue_key'],
-                     json.dumps({'phone': phone, 'city': city, 'force_new_device': force_new_device}, ensure_ascii=False))
+                     json.dumps({'phone': phone, 'city': city, 'force_new_device': force_new_device,
+                                 'province': province, 'merchant_id': merchant_id or MERCHANT_ID_DEFAULT,
+                                 'proxy_source': proxy_source or PROXY_SOURCE_DEFAULT}, ensure_ascii=False))
 
 
 def unfreeze_login(phone):
@@ -182,8 +204,10 @@ def login_send_code():
     phone = data.get('phone')
     use_new_device = data.get('use_new_device', False)
     city = data.get('city')  # 新增：获取城市参数
+    province, merchant_id, proxy_source = _biz_params(data)  # 省份/商户ID/代理源
 
-    app.logger.info(f"[send_code] 请求参数: phone={phone}, use_new_device={use_new_device}, city={city}")
+    app.logger.info(f"[send_code] 请求参数: phone={phone}, use_new_device={use_new_device}, "
+                    f"city={city}, province={province}, merchant_id={merchant_id}, proxy_source={proxy_source}")
 
     if not phone:
         error_msg = '缺少 phone 参数'
@@ -204,15 +228,21 @@ def login_send_code():
 
     # 确保账号已绑定数美设备指纹 d：新账号自动从设备池领一个;已有但无 d 的也自动补领并写入凭证。
     # use_new_device=True 时换新设备(旧设备标记失效)。失败不阻断发码(worker 侧仍会用现有 d)。
+    eff_province, eff_city = province, city
     try:
-        _lm = get_login_manager(phone, city)
+        _lm = get_login_manager(phone, city, province, merchant_id, proxy_source)
+        # 定本次生效省/市(没传取凭证已绑定;账号未绑定则绑定写入)
+        eff_province, eff_city = _lm.apply_location(province, city)
         _d = _lm.ensure_device(force_new=use_new_device)
-        app.logger.info(f"[send_code] {phone} 设备绑定 d={'有' if _d else '无(池空?)'} device_id={_lm.device_id}")
+        app.logger.info(f"[send_code] {phone} 省市 province={eff_province} city={eff_city} "
+                        f"设备绑定 d={'有' if _d else '无(池空?)'} device_id={_lm.device_id}")
     except Exception as e:
-        app.logger.warning(f"[send_code] {phone} 设备绑定失败(继续入队): {e}")
+        app.logger.warning(f"[send_code] {phone} 设备/省市绑定失败(继续入队): {e}")
 
     _cap_redis.delete(_status_key(phone))  # 清掉上次残留的 code_sent，避免轮询误判"已发送"而实际没重发
-    enqueue_login(phone, city=city, force_new_device=use_new_device)
+    # 入队用【生效】省市,worker 发码按同一省市取代理
+    enqueue_login(phone, city=eff_city, force_new_device=use_new_device,
+                  province=eff_province, merchant_id=merchant_id, proxy_source=proxy_source)
     app.logger.info(f"[send_code] {phone} 已(重新)入队验证码登录 (prev status={status})")
     return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '已入队，请轮询 /api/login/captcha_status'})
 
@@ -223,22 +253,26 @@ def login_verify():
     phone = data.get('phone')
     verify_code = data.get('verify_code')
     city = data.get('city')  # 新增：获取城市参数
+    province, merchant_id, proxy_source = _biz_params(data)
 
-    app.logger.info(f"[login_verify] 请求参数: phone={phone}, verify_code={verify_code}, city={city}")
+    app.logger.info(f"[login_verify] 请求参数: phone={phone}, verify_code={verify_code}, city={city}, "
+                    f"province={province}, merchant_id={merchant_id}, proxy_source={proxy_source}")
 
     if not phone or not verify_code:
         error_msg = '缺少 phone 或 verify_code 参数'
         app.logger.error(f"[login_verify] ❌ 参数错误: {error_msg}, 收到的数据: {data}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone, city)  # 传递 city 参数
+    login_manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
     login_manager.load_credentials()
+    login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定
     login_manager.ensure_device()  # 确保有设备指纹 d(没有则从设备池补领),否则登录会被判设备异常
     # 调用登录
     success, message = login_manager.do_login(verify_code)
 
     if success:
         app.logger.info(f"[login_verify] ✓ 登录成功: phone={phone}")
+        login_manager.record_check('valid')  # 登录成功即记一次检测时间+状态
         # 登录成功：解冻 + 清理验证码状态
         unfreeze_login(phone)
         _cap_redis.delete(_status_key(phone))
@@ -272,18 +306,21 @@ def login_status():
     """检测登录状态"""
     phone = request.args.get('phone')
     city = request.args.get('city')  # 带上 city：首次会据此分配指定城市代理并建绑定
+    province, merchant_id, proxy_source = _biz_params(request.args)
 
-    app.logger.info(f"[login_status] 请求参数: phone={phone}, city={city}")
+    app.logger.info(f"[login_status] 请求参数: phone={phone}, city={city}, "
+                    f"province={province}, merchant_id={merchant_id}, proxy_source={proxy_source}")
 
     if not phone:
         error_msg = '缺少 phone 参数'
         app.logger.error(f"[login_status] ❌ 参数错误: {error_msg}")
         return jsonify({'success': False, 'message': error_msg}), 400
 
-    login_manager = get_login_manager(phone, city)
+    login_manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
 
     # 加载凭证
     token, sid, meddy_id = login_manager.load_credentials()
+    login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定
 
     if not (token and sid):
         app.logger.info(f"[login_status] 未找到登录凭证: phone={phone}")
@@ -296,6 +333,8 @@ def login_status():
     # 检查登录状态
     try:
         is_valid, user_info = login_manager.check_login_status()
+        # 记录本次检测时间+结果到凭证(有sid也可能掉线)
+        login_manager.record_check('valid' if is_valid else 'invalid')
 
         if is_valid:
             app.logger.info(f"[login_status] ✓ 已登录: phone={phone}")
@@ -306,7 +345,9 @@ def login_status():
                     'token': login_manager.token,
                     'sid': login_manager.sid,
                     'meddy_id': login_manager.meddy_id,
-                    'user_info': user_info
+                    'user_info': user_info,
+                    'checked_at': login_manager.checked_at,
+                    'check_status': login_manager.check_status
                 },
                 'message': '已登录'
             })
@@ -314,16 +355,81 @@ def login_status():
             app.logger.info(f"[login_status] 登录凭证已失效: phone={phone}")
             return jsonify({
                 'success': True,
-                'data': {'is_logged_in': False},
+                'data': {'is_logged_in': False,
+                         'checked_at': login_manager.checked_at,
+                         'check_status': login_manager.check_status},
                 'message': '登录已失效'
             })
     except Exception as e:
+        # 检测异常(网络等) → 记 error(不确定在线/掉线),不误判
+        login_manager.record_check('error')
         app.logger.error(f"[login_status] ❌ 检查登录状态失败: phone={phone}, 错误: {str(e)}")
         return jsonify({
             'success': True,
-            'data': {'is_logged_in': False},
+            'data': {'is_logged_in': False,
+                     'checked_at': login_manager.checked_at,
+                     'check_status': login_manager.check_status},
             'message': f'检查登录状态失败: {str(e)}'
         })
+
+
+@app.route('/api/login/bind_city', methods=['POST'])
+def login_bind_city():
+    """绑定/修改账号省市(显式覆盖凭证里的 province/city)。
+    body: {phone, province, city, merchant_id?}。已绑定账号换城市须调本接口。"""
+    data = request.json or {}
+    phone = data.get('phone')
+    province = (data.get('province') or '').strip()
+    city = (data.get('city') or '').strip()
+    _, merchant_id, proxy_source = _biz_params(data)
+
+    if not phone or not (province or city):
+        return jsonify({'success': False, 'message': '缺少 phone 或 province/city 参数'}), 400
+
+    app.logger.info(f"[bind_city] phone={phone} province={province} city={city} merchant_id={merchant_id}")
+    try:
+        manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
+        p, c = manager.set_location(province, city)
+        return jsonify({'success': True, 'data': {'phone': phone, 'province': p, 'city': c},
+                        'message': '省市已绑定/修改'})
+    except Exception as e:
+        app.logger.error(f"[bind_city] ❌ {phone} 失败: {e}")
+        return jsonify({'success': False, 'message': f'绑定省市失败: {str(e)}'}), 500
+
+
+@app.route('/api/accounts', methods=['GET'])
+def accounts_query():
+    """
+    查询账号凭证数据。?phone= 查单个;不传查全部。?merchant_id= 可选(默认100001)。
+    返回 list,每项 = 凭证 value(含 token/sid/d/province/city/checked_at/check_status/saved_at…) + phone。
+    """
+    phone = request.args.get('phone')
+    merchant_id = request.args.get('merchant_id') or MERCHANT_ID_DEFAULT
+    key = CREDENTIALS_KEY_TMPL.format(merchant_id=merchant_id)
+    out = []
+    try:
+        if phone:
+            raw = _cap_redis.hget(key, phone)
+            if raw:
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    d = {'_raw': raw}
+                d['phone'] = phone
+                out.append(d)
+        else:
+            for ph, raw in (_cap_redis.hgetall(key) or {}).items():
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                if not d.get('sid'):   # 不传手机号时,只返回有 sid(已登录)的账号
+                    continue
+                d['phone'] = ph
+                out.append(d)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'查询账号失败: {str(e)}'}), 500
+    return jsonify({'success': True, 'data': out, 'total': len(out)})
 
 
 # ========== 通用 mcd_api 接口 ==========
@@ -352,6 +458,10 @@ def universal_mcd_api(function_name):
     # 2. 提取登录信息
     phone = params.pop('phone', None)
     city = params.pop('city', None)  # 新增：提取城市参数
+    # 弹出商户/省份/代理源(不透传给 mcd_api 业务函数)
+    province = params.pop('province', None)
+    merchant_id = params.pop('merchant_id', None) or MERCHANT_ID_DEFAULT
+    proxy_source = params.pop('proxy_source', None) or PROXY_SOURCE_DEFAULT
 
     if not phone:
         return jsonify({'success': False, 'message': '缺少登录信息: 需要 phone 或 (token+sid)'}), 400
@@ -368,8 +478,9 @@ def universal_mcd_api(function_name):
         _cap_redis.delete(_processing_key(phone))
         app.logger.warning(f"[{function_name}] {phone} 僵尸冻结(status={status}, worker_alive={worker_alive()})，已自动解冻并继续")
 
-    login_manager = get_login_manager(phone, city)  # 传递 city 参数
+    login_manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
     token, sid, meddy_id_from_redis = login_manager.load_credentials()
+    login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定(取代理按此省市)
 
     if not (token and sid):
         return jsonify({'success': False, 'message': f'手机号 {phone} 未登录'}), 401
@@ -651,6 +762,71 @@ def proxy_health_check():
         return jsonify({'success': True, 'data': result})
     except Exception as e:
         return jsonify({'success': False, 'message': f'健康检查失败: {str(e)}'}), 500
+
+
+# ========== 站大爷(zdtps)代理白名单管理 ==========
+
+@app.route('/api/proxy/egress_ip', methods=['GET'])
+def proxy_egress_ip():
+    """查本机(运行本服务的机器)公网出口 IP(直连探测,多出口全列)。用于确认要加哪些 IP 进白名单。"""
+    try:
+        ips = utils.get_egress_ip(want_all=True)
+        return jsonify({'success': True, 'data': {'egress_ips': ips}})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'探测出口IP失败: {str(e)}'}), 500
+
+
+@app.route('/api/proxy/whitelist', methods=['GET'])
+def proxy_whitelist_get():
+    """查站大爷当前白名单 IP 列表。可选 ?merchant_id=。"""
+    merchant_id = request.args.get('merchant_id') or MERCHANT_ID_DEFAULT
+    lst = utils.zdtps_whitelist_list(merchant_id)
+    if lst is None:
+        return jsonify({'success': False, 'message': '查询白名单失败(见日志)'}), 502
+    return jsonify({'success': True, 'data': {'whitelist': lst}})
+
+
+@app.route('/api/proxy/whitelist/add', methods=['POST'])
+def proxy_whitelist_add():
+    """加白名单。body: {ip?(不传=加本机当前出口IP; 传则 str/逗号分隔多个), merchant_id?}。"""
+    data = request.json or {}
+    merchant_id = data.get('merchant_id') or MERCHANT_ID_DEFAULT
+    ok, msg = utils.zdtps_whitelist_add(ip=data.get('ip'), merchant_id=merchant_id)
+    return jsonify({'success': ok, 'message': msg,
+                    'data': {'whitelist': utils.zdtps_whitelist_list(merchant_id)}}), (200 if ok else 502)
+
+
+@app.route('/api/proxy/whitelist/del', methods=['POST'])
+def proxy_whitelist_del():
+    """删白名单 IP。body: {ip(必填, str/逗号分隔多个), merchant_id?}。"""
+    data = request.json or {}
+    ip = data.get('ip')
+    if not ip:
+        return jsonify({'success': False, 'message': '缺少 ip 参数'}), 400
+    merchant_id = data.get('merchant_id') or MERCHANT_ID_DEFAULT
+    ok, msg = utils.zdtps_whitelist_del(ip, merchant_id=merchant_id)
+    return jsonify({'success': ok, 'message': msg,
+                    'data': {'whitelist': utils.zdtps_whitelist_list(merchant_id)}}), (200 if ok else 502)
+
+
+@app.route('/api/proxy/stats', methods=['GET'])
+def proxy_stats_query():
+    """
+    查短效代理用量(按 源+省+市+日期)。默认近7天;?days=N 近N天;?date=YYYY-MM-DD 只查某天。
+    可选过滤 ?source= ?province= ?city= ?merchant_id=。
+    返回 {tree:{源:{省:{市:{日期:{req,proxy}}}}}, totals:{req,proxy}, dates:[...]}。
+    req=请求(使用)次数, proxy=消耗(新提取)的短效代理数。
+    """
+    args = request.args
+    merchant_id = args.get('merchant_id') or MERCHANT_ID_DEFAULT
+    try:
+        days = int(args.get('days', 7))
+    except (TypeError, ValueError):
+        days = 7
+    res = utils.query_proxy_stats(
+        merchant_id=merchant_id, days=days, date=args.get('date'),
+        source=args.get('source'), province=args.get('province'), city=args.get('city'))
+    return jsonify({'success': True, 'data': res})
 
 
 # ========== 健康检查 ==========

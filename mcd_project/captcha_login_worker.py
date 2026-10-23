@@ -386,11 +386,13 @@ def raw_send(phone, token, proxies, tid='', d='', sec_verify=None):
     return requests.post(SEND_URL, headers=h, data=body, proxies=proxies, timeout=15).json()
 
 
-def handle_login(phone, city=None, force_new_device=False, headless=True):
+def handle_login(phone, city=None, force_new_device=False, headless=True,
+                 province=None, merchant_id=None, proxy_source=None):
     beat(phone)  # 开始处理，上报心跳
     try:
         set_status(phone, 'sending', '开始发码')
-        manager = LoginManager(phone, use_redis=True, city=city)
+        manager = LoginManager(phone, use_redis=True, city=city,
+                               province=province, merchant_id=merchant_id, proxy_source=proxy_source)
         # 发码场景：未绑定→每次新短效代理(force_new)；已绑定→静态；USE_PROXY 关=None 直连。
         # 整个发码流程(activate/发码/滑块/重发)全程复用这同一个 proxies，保证 IP 一致性。
         proxies = manager.get_login_proxy(is_send_code=True)
@@ -463,10 +465,14 @@ def main():
         phone = payload.get('phone')
         if not phone:
             continue
-        log_info(f"[worker] 取到任务 {phone} city={payload.get('city')}")
+        log_info(f"[worker] 取到任务 {phone} city={payload.get('city')} "
+                 f"province={payload.get('province')} merchant_id={payload.get('merchant_id')} "
+                 f"proxy_source={payload.get('proxy_source')}")
         try:
             handle_login(phone, city=payload.get('city'),
-                         force_new_device=payload.get('force_new_device', False), headless=headless)
+                         force_new_device=payload.get('force_new_device', False), headless=headless,
+                         province=payload.get('province'), merchant_id=payload.get('merchant_id'),
+                         proxy_source=payload.get('proxy_source'))
         except Exception as e:
             import traceback
             log_info(f"[worker] {phone} 异常: {traceback.format_exc()}")

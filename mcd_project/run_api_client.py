@@ -19,11 +19,11 @@ DATA_DIR = os.path.expanduser('~/datas/mcd')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
-API_BASE = 'http://43.163.92.204:5001'
-# API_BASE = 'http://43.163.92.204:5001'
+# API_BASE = 'http://127.0.0.1:5001'
 API_BASE = 'http://dns.xme.fan:5001'
 # 默认配置
 DEFAULT_PHONE = '17717295039'
+DEFAULT_PROVINCE = '江苏'
 DEFAULT_CITY = '南京'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
@@ -32,18 +32,42 @@ ORDER_GOODS_FILE = os.path.join(DATA_DIR, 'save_order_data.json')
 PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
 PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
+# True = 登录/下单请求都带上省份+城市; False = 都不带(由服务端取凭证里已绑定的省市)
+SEND_LOCATION = False
+# 代理源:用来测不同代理。'zdtps'=站大爷 / 'shenlong'=神龙 / ''=不传(用服务端默认 zdtps)
+PROXY_SOURCE = 'shenlong'
 
-_CURRENT_CITY = None  # 登录时设为代理城市；always_short 模式下 /api/mcd/ 业务接口自动带上,用指定城市短效代理复用
+
+_CURRENT_CITY = None      # 登录时设为代理城市；always_short 下 /api/mcd/ 业务接口自动带上
+_CURRENT_PROVINCE = None  # 同上,省份(SEND_LOCATION=True 时才带)
+
+
+def _extra_params():
+    """附加到请求的公共参数:代理源(始终带,若设置) + 省市(SEND_LOCATION=True 才带)。"""
+    p = {}
+    if PROXY_SOURCE:
+        p['proxy_source'] = PROXY_SOURCE
+    if SEND_LOCATION:
+        if _CURRENT_PROVINCE:
+            p['province'] = _CURRENT_PROVINCE
+        if _CURRENT_CITY:
+            p['city'] = _CURRENT_CITY
+    return p
 
 
 def api_call(endpoint, method='GET', data=None, params=None):
-    """通用 API 调用。always_short 代理模式:/api/mcd/ 业务接口自动注入当前城市(city)。"""
-    # 业务接口自动带城市(短效代理按城市复用);登录接口自己已传 city,用 setdefault 不覆盖
-    if endpoint.startswith('/api/mcd/') and _CURRENT_CITY:
+    """通用 API 调用。always_short 代理模式:/api/mcd/ 业务接口按 SEND_LOCATION 自动注入省份+城市。"""
+    # 业务接口自动带省份+城市(短效代理按地域复用);登录接口自己已传,用 setdefault 不覆盖
+    loc = _extra_params()
+    if endpoint.startswith('/api/mcd/') and loc:
         if method == 'POST':
-            data = dict(data or {}); data.setdefault('city', _CURRENT_CITY)
+            data = dict(data or {})
+            for k, v in loc.items():
+                data.setdefault(k, v)
         else:
-            params = dict(params or {}); params.setdefault('city', _CURRENT_CITY)
+            params = dict(params or {})
+            for k, v in loc.items():
+                params.setdefault(k, v)
     url = f"{API_BASE}{endpoint}"
 
     response = None
@@ -74,20 +98,23 @@ def api_call(endpoint, method='GET', data=None, params=None):
 def get_login_info():
     """获取登录信息"""
     phone = input(f"请输入手机号 (回车使用默认 {DEFAULT_PHONE}): ").strip()
-    proxy_city = input(f"请输入城市 (回车使用默认 {DEFAULT_CITY}): ").strip()
     if not phone:
         phone = DEFAULT_PHONE
-    if not proxy_city:
-        proxy_city = DEFAULT_CITY
 
-    global _CURRENT_CITY
-    _CURRENT_CITY = proxy_city  # 业务接口(/api/mcd/)将自动带这个城市(always_short 短效代理按城市复用)
+    global _CURRENT_CITY, _CURRENT_PROVINCE
+    if SEND_LOCATION:
+        province = input(f"请输入省份 (回车使用默认 {DEFAULT_PROVINCE}): ").strip() or DEFAULT_PROVINCE
+        proxy_city = input(f"请输入城市 (回车使用默认 {DEFAULT_CITY}): ").strip() or DEFAULT_CITY
+    else:
+        province = proxy_city = None   # 不带省市,服务端取凭证里已绑定的
+    _CURRENT_PROVINCE = province
+    _CURRENT_CITY = proxy_city  # 业务接口(/api/mcd/)将按 SEND_LOCATION 自动带省市
 
-    print(f"\n使用手机号: {phone}, 代理城市: {proxy_city}")
+    print(f"\n使用手机号: {phone}, 省份: {province or '(不带)'}, 城市: {proxy_city or '(不带)'}, 代理源: {PROXY_SOURCE or '(默认)'}")
     print("正在检查登录状态...")
 
     # 检查登录状态
-    result = api_call('/api/login/status', params={'phone': phone, 'city': proxy_city})
+    result = api_call('/api/login/status', params={'phone': phone, **_extra_params()})
     if result.get('success') and result.get('data', {}).get('is_logged_in'):
         print(f"✅ 已登录")
         print(result)
@@ -106,7 +133,7 @@ def get_login_info():
     print(f"⚠️  未登录，开始登录流程...")
 
     # 发送验证码（入队，由 captcha_login_worker 自动过滑块后触发发码）
-    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, 'city': proxy_city})
+    result = api_call('/api/login/send_code', method='POST', data={'phone': phone, **_extra_params()})
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '发送验证码失败')}")
@@ -143,7 +170,7 @@ def get_login_info():
     result = api_call('/api/login/verify', method='POST', data={
         'phone': phone,
         'verify_code': code,
-        'city': proxy_city
+        **_extra_params()
     })
 
     if not result.get('success'):

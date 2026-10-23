@@ -19,6 +19,16 @@
 
 ## 一、登录相关接口
 
+> **公共参数（v2.1 新增，登录与 `/api/mcd/` 下单业务接口通用）**
+> | 参数 | 默认 | 说明 |
+> |---|---|---|
+> | `province` | 无 | 省份（如"江苏"）。zdtps 按 `"省,市"` 提代理，取不到退仅省 |
+> | `city` | 无 | 城市（如"南京"）。短效代理按省+市隔离/复用 |
+> | `merchant_id` | `100001` | 商户ID。决定凭证 key `mkt:prod:<商户>:credentials` 与代理配置/统计隔离 |
+> | `proxy_source` | `zdtps` | 代理源：`zdtps`（站大爷短效）/ `shenlong`（神龙短效） |
+>
+> **省/市 生效与绑定规则**：请求**没传** province 和 city → 取凭证里**已绑定**的省市；**传了其一** → 用传入值（本次不读凭证）。账号**首次（未绑定）**会把生效省市写入凭证绑定；**已绑定**则不再改动这两字段，换城市需显式调 `POST /api/login/bind_city`。
+
 ### 1. 发送验证码
 `POST /api/login/send_code`
 
@@ -26,16 +36,17 @@
 |---|---|---|---|
 | phone | string | 是 | 手机号（11位） |
 | use_new_device | bool | 否 | 是否强制生成新设备 Token，默认 false |
-| city | string | 否 | 指定城市（如"上海"），优先分配该城市的代理（v2.0新增） |
+| province / city | string | 否 | 省份/城市，见上方公共参数 |
+| merchant_id | string | 否 | 商户ID，默认 100001 |
+| proxy_source | string | 否 | 代理源，默认 zdtps |
 
 内部逻辑：
-- 优先复用 Redis/文件中已保存的设备 Token；若无则调用 `generate_token()` 生成新 Token 并通过 `activate_token()` 激活
-- 调用 `send_verification_code()` 发送验证码（手机号会先用 AES-128-ECB 加密）
-- **v2.0 新增**：首次请求时自动为账号分配代理，如果指定 `city` 参数则优先分配同城代理
+- 方案①：服务端不直接发码，统一入队交给 `captcha_login_worker`（自动过滑块→发码），客户端轮询 `/api/login/captcha_status`
+- 入队前解析本次生效省/市并绑定（未绑定时）；生效省/市随队列下发给 worker，发码按同一省市取短效代理
 
 响应：
 ```json
-{"success": true, "data": {"token": "设备Token"}, "message": "验证码已发送"}
+{"success": true, "data": {"status": "queued"}, "message": "已入队，请轮询 /api/login/captcha_status"}
 ```
 
 ### 2. 验证码登录
@@ -45,11 +56,9 @@
 |---|---|---|---|
 | phone | string | 是 | 手机号 |
 | verify_code | string | 是 | 6位短信验证码 |
-| city | string | 否 | 指定城市（如"上海"），优先分配该城市的代理（v2.0新增） |
+| province / city / merchant_id / proxy_source | string | 否 | 见公共参数 |
 
-内部调用 `login_manager.do_login()` → `mcd_api.login()`，登录成功后凭证会自动落盘（Redis 或 `data/credentials.json`）。
-
-**v2.0 新增**：所有请求自动使用账号绑定的代理，如果指定 `city` 参数则优先分配同城代理。
+内部调用 `login_manager.do_login()` → `mcd_api.login()`，登录成功后凭证自动落盘；并记录一次检测时间+状态（`check_status=valid`）。
 
 响应：
 ```json
@@ -66,8 +75,9 @@
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | phone | string | 是 | 手机号 |
+| province / city / merchant_id / proxy_source | string | 否 | 见公共参数 |
 
-逻辑：先从存储加载凭证，再调用上游 `GET /bff/user/pin?scene=1` 校验有效性。
+逻辑：先从存储加载凭证，再调用上游校验有效性。**每次检测都会把结果写回凭证**：`checked_at`（检测时间，区别于 cookie 保存时间 `saved_at`）+ `check_status`（`valid` 在线 / `invalid` 掉线失效 / `error` 检测异常）。有 sid 也可能掉线，以 `check_status` 为准。
 
 响应（已登录）：
 ```json
@@ -76,15 +86,42 @@
   "data": {
     "is_logged_in": true,
     "token": "...", "sid": "...", "meddy_id": "...",
-    "user_info": {"phone": "", "name": "", "points": "0", "meddy_id": "", "identity": ""}
+    "user_info": {"phone": "", "name": "", "points": "0", "meddy_id": "", "identity": ""},
+    "checked_at": "2026-10-23T12:00:00", "check_status": "valid"
   },
   "message": "已登录"
 }
 ```
 响应（未登录/已失效）：
 ```json
-{"success": true, "data": {"is_logged_in": false}, "message": "未登录 / 登录已失效"}
+{"success": true, "data": {"is_logged_in": false, "checked_at": "...", "check_status": "invalid"}, "message": "登录已失效"}
 ```
+
+### 4. 绑定/修改账号省市（v2.1 新增）
+`POST /api/login/bind_city`
+
+显式覆盖凭证里的 `province`/`city`。已绑定账号换城市须调本接口。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| phone | string | 是 | 手机号 |
+| province | string | 否* | 省份 |
+| city | string | 否* | 城市（province/city 至少传一个） |
+| merchant_id | string | 否 | 商户ID，默认 100001 |
+
+响应：`{"success": true, "data": {"phone": "...", "province": "江苏", "city": "南京"}, "message": "省市已绑定/修改"}`
+
+### 5. 查询账号数据（v2.1 新增）
+`GET /api/accounts`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| phone | string | 否 | 传则查单个（原样返回）；**不传则只返回有 sid（已登录）的账号** |
+| merchant_id | string | 否 | 商户ID，默认 100001 |
+
+返回 `list`，每项 = 凭证 value（token/sid/d/province/city/checked_at/check_status/saved_at…）+ `phone`。
+
+响应：`{"success": true, "data": [ {"phone":"...","sid":"...","check_status":"valid",...} ], "total": N}`
 
 ---
 
@@ -99,6 +136,8 @@
 - 或直接传 `token` + `sid`
 
 若函数需要 `mcd_id` 但未传，会自动用 Redis 中该手机号对应的 `meddy_id` 补全。
+
+**v2.1 公共参数**：`province`/`city`/`merchant_id`/`proxy_source` 会被服务端提取（**不透传**给业务函数），用于定位凭证、决定取短效代理的地域与代理源，规则同登录接口（见第一节顶部公共参数）。`run_api_client.py` 里 `SEND_LOCATION` 开关控制业务请求是否自动带省市（True 带 / False 不带），`PROXY_SOURCE` 常量控制代理源（`zdtps`/`shenlong`/`''`=默认），方便测不同代理。
 
 **v2.0 重要更新：代理自动管理**
 - 所有通过此接口的请求会自动使用账号绑定的代理
@@ -428,6 +467,53 @@
 ```
 
 **返回值：** `true` 表示健康，`false` 表示失败。此接口会更新代理的健康状态和响应时间。
+
+---
+
+## 三续、短效代理源 / 白名单 / 用量统计（v2.1 新增）
+
+短效代理源配置存于 Redis Hash `mkt:prod:<商户>:proxy`（field=源名 `zdtps`/`shenlong`，value=该源配置 JSON）；服务启动自动 seed 默认配置（只补缺失）。默认源 `zdtps`（站大爷），IP 存活 `timespan=3`（1-5 等级），池 TTL = 过期时间 `expire`(默认180) − 20 = 160s，与神龙短效(~3min)一致。
+
+### 1. 查询本机出口 IP
+`GET /api/proxy/egress_ip`
+
+直连探测运行本服务机器的公网出口 IP（多出口全列），用于确认要加哪些 IP 进代理白名单。
+响应：`{"success": true, "data": {"egress_ips": ["1.2.3.4"]}}`
+
+### 2. 查询白名单
+`GET /api/proxy/whitelist`（可选 `?merchant_id=`）→ `{"success": true, "data": {"whitelist": ["1.2.3.4", ...]}}`
+
+### 3. 加白名单
+`POST /api/proxy/whitelist/add`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| ip | string | 否 | 不传=加**本机当前出口IP**；传则加指定 IP（逗号分隔多个） |
+| merchant_id | string | 否 | 商户ID，默认 100001 |
+
+### 4. 删白名单
+`POST /api/proxy/whitelist/del` — body `{ip（必填,逗号分隔多个）, merchant_id?}`
+
+### 5. 短效代理用量统计
+`GET /api/proxy/stats`
+
+在**取代理时**按 `源+省+市+日期` 累计：`req`=请求（使用）次数（含池内复用）、`proxy`=消耗（从上游新提取）的短效代理数（复用不计）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| days | int | 否 | 近 N 天，默认 7 |
+| date | string | 否 | 只查某天 `YYYY-MM-DD`（传了则忽略 days） |
+| source / province / city | string | 否 | 过滤维度 |
+| merchant_id | string | 否 | 商户ID，默认 100001 |
+
+响应：
+```json
+{"success": true, "data": {
+  "tree": {"zdtps": {"江苏": {"南通": {"2026-10-23": {"req": 3, "proxy": 3}}}}},
+  "totals": {"req": 3, "proxy": 3},
+  "dates": ["2026-10-17", "...", "2026-10-23"]
+}}
+```
 
 ---
 

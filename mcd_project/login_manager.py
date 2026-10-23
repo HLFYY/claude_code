@@ -17,6 +17,7 @@ from typing import Optional, Tuple, Dict
 from functools import wraps
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
+import config
 from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT, USE_PROXY, make_redis
 from mcd_api import (
     generate_token,
@@ -131,7 +132,8 @@ class LoginManager:
     """
 
     def __init__(self, phone: str, credentials_file: str = None, use_redis: bool = True, city: str = None,
-                 proxy_pool=None, binding_manager=None, failure_handler=None):
+                 proxy_pool=None, binding_manager=None, failure_handler=None,
+                 merchant_id: str = None, province: str = None, proxy_source: str = None):
         """
         初始化登录管理器
 
@@ -150,6 +152,16 @@ class LoginManager:
         self.phone = phone
         self.use_redis = use_redis
         self.city = city
+        # 商户/地域/代理源(mcd_server 传入,决定凭证 key、代理源与取代理地域)
+        self.merchant_id = merchant_id or config.MERCHANT_ID_DEFAULT
+        self.province = province
+        self.proxy_source = proxy_source or config.PROXY_SOURCE_DEFAULT
+        # 凭证里【已绑定】的省/市(load_credentials 填充);self.province/self.city 是本次【生效】值(apply_location 定)
+        self.province_bound: str = ''
+        self.city_bound: str = ''
+        # 登录态检测:checked_at=最近检测时间(ISO,区别于 cookie 保存时间 saved_at);check_status=valid/invalid/error
+        self.checked_at: str = ''
+        self.check_status: str = ''
 
         # 凭证文件路径
         if credentials_file is None:
@@ -160,7 +172,8 @@ class LoginManager:
         # Redis 客户端（如果使用 Redis）
         if self.use_redis:
             self.redis_client = make_redis()  # 带超时/重试/keepalive
-            self.redis_key = 'mcd:credentials'
+            # 凭证按商户隔离: mkt:prod:<商户ID>:credentials(原 'mcd:credentials')
+            self.redis_key = config.CREDENTIALS_KEY_TMPL.format(merchant_id=self.merchant_id)
 
         # 当前账号凭证
         self.token: Optional[str] = None
@@ -195,6 +208,85 @@ class LoginManager:
         # 自动加载已保存的凭证（如果存在）
         self.load_credentials()
 
+    def apply_location(self, req_province: Optional[str], req_city: Optional[str]) -> Tuple[str, str]:
+        """
+        登录/下单接口请求时定【本次生效】省/市,并在账号未绑定时把它写进凭证(绑定)。
+          - 省/市都没传 → 取凭证里已绑定的省/市;
+          - 传了省【或】市 → 用传入值(不取凭证);
+          - 账号未绑定(凭证无省市) → 把生效省市写入凭证绑定;已绑定 → 不动这2字段(换城市需显式调 set_location)。
+        返回 (province, city)。
+        """
+        req_province = (req_province or '').strip()
+        req_city = (req_city or '').strip()
+        if not req_province and not req_city:
+            eff_p, eff_c = self.province_bound or '', self.city_bound or ''
+        else:
+            eff_p, eff_c = req_province, req_city
+        if not (self.province_bound or self.city_bound) and (eff_p or eff_c):
+            self.province_bound, self.city_bound = eff_p, eff_c
+            try:
+                self._persist_location(eff_p, eff_c)
+                log_info(f'📍 账号 {self.phone} 绑定省市 province={eff_p} city={eff_c}')
+            except Exception as e:
+                log_info(f'⚠️  绑定省市写入失败 {self.phone}: {e}')
+        self.province, self.city = eff_p, eff_c
+        return eff_p, eff_c
+
+    def set_location(self, province: str, city: str) -> Tuple[str, str]:
+        """显式修改绑定省/市(绑定城市修改接口用):覆盖凭证里的 province/city,并作为本次生效值。"""
+        self.province_bound = (province or '').strip()
+        self.city_bound = (city or '').strip()
+        self._persist_location(self.province_bound, self.city_bound)
+        self.province, self.city = self.province_bound, self.city_bound
+        log_info(f'📍 账号 {self.phone} 修改绑定省市 province={self.province_bound} city={self.city_bound}')
+        return self.province_bound, self.city_bound
+
+    def _merge_cred_fields(self, fields: dict) -> None:
+        """把 fields 合并进该手机号凭证行(只改这些字段,保留其余;不动 saved_at);无行则新建。"""
+        if self.use_redis:
+            row = {}
+            try:
+                raw = self.redis_client.hget(self.redis_key, self.phone)
+                if raw:
+                    row = json.loads(raw)
+            except Exception:
+                row = {}
+            row.update(fields)
+            self.redis_client.hset(self.redis_key, self.phone, json.dumps(row, ensure_ascii=False))
+        else:
+            all_c = {}
+            if os.path.exists(self.credentials_file):
+                try:
+                    with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                        all_c = json.load(f)
+                except Exception:
+                    all_c = {}
+            row = all_c.get(self.phone, {})
+            row.update(fields)
+            all_c[self.phone] = row
+            os.makedirs(os.path.dirname(self.credentials_file), exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=os.path.dirname(self.credentials_file), delete=False) as tf:
+                json.dump(all_c, tf, indent=2, ensure_ascii=False)
+                tmp = tf.name
+            shutil.move(tmp, self.credentials_file)
+
+    def _persist_location(self, province: str, city: str) -> None:
+        """只更新凭证里的 province/city 两字段(保留其余)。"""
+        self._merge_cred_fields({'province': province, 'city': city})
+
+    def record_check(self, status: str) -> None:
+        """
+        记录登录态检测的时间+结果到凭证(checked_at/check_status),不动 cookie 保存时间 saved_at。
+        登录成功/查状态时调用。status: 'valid'(在线)/'invalid'(掉线/失效)/'error'(检测异常,不确定)。
+        """
+        self.check_status = status
+        self.checked_at = datetime.now().isoformat()
+        try:
+            self._merge_cred_fields({'checked_at': self.checked_at, 'check_status': status})
+        except Exception as e:
+            log_info(f'⚠️  写检测状态失败 {self.phone}: {e}')
+
     def get_login_proxy(self, is_send_code: bool = False) -> Optional[Dict[str, str]]:
         """
         本次请求应使用的代理(requests proxies 字典)，或 None=直连。【统一入口】
@@ -218,7 +310,8 @@ class LoginManager:
         from config import PROXY_MODE
         if PROXY_MODE == 'always_short':
             from utils import get_short_proxy
-            return get_short_proxy(self.city, as_dict=True, force_new=is_send_code)
+            return get_short_proxy(self.city, province=self.province, source=self.proxy_source,
+                                   merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
 
         binding = self.binding_manager.get_binding(self.phone)
         if not binding:
@@ -238,7 +331,8 @@ class LoginManager:
             else:
                 # 未登录 → 短效代理(白名单 ip:port)
                 from utils import get_short_proxy
-                return get_short_proxy(self.city, as_dict=True, force_new=is_send_code)
+                return get_short_proxy(self.city, province=self.province, source=self.proxy_source,
+                                       merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
 
         return self._static_proxy_dict(binding)
 
@@ -460,15 +554,21 @@ class LoginManager:
             meddy_id: MeddyId
         """
         if self.use_redis:
-            # 保留已存的 d（数美设备指纹，由 set_device 写入，登录保存时别弄丢）
-            d_keep = self.d
-            if d_keep is None:
-                try:
-                    _old = self.redis_client.hget(self.redis_key, self.phone)
-                    if _old:
-                        d_keep = json.loads(_old).get('d')
-                except Exception:
-                    pass
+            # 读一次旧行,保留 d(数美设备指纹)、province/city(已绑定省市),登录保存时别弄丢
+            _old_row = {}
+            try:
+                _raw = self.redis_client.hget(self.redis_key, self.phone)
+                if _raw:
+                    _old_row = json.loads(_raw)
+            except Exception:
+                _old_row = {}
+            d_keep = self.d if self.d is not None else _old_row.get('d')
+            p_keep = self.province_bound or _old_row.get('province', '') or ''
+            c_keep = self.city_bound or _old_row.get('city', '') or ''
+            chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
+            chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            self.province_bound, self.city_bound = p_keep, c_keep
+            self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             # Redis 存储
             credential_data = {
                 'token': token,
@@ -478,6 +578,10 @@ class LoginManager:
                 'device_id': self.device_id,
                 'tid': self.tid,
                 'tid_expire': self.tid_expire,
+                'province': p_keep,
+                'city': c_keep,
+                'checked_at': chk_at_keep,
+                'check_status': chk_st_keep,
                 'saved_at': datetime.now().isoformat()
             }
             try:
@@ -500,8 +604,15 @@ class LoginManager:
                     log_info(f"⚠️  警告: 读取旧凭证失败: {e}")
                     # 继续执行，使用空字典
 
-            # 更新当前手机号的凭证（保留已存的 d）
-            d_keep = self.d if self.d is not None else all_credentials.get(self.phone, {}).get('d')
+            # 更新当前手机号的凭证（保留已存的 d / province / city）
+            _old_row = all_credentials.get(self.phone, {})
+            d_keep = self.d if self.d is not None else _old_row.get('d')
+            p_keep = self.province_bound or _old_row.get('province', '') or ''
+            c_keep = self.city_bound or _old_row.get('city', '') or ''
+            chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
+            chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            self.province_bound, self.city_bound = p_keep, c_keep
+            self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             all_credentials[self.phone] = {
                 'token': token,
                 'sid': sid,
@@ -510,6 +621,10 @@ class LoginManager:
                 'device_id': self.device_id,
                 'tid': self.tid,
                 'tid_expire': self.tid_expire,
+                'province': p_keep,
+                'city': c_keep,
+                'checked_at': chk_at_keep,
+                'check_status': chk_st_keep,
                 'saved_at': datetime.now().isoformat()
             }
 
@@ -556,6 +671,10 @@ class LoginManager:
         self.d = None
         self.tid = None
         self.tid_expire = None
+        self.province_bound = ''
+        self.city_bound = ''
+        self.checked_at = ''
+        self.check_status = ''
         set_active_d('')  # 先重置，避免同 worker 上个账号的 d 残留
         set_active_tid('')
         if self.use_redis:
@@ -579,6 +698,10 @@ class LoginManager:
                 self.device_id = cred.get('device_id')
                 self.tid = cred.get('tid')
                 self.tid_expire = cred.get('tid_expire')
+                self.province_bound = cred.get('province', '') or ''
+                self.city_bound = cred.get('city', '') or ''
+                self.checked_at = cred.get('checked_at', '') or ''
+                self.check_status = cred.get('check_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
 
@@ -615,6 +738,10 @@ class LoginManager:
                 self.device_id = cred.get('device_id')
                 self.tid = cred.get('tid')
                 self.tid_expire = cred.get('tid_expire')
+                self.province_bound = cred.get('province', '') or ''
+                self.city_bound = cred.get('city', '') or ''
+                self.checked_at = cred.get('checked_at', '') or ''
+                self.check_status = cred.get('check_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
 

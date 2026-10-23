@@ -8,7 +8,7 @@ mitm_mcd.py —— mitmdump addon: 抓麦当劳 + 数美(风控/注册)流量,�
 
 服务器运行:
   pip install mitmproxy
-  mitmdump -s mitm_mcd.py --listen-host 0.0.0.0 --listen-port 8080 --set block_global=false
+  mitmdump -s mitm_mcd.py --listen-host 0.0.0.0 --listen-port 18080 --set block_global=false --ignore-hosts '(fengkongcloud\.com|ishumei\.com)'
   # 可选同时存原始流: 加  -w /tmp/mcd_flows.mitm   (之后可 mitmweb -r 回看)
 
 手机侧:
