@@ -472,6 +472,8 @@ def handle_mcgold(payload, headless=True):
                                province=province, merchant_id=merchant_id, proxy_source=proxy_source)
         token, sid, mcd_id = manager.load_credentials()
         manager.apply_location(province, city)
+        if sid and not token:
+            token = manager.ensure_token()  # 只有 sid 无 token → 自动生成+激活+绑定
         try:
             manager.ensure_device()
         except Exception as e:

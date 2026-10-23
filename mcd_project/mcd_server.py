@@ -323,6 +323,8 @@ def login_status():
     # 加载凭证
     token, sid, meddy_id = login_manager.load_credentials()
     login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定
+    if sid and not token:
+        token = login_manager.ensure_token()  # 只有 sid 无 token → 自动生成+激活+绑定
 
     if not (token and sid):
         app.logger.info(f"[login_status] 未找到登录凭证: phone={phone}")
@@ -546,6 +548,8 @@ def universal_mcd_api(function_name):
     login_manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
     token, sid, meddy_id_from_redis = login_manager.load_credentials()
     login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定(取代理按此省市)
+    if sid and not token:
+        token = login_manager.ensure_token()  # 只有 sid 无 token → 自动生成+激活+绑定
 
     if not (token and sid):
         return jsonify({'success': False, 'message': f'手机号 {phone} 未登录'}), 401

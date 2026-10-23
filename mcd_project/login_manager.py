@@ -462,6 +462,38 @@ class LoginManager:
         log_info(f"✓ 账号 {self.phone} 绑定设备 {dev['id']} (model={dev.get('model')}) token={str(self.token)[:8]}… d={dev['d'][:16]}…")
         return self.d
 
+    def ensure_token(self, proxies=None):
+        """
+        凭证【有 sid 但无 token】时:自动生成设备 token + 激活(tid) + 绑定(持久化到凭证)。
+        用于别处拿来的"只有 sid/meddyId"的凭证,补齐 token 才能调签名接口。返回 token 或 None。
+        注:McD 服务端是否接受"借来的 sid + 新设备 token"需实测;本方法只负责补齐 token。
+        """
+        if self.token:
+            return self.token
+        if not self.sid:
+            return None   # 没 sid 不是已登录态,不给补 token
+        new_token = generate_token()
+        if proxies is None:
+            try:
+                proxies = self.get_login_proxy(is_send_code=False)
+            except Exception:
+                proxies = None
+        try:
+            ok, tid, msg = activate_token(new_token, proxies=proxies)
+        except Exception as e:
+            ok, tid, msg = False, None, str(e)
+        self.token = new_token
+        if ok and tid:
+            self.tid = tid
+            self.tid_expire = time.time() + 7 * 86400
+            set_active_tid(self.tid)
+        else:
+            log_info(f"⚠️  ensure_token: {self.phone} 新 token 激活失败({msg}),仍绑定 token(tid 空)")
+        # 绑定:持久化 token(+tid),save_credentials 会保留 sid/meddy/d/省市/检测字段
+        self.save_credentials(self.token, self.sid, self.meddy_id)
+        log_info(f"✓ ensure_token: {self.phone} 已生成并绑定设备 token(tid={'有' if self.tid else '无'})")
+        return self.token
+
     def _update_credential(self, fields: dict) -> None:
         """把若干字段合并进凭证(保留其它字段)；token 以当前 self.token 为准(设备池固定 token)。"""
         now = datetime.now().isoformat()
