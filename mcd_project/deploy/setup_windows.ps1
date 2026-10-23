@@ -10,26 +10,38 @@
     阶段二  SSH key：已存在就直接展示，不存在就生成后展示
     阶段三  暂停，等你把公钥加进 GitHub Deploy keys，回车继续
     阶段四  验证 SSH 连接 -> 稀疏 clone（只取 mcd_project，约 1.2MB）
-    阶段五  建 venv、装依赖、验证 Redis 连通
+    阶段五  装依赖（默认装到系统 Python，不建 venv）、验证 Redis 连通
     阶段六  生成 run_worker.bat
 
-    幂等设计：重复执行安全（key 不覆盖、仓库存在则 pull、venv 复用）。
+    默认代码目录：本脚本所在目录下的 claude_code\（用 -TargetDir 可改）
+    默认不创建虚拟环境，直接用系统 Python（加 -UseVenv 才建 .venv）
+
+    幂等设计：重复执行安全（key 不覆盖、仓库存在则 pull）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File setup_windows.ps1
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -TargetDir D:\code\claude_code -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -UseVenv
 #>
 [CmdletBinding()]
 param(
     [string] $RepoUrl   = "git@github.com:HLFYY/claude_code.git",
-    [string] $TargetDir = "C:\claude_code",
+    [string] $TargetDir = "",
     [string] $PipIndex  = "https://pypi.tuna.tsinghua.edu.cn/simple",
     [switch] $SkipPause,
     [switch] $SkipChrome,
-    [switch] $FullClone
+    [switch] $FullClone,
+    [switch] $UseVenv
 )
+
+# 默认把代码拉到「脚本所在目录」下面，不再固定 C:\claude_code
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+if (-not $TargetDir) { $TargetDir = Join-Path $ScriptDir "claude_code" }
+$TargetDir = [IO.Path]::GetFullPath($TargetDir)
 
 $ErrorActionPreference = "Continue"
 
@@ -500,17 +512,26 @@ Ok "已设置仓库级 core.sshCommand（以后 git pull 不用再管 key）"
 $projDir = Join-Path $TargetDir "mcd_project"
 
 # ========================================================
-Step 5 "创建虚拟环境并安装依赖"
+Step 5 "安装依赖"
 
-$venvDir = Join-Path $projDir ".venv"
-$vpy = Join-Path $venvDir "Scripts\python.exe"
+if ($UseVenv) {
+    $venvDir = Join-Path $projDir ".venv"
+    $vpy = Join-Path $venvDir "Scripts\python.exe"
 
-if (Test-Path $vpy) { Ok "venv 已存在，复用 $venvDir" }
+    if (Test-Path $vpy) { Ok "venv 已存在，复用 $venvDir" }
+    else {
+        Info "创建 venv：$venvDir"
+        & $pyExe -m venv $venvDir 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        if (-not (Test-Path $vpy)) { Die "venv 创建失败" }
+        Ok "venv 创建完成"
+    }
+}
 else {
-    Info "创建 venv：$venvDir"
-    & $pyExe -m venv $venvDir 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-    if (-not (Test-Path $vpy)) { Die "venv 创建失败" }
-    Ok "venv 创建完成"
+    # 默认不建虚拟环境，直接装到系统 Python
+    $vpy = (Get-Command $pyExe -ErrorAction SilentlyContinue).Source
+    if (-not $vpy) { $vpy = $pyExe }
+    Ok "跳过虚拟环境，使用系统 Python：$vpy"
+    Info "（如需隔离环境，重跑时加 -UseVenv）"
 }
 
 $pipArgs = @()
@@ -520,8 +541,12 @@ if ($PipIndex) {
     $pipHost = ([Uri]$PipIndex).Host
     if ($pipHost) { $pipArgs += @("--trusted-host", $pipHost) }
     Info ("pip 源：" + $PipIndex)
-    # 第一次从国内源装包，先建好 pip 缓存目录，避免落盘抖动
     & $vpy -m pip config set global.index-url $PipIndex 2>&1 | Out-Null
+}
+# 非管理员时系统 Python 的 site-packages 可能没写权限，退回用户目录
+if (-not $UseVenv -and -not $isAdmin) {
+    $pipArgs += @("--user")
+    Warn "非管理员运行，pip 加 --user 装到用户目录"
 }
 
 Info "升级 pip ..."
