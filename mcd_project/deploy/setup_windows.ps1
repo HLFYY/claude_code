@@ -13,7 +13,9 @@
     阶段五  装依赖（默认装到系统 Python，不建 venv）、验证 Redis 连通
     阶段六  生成 run_worker.bat
 
-    默认代码目录：本脚本所在目录下的 claude_code\（用 -TargetDir 可改）
+    默认代码目录（-TargetDir 可改）：
+      · 脚本被单独复制到一个空目录 → 代码 clone 到「脚本所在目录\claude_code」
+      · 脚本本身就在已 clone 的仓库里 → 直接复用那个仓库，不再嵌套 clone
     默认不创建虚拟环境，直接用系统 Python（加 -UseVenv 才建 .venv）
 
     幂等设计：重复执行安全（key 不覆盖、仓库存在则 pull）。
@@ -40,7 +42,29 @@ param(
 
 # 默认把代码拉到「脚本所在目录」下面，不再固定 C:\claude_code
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-if (-not $TargetDir) { $TargetDir = Join-Path $ScriptDir "claude_code" }
+
+function Find-GitRoot([string]$dir) {
+    $d = $dir
+    while ($d) {
+        if (Test-Path (Join-Path $d ".git")) { return $d }
+        $parent = Split-Path $d -Parent
+        if (-not $parent -or $parent -eq $d) { return $null }
+        $d = $parent
+    }
+    return $null
+}
+
+if (-not $TargetDir) {
+    # 情况 A：脚本本身就在已 clone 好的仓库里（如在 mcd_project\deploy\ 下双击）→ 直接复用，不再嵌套 clone
+    $gitRoot = Find-GitRoot $ScriptDir
+    if ($gitRoot -and (Test-Path (Join-Path $gitRoot "mcd_project\captcha_login_worker.py"))) {
+        $TargetDir = $gitRoot
+    }
+    # 情况 B：脚本是单独复制到某个目录的 → 代码拉到该目录下的 claude_code\
+    else {
+        $TargetDir = Join-Path $ScriptDir "claude_code"
+    }
+}
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 
 $ErrorActionPreference = "Continue"

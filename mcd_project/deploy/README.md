@@ -19,6 +19,8 @@
 > `deploy/setup.bat` 和 `deploy/setup_windows.ps1`。
 >
 > **代码默认拉到「脚本所在目录」下的 `claude_code\`**（例如脚本在 `C:\setup\`，代码就在 `C:\setup\claude_code\`）。
+> 如果脚本本身就在已经 clone 好的仓库里跑（比如在 `claude_code\mcd_project\deploy\` 下双击），
+> 会**直接复用那个仓库**，不会再多套一层。
 > 想换位置用 `-TargetDir D:\code\claude_code`。
 >
 > **默认不创建虚拟环境**，依赖直接装到系统 Python。想用 venv 就加 `-UseVenv`。
