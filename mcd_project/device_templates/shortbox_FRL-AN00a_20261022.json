@@ -1,0 +1,49 @@
+{
+ "a1": "all",
+ "a4": "2",
+ "a2": "QwDzZHBJNx6itOkCIZRpAY9PUFBzCXMGAospU16BXM9Sq9SNwCv3lapMR0469hZzf+qTFgFmBfrFm40oEQi8Ug==",
+ "a6": "android",
+ "a9": 1792641645090,
+ "a10": "10",
+ "a7": "3.17.0",
+ "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+ "a18": {
+  "gsm.sim.state": "LOADED",
+  "sys.usb.state": "mtp"
+ },
+ "a24": "a688b9c80573f2b5",
+ "a60": "u0_a104",
+ "a46": {
+  "model": "FRL-AN00a",
+  "serial": "",
+  "brand": "HUAWEI",
+  "manufacturer": "HUAWEI",
+  "fingerprint": "HUAWEI/FRLM-AN00a/HWFRL-M:10/HUAWEIFRL-AN00a/103.0.0.165C00:user/release-keys"
+ },
+ "a38": "7.0.43.1",
+ "a44": "WIFI",
+ "a39": "com.mcdonalds.gma.cn",
+ "a40": 1792405879285,
+ "a135": 0,
+ "a136": "build1",
+ "a133": 288,
+ "a85": [
+  "bootId",
+  "tel",
+  "sensor",
+  "gps",
+  "apps"
+ ],
+ "a167": 1574500,
+ "a168": 1574500,
+ "a121": 0,
+ "a125": {
+  "fit": 1792641258293,
+  "lut": 1792641258293
+ },
+ "a127": 888,
+ "a96": "qvdTr7A9k1DIU04ha4eP",
+ "a97": "QwDzZHBJNx6itOkCIZRpAY9PUFBzCXMGAospU16BXM9Sq9SNwCv3lapMR0469hZzf+qTFgFmBfrFm40oEQi8Ug==",
+ "a103": "981cfd62-305f-4c5a-91f0-19d38bc08da1",
+ "a155": 1
+}

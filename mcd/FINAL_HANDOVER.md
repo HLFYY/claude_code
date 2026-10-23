@@ -1,5 +1,7 @@
 # 麦当劳 App 逆向工程最终交接文档
 
+> 📒 **踩坑与结论日志**：`docs/踩坑与结论日志.md` —— 每次测试/排查的问题现象、过程、结论、解法都记在那里（带"快速索引"一句话结论表）。**遇到问题先查它**，别重复踩坑；每轮测试完请追加一条。本交接文档记工程细节与方案，踩坑日志记"试过什么、为什么不行、最终怎么解"。
+
 **项目名称**: 麦当劳中国 App API 加密与签名逆向
 **项目周期**: 2026-09-14 至 2026-09-24
 **完成度**: 100% (所有功能已实现并验证)
@@ -1612,3 +1614,10 @@ $PY mcd_project/device_pool_redis.py stats
 - ⚠️ **签名版本坑**:`v`/`p` 必须保持 `7.0.41.0`/`102`(与密钥 `V4AK=HJ7..` 匹配);对齐成 43.1/105 会被网关 403(无 5DLU 密钥)。`biz_scenario=500/biz_from=1011` 不签名、已对齐。
 - 脚本:`scratchpad` 的 `test_clean_d.py`(注入指定d发码判定)、`test_local_clean_template.py`(本地造d+激活+发码判定);mitm:`tools/mitm/mitm_mcd.py`。
 - 剩下:把干净模板接进 `device_pool_redis` 批量补池 + 配 `captcha_login_worker` 过滑块 → 端到端发码。
+
+### 14.6 biz_scenario/biz_from 按接口对齐(2026-10-21 全流程抓包比对)
+
+- mitm 抓真机完整下单流程(`tools/mitm/mitm_mcd.py` 抓、`compare_capture.py` 逐接口 diff),发现真机 `biz_scenario`/`biz_from` **按页面/业务分**,我们原来全写死 `102/1006`(指纹破绽)。
+- 已在 `mcd_api.BIZ_MAP`(path→biz)对齐,`build_headers(biz_scenario/biz_from 默认 None)` 自动按 path 查表;修掉之前 login 错设的 biz(真机 `500/1004`,发码 `500/1011`)。关键:store 103/13·12·14、stores/{id} 101/1004、menu 101/1009、products/detail 101/1001、cart 101/1007、order/confirmation 200/1004·202/1020·202/1019、getNearest 202/1021、orders 202/1012、cashier 501/1001·501/1002。
+- `v`/`p` 是签名头,因密钥 `V4AK=HJ7..`(7.0.41.0版)锁定,**保持 7.0.41.0/102**,不随真机 7.0.43.1/105 改(改了网关 403)。biz_* 不签名可安全对齐。
+- 对比产物:`mcd/resources/logs/cap_full/`(319 条真机请求 req/resp)。

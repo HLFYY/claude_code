@@ -161,17 +161,33 @@ def _dbg_dump(page, tag):
     return shot
 
 
+def _fetch_img(ele):
+    """取滑块图:优先经浏览器(走代理、支持 data-uri、不依赖 Pi 直连),失败再 requests 兜底。"""
+    try:
+        b = ele.src(timeout=8, base64_to_bytes=True)   # DrissionPage 经浏览器会话取图
+        if b:
+            return b
+    except Exception as e:
+        log_info(f"[worker][dbg] ele.src 取图失败: {str(e)[:60]}")
+    try:
+        src = ele.attr('src')
+        if src and src.startswith('http'):
+            return requests.get(src, headers=IMG_HEADERS, timeout=10).content
+    except Exception as e:
+        log_info(f"[worker][dbg] requests 兜底取图失败: {str(e)[:60]}")
+    return None
+
+
 def _slide_once(page):
     bg_ele = page.ele('.shumei_captcha_loaded_img_bg', timeout=3)
     fg_ele = page.ele('.shumei_captcha_loaded_img_fg', timeout=3)
     if not bg_ele or not fg_ele:
         log_info(f"[worker][dbg] 滑块图元素缺失 bg={bool(bg_ele)} fg={bool(fg_ele)}")
         return None, None
-    try:
-        bg_bytes = requests.get(bg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
-        fg_bytes = requests.get(fg_ele.attr('src'), headers=IMG_HEADERS, timeout=10).content
-    except Exception as e:
-        log_info(f"[worker][dbg] 下载滑块图失败(requests 直连该服务器可能不通): {e}")
+    bg_bytes = _fetch_img(bg_ele)
+    fg_bytes = _fetch_img(fg_ele)
+    if not bg_bytes or not fg_bytes:
+        log_info(f"[worker][dbg] 取滑块图失败 bg={bool(bg_bytes)} fg={bool(fg_bytes)}")
         return None, None
     res = _ocr.slide_match(fg_bytes, bg_bytes, simple_target=True)
     native_w = Image.open(io.BytesIO(bg_bytes)).size[0]
@@ -184,6 +200,11 @@ def _slide_once(page):
     tracks = get_tracks(distance)
 
     btn = page.ele('.shumei_captcha_slide_btn')
+    btn_x0 = None
+    try:
+        btn_x0 = btn.rect.location[0]
+    except Exception:
+        pass
     page.listen.start('ca/v2/fverify')
     ac = Actions(page)
     ac.hold(btn)
@@ -192,10 +213,22 @@ def _slide_once(page):
         ac.move(tr, random.randint(-4, 4), duration=0.05)
     time.sleep(random.uniform(0.1, 0.2))
     ac.release(btn)
-    pkt = page.listen.wait(timeout=18)  # 服务器代理慢，放宽到 18s
+    pkt = page.listen.wait(timeout=15)  # 15s（短效代理~180s TTL，要在150s内完成5次重试）
     page.listen.stop()
     if not pkt:
-        log_info("[worker][dbg] 未捕获到 ca/v2/fverify（滑动可能未触发校验 / 响应超时 / 页面没正常加载）")
+        # 诊断:按钮到底动没动 + 是否被数美判定机器人(webdriver)
+        btn_x1 = None
+        try:
+            btn_x1 = page.ele('.shumei_captcha_slide_btn').rect.location[0]
+        except Exception:
+            pass
+        try:
+            wd = page.run_js('return navigator.webdriver')
+        except Exception:
+            wd = '?'
+        moved = (btn_x0 is not None and btn_x1 is not None and abs(btn_x1 - btn_x0) > 5)
+        log_info(f"[worker][dbg] 未捕获 fverify: 按钮移动={moved}(x {btn_x0}->{btn_x1}) navigator.webdriver={wd} "
+                 f"(移动=True→多半数美判机器人不下发校验,需隐身/真Chrome;移动=False→拖拽未生效)")
         return None, None
     body = pkt.response.body if isinstance(pkt.response.body, str) else str(pkt.response.body)
     risk = re.search(r'riskLevel"\s*:\s*"(\w+)"', body)
@@ -239,6 +272,7 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='
     # Linux 服务器(尤其 root)起 Chrome 必需；mac 下也无害
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-dev-shm-usage')  # 容器 /dev/shm 太小会崩
+    co.set_argument('--disable-blink-features=AutomationControlled')  # 去自动化标记,navigator.webdriver 不为 true(数美 bot 检测常命中点)
     if headless:
         co.set_argument('--headless=new')  # 新无头(扩展/服务器都更稳)
         co.set_argument('--disable-gpu')
@@ -255,20 +289,44 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='
             log_info(f"[worker] 浏览器走白名单代理 {proxy_parts['host']}:{proxy_parts['port']}")
     page = ChromiumPage(co)
     try:
+        # 页面加载超时设短：坏/慢代理上 page.get 默认会死等~2min，改 30s 快速失败→账号回队列换新代理重来
+        try:
+            page.set.timeouts(page_load=30)
+            page.set.load_mode.eager()  # DOMContentLoaded 即返回，不等全部资源(SDK能更早就绪)
+        except Exception:
+            pass
         try:
             page.get(SM_URL)
         except Exception as e:
             log_info(f"[worker][dbg] 打开数美页面失败(代理/网络不通?): {e}")
             _dbg_dump(page, f'{tag}_openfail')
             return None
-        time.sleep(2)
+        deadline = time.time() + 155  # 短效代理 ~180s TTL：整个过滑块(加载+5次重试)155s 内完成，留余量
+        # 等数美 SDK 注入 window.deliverNativeParams 再调用（慢代理/Pi 上 SDK 加载慢，sleep 死等会 is not a function）
+        ok = False
+        _t0 = time.time()
+        while time.time() - _t0 < 15:
+            try:
+                if page.run_js('return typeof window.deliverNativeParams === "function"'):
+                    ok = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.4)
+        if not ok:
+            log_info("[worker][dbg] deliverNativeParams 15s 未就绪（SDK 没加载完/页面没正常加载/代理慢）")
+            _dbg_dump(page, f'{tag}_nodeliver')
+            return None
         page.run_js(DELIVER_JS)
-        time.sleep(5)
+        time.sleep(3)
         # 首屏取证：确认滑块是否真的渲染出来（服务器上常见就是根本没出滑块）
         if not page.ele('.shumei_captcha_slide_btn', timeout=8):
             log_info("[worker][dbg] 首屏 8s 未出现滑块按钮，dump 现场")
             _dbg_dump(page, f'{tag}_noslider')
         for i in range(1, max_try + 1):
+            if time.time() > deadline:
+                log_info(f"[worker] 已达 155s 总时限，停止重试（短效代理将过期），已尝试 {i-1} 次")
+                break
             if on_beat:
                 try:
                     on_beat()  # 过滑块每次尝试上报心跳（最耗时段，避免被判僵尸）

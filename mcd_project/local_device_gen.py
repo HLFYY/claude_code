@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """local_device_gen.py —— 本地纯 HTTP 造数美设备(不用真机/frida)。
 
-原理:一份真机 hook 来的 shortbox 模板(shumei_shortbox_template.json),替换身份字段
+原理:一份真机 hook 来的 shortbox 模板(device_templates/ 下,见 ACTIVE_TEMPLATE),替换身份字段
      (android_id/机型/时间) → mcd_shumei_d.make_box 打包 → POST 数美注册接口 → 拿 B+smid。
      shortbox 不含硬件根字段(a84 等),故可批量造独立设备,绕开真机 706070 的物理机累计。
 供 device_pool_redis.refill(build_mode='local') 调用;每台走新神龙短效代理注册。
@@ -21,10 +21,13 @@ import utils
 import mcd_api
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 干净 shortbox 模板:来自能过风控的多多云手机(2026-10-21 hook)。
-# 实测:用它本地造的 d 发码得 420(出滑块可过);旧 Pixel 模板(shumei_shortbox_template.json)则 706070。
-_TPL_NAME = 'shumei_shortbox_template_cloud.json'
-TEMPLATE = json.load(open(os.path.join(HERE, _TPL_NAME), encoding='utf-8'))
+# 设备模板统一放 device_templates/,命名「类型_设备_日期.json」(如 shortbox_MOA-AL00_20261021.json)。
+# ACTIVE_TEMPLATE = 当前使用的干净 shortbox;换新云手机 hook 到新模板后,改这里指向新文件即可。
+# ⚠️ 一份模板只配少量号:a2/a97 是数美「每次注册唯一」的现签 token,复用一份灌多台会被识别为克隆→整组连坐封。
+#    详见 ../mcd/docs/踩坑与结论日志.md(a2/a97、706070 批量封号根源)。
+TEMPLATE_DIR = os.path.join(HERE, 'device_templates')
+ACTIVE_TEMPLATE = 'shortbox_STK-AL00_20261022.json'  # 当前干净模板(MOA-AL00 已烧)
+TEMPLATE = json.load(open(os.path.join(TEMPLATE_DIR, ACTIVE_TEMPLATE), encoding='utf-8'))
 
 REGISTER_URL = "https://fp-it.fengkongcloud.com/deviceprofile/v4"
 REGISTER_HEADERS = {
@@ -48,6 +51,16 @@ def gen_shortbox():
     box['a125'] = {"fit": base, "lut": base + random.randint(0, 30 * 86400) * 1000}  # 安装/更新时间
     if 'a103' in box:
         box['a103'] = str(uuid.uuid4())                  # 每安装唯一 uuid(云模板带, 逐台刷新)
+    # 跨设备实测会变的字段也逐台伪造,让每台更独立(减少被归为一组的概率)。取值按两台干净机观测范围。
+    # ⚠️ a2/a97 是数美现签 token、随机会 706070,无法伪造;这是本地造的天花板(复用同一 a2 会碰撞连坐)。
+    if 'a4' in box:   box['a4'] = str(random.randint(1, 9))                 # SDK 调用计数之类
+    if 'a60' in box:  box['a60'] = 'u0_a' + str(random.randint(100, 250))  # app 的 Linux UID(每安装不同)
+    if 'a127' in box: box['a127'] = random.randint(100, 2000)
+    if 'a133' in box: box['a133'] = random.randint(100, 3000)
+    if 'a167' in box:                                                       # a167==a168(观测),保持相等
+        v = random.randint(500000, 2000000)
+        box['a167'] = v
+        box['a168'] = v
     return box, m
 
 
@@ -55,6 +68,7 @@ def new_short_proxy(tries=3):
     """提一个神龙短效代理(随机支持城市,每次新)。返回 (proxies_dict, 'city/ip:port') 或 (None, None)。"""
     for _ in range(tries):
         city = random.choice(list(utils.config.SHENLONG_SUPPORTED))
+        city = '上海'
         ips = utils.extract_short_proxy_by_city(city, count=1)
         if ips:
             p = ips[0]

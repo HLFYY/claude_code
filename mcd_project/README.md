@@ -2,6 +2,10 @@
 
 一个完整的麦当劳中国 App API 逆向工程项目，实现了从登录、选店、点餐到支付的完整下单流程。
 
+> 📒 **踩坑与结论日志**：`../mcd/docs/踩坑与结论日志.md` ——
+> 记录每次测试遇到的问题、排查过程、最终结论和解法（706070 根因、a2/a97 封号根源、云手机 hook/ddyun 隧道坑、滑块失败、签名版本锁、mitm 等）。
+> **开工前先查它的"快速索引"**，避免重复踩已验证过的坑；每完成一轮测试/排查，请往对应主题追加一条。
+
 ## 项目特性
 
 ✅ **完整的三步流程**
@@ -486,7 +490,24 @@ $PY device_pool_redis.py stats
 > 完整方法/用法见 `../mcd/tools/frida/云手机dumpbox用法.md`;连接见 `../mcd/docs/Mac连接Windows共享adb手机.md`。
 >
 > **★结论(2026-10-21 实测)**:706070 根因是 **d 的设备信誉**,不是 IP。换上这份干净云模板后,**本地造的 d 发码得 420(出滑块可过),不再 706070**;神龙代理 IP 无关。`local_device_gen.TEMPLATE` 已默认切到 `shumei_shortbox_template_cloud.json`。
-> ⚠️ 签名版本坑:我们的密钥 `V4AK=HJ7..` 属 **7.0.41.0**,`v`/`p` 必须保持 `7.0.41.0`/`102`(声明 43.1 会被网关 403,因无 5DLU 密钥);`biz_scenario=500/biz_from=1011` 不参与签名,已对齐真机。
+> ⚠️ 签名版本坑:我们的密钥 `V4AK=HJ7..` 属 **7.0.41.0**,`v`/`p` 必须保持 `7.0.41.0`/`102`(声明 43.1 会被网关 403,因无 5DLU 密钥)。
+
+### biz_scenario/biz_from 按接口对齐(2026-10-21 全流程抓包)
+
+mitm 抓真机完整下单流程(`mcd/tools/mitm/mitm_mcd.py` + `compare_capture.py`)发现:真机每个接口的 `biz_scenario`/`biz_from` **按页面/业务分**,我们原来全写死 `102/1006` 是指纹破绽。已在 `mcd_api.BIZ_MAP` 按 path 对齐,`build_headers` 不传 biz 时自动查表:
+
+| 接口 | biz_scenario/biz_from |
+|---|---|
+| passport/login/mobile | 500/1004 |
+| passport/verifyCode/sms/send | 500/1011 |
+| store/cities | 100/1002 ·· store/stores 103/1013 ·· vicinity 103/1012 ·· stores/{id} 101/1004 |
+| spc/menu 101/1009 ·· products/detail/{code} | 101/1001 |
+| cart/carts | 101/1007 |
+| order/confirmation/validationinfo 200/1004 ·· promotion 202/1020 ·· rightcard 202/1019 | |
+| store/getNearest/{id} 202/1021 ·· order/orders | 202/1012 |
+| cashier/channels 501/1001 ·· cashier/preorder | 501/1002 |
+
+biz_* 不参与 HMAC,安全可改。`v`/`p`(签名头)因密钥锁定仍保持 7.0.41.0/102。
 
 ### 产出(实测)
 

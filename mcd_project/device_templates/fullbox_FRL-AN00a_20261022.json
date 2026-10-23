@@ -1,0 +1,140 @@
+{
+ "a1": "all",
+ "a4": "2",
+ "a2": "QwDzZHBJNx6itOkCIZRpAY9PUFBzCXMGAospU16BXM9Sq9SNwCv3lapMR0469hZzf+qTFgFmBfrFm40oEQi8Ug==",
+ "a6": "android",
+ "a9": 1792641645090,
+ "a10": "10",
+ "a7": "3.17.0",
+ "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+ "a64": {
+  "suc": "1",
+  "enable": "1",
+  "service": [
+   "com.android.tv/.ToolAccessibilityService"
+  ]
+ },
+ "a56": "O=McDonalds, L=Oak Brook, ST=IL, C=US",
+ "a45": "46001",
+ "a131": "cn",
+ "a72": {
+  "temp": 259,
+  "vol": 4117,
+  "level": 96,
+  "scale": 100,
+  "status": 4
+ },
+ "a15": "false",
+ "a18": {
+  "ro.boot.hardware": "mt6853",
+  "gsm.sim.state": "LOADED",
+  "gsm.operator.alpha": "China Unicom",
+  "sys.usb.state": "mtp",
+  "ro.debuggable": "0"
+ },
+ "a19": "40:fe:95:51:c2:74",
+ "a24": "a688b9c80573f2b5",
+ "a29": "MOLY.NR15.R3.TC3.PR3.SP.V1.0.5.P49,MOLY.NR15.R3.TC3.PR3.SP.V1.0.5.P49",
+ "a11": "default",
+ "a57": 932402847,
+ "a60": "u0_a104",
+ "a63": [
+  "InputMethodInfo{com.sohu.inputmethod.sogou/.SogouIME, settings: com.sohu.inputmethod.sogou.SogouIMESettingsLauncher}",
+  "InputMethodInfo{com.android.inputmethod/com.lbd.ddyime.ime.SoftKeyboard, settings: com.lbd.ddyime.ime.ImePreferences}"
+ ],
+ "a31": "10.2.165.118",
+ "a34": 2208000,
+ "a36": "720,1280,320",
+ "a32": 8,
+ "a46": {
+  "cpu_abi": "arm64-v8a",
+  "fingerprint": "HUAWEI/FRLM-AN00a/HWFRL-M:10/HUAWEIFRL-AN00a/103.0.0.165C00:user/release-keys",
+  "radioVersion": "MOLY.NR15.R3.TC3.PR3.SP.V1.0.5.P49,MOLY.NR15.R3.TC3.PR3.SP.V1.0.5.P49",
+  "model": "FRL-AN00a",
+  "cpu_abi2": "",
+  "brand": "HUAWEI",
+  "board": "FRLM",
+  "manufacturer": "HUAWEI"
+ },
+ "a48": 4294967296,
+ "a37": 102,
+ "a38": "7.0.43.1",
+ "a44": "WIFI",
+ "a39": "com.mcdonalds.gma.cn",
+ "a40": 1792405879285,
+ "a144": "15:38;154:55;102:113;159:77;60:41;97:72;115:34;",
+ "a132": "cn",
+ "a135": 0,
+ "a136": "build1",
+ "a139": 0,
+ "a142": 1,
+ "a133": 288,
+ "a30": "\"HUAWEI_79CP\"",
+ "a70": 34555838464,
+ "a71": 37729304576,
+ "a69": 32606326784,
+ "a73": 0,
+ "a75": 0,
+ "a74": 0,
+ "a113": 0,
+ "a85": [
+  "bootId",
+  "tel",
+  "sensor",
+  "gps",
+  "apps"
+ ],
+ "a164": 0,
+ "a167": 1574500,
+ "a157": 0,
+ "a171": 235765973,
+ "a168": 1574500,
+ "a172": {
+  "s": "4355;",
+  "n": "Game China Virtual Input Device.1;"
+ },
+ "a170": 235765973,
+ "a117": false,
+ "a120": {
+  "tt": 27265551,
+  "mr": 0,
+  "tr": 299300576,
+  "mt": 0
+ },
+ "a121": 0,
+ "a125": {
+  "fit": 1792641258293,
+  "lut": 1792641258293
+ },
+ "a126": "BQwDzZHBJNx6itOkCIZRpAY9PUFBzCXMGAospU16BXM9Sq9SNwCv3lapMR0469hZzf+qTFgFmBfrFm40oEQi8Ug==",
+ "a127": 888,
+ "a130": 2,
+ "a84": "qOUHa1hGKc/bKAWqKfsX9WYw8guxspUE/eDap/LzPj8=___",
+ "a80": "1792641644550-48267",
+ "a83": "1101111",
+ "a96": "qvdTr7A9k1DIU04ha4eP",
+ "a93": 1,
+ "a97": "QwDzZHBJNx6itOkCIZRpAY9PUFBzCXMGAospU16BXM9Sq9SNwCv3lapMR0469hZzf+qTFgFmBfrFm40oEQi8Ug==",
+ "a103": "981cfd62-305f-4c5a-91f0-19d38bc08da1",
+ "a86": "1101010",
+ "a90": 33,
+ "a92": "720,1280",
+ "a88": "locateServiceName:android.os.BinderProxy|phoneServiceName:android.os.BinderProxy",
+ "a155": 0,
+ "a141": 0,
+ "a154": {
+  "ver": "2.2.201",
+  "label": "Launcher3",
+  "pkg": "com.android.launcher2"
+ },
+ "a163": "df0387c03d8d40e28fe078e312d49608",
+ "a165": 0,
+ "a160": 0,
+ "a161": 0,
+ "a162": [
+  "hu"
+ ],
+ "a173": 10,
+ "a175": 14631,
+ "a174": 0
+}

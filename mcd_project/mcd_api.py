@@ -17,6 +17,7 @@ import uuid
 import json
 import time
 import random
+import re
 from urllib.parse import quote
 
 import requests
@@ -55,6 +56,54 @@ SIGNED_HEADERS = ['ct', 'language', 'p', 'sid', 'sv', 'token', 'v', 'x-mcd-gw-v'
 # API 端点
 API_BASE = 'https://api.mcd.cn'
 API2_BASE = 'https://api2.mcd.cn'
+
+# 各接口的 biz_scenario / biz_from（真机抓包实测，2026-10-21）。
+# biz_* 不参与 HMAC 签名，但标识来源页面；写死 102/1006 是指纹破绽，按 path 对齐真机。
+# key = 规整后的 path（数字 id / detail code 用占位）。未命中则用默认 ('102','1006')。
+BIZ_MAP = {
+    '/bff/passport/verifyCode/sms/send': ('500', '1011'),
+    '/bff/passport/login/mobile': ('500', '1004'),
+    '/bff/passport/login/session/refresh': ('500', '1020'),
+    '/bff/store/cities': ('100', '1002'),
+    '/bff/store/cities/group': ('103', '1007'),
+    '/bff/store/stores': ('103', '1013'),
+    '/bff/store/stores/vicinity': ('103', '1012'),
+    '/bff/store/stores/hottags': ('103', '1014'),
+    '/bff/store/stores/{id}': ('101', '1004'),
+    '/bff/store/stores/getNearest/{id}': ('202', '1021'),
+    '/bff/spc/menu': ('101', '1009'),
+    '/bff/spc/menu/campaign': ('101', '1009'),
+    '/bff/spc/frequent': ('101', '1009'),
+    '/bff/spc/products/detail/{code}': ('101', '1001'),
+    '/bff/cart/carts': ('101', '1007'),
+    '/bff/promotion/coupons/card': ('101', '1007'),
+    '/bff/promotion/price/calculate/product': ('101', '1001'),
+    '/bff/order/confirmation/validationinfo': ('200', '1004'),
+    '/bff/order/confirmation/promotion': ('202', '1020'),
+    '/bff/order/confirmation/addon': ('202', '1012'),
+    '/bff/order/confirmation/rightcard': ('202', '1019'),
+    '/bff/order/orders': ('202', '1012'),
+    '/bff/cashier/channels': ('501', '1001'),
+    '/bff/cashier/preorder': ('501', '1002'),
+    '/bff/member/device/collect': ('100', '1020'),
+    '/bff/member/user/portal/v2': ('100', '1027'),
+    '/bff/common/proxy/tid': ('100', '1002'),
+}
+_BIZ_DEFAULT = ('102', '1006')
+
+
+def _norm_path(path):
+    """把 path 里的数字 id / 商品 code 规整成占位,用于 BIZ_MAP 查表。"""
+    p = (path or '').split('?')[0]
+    p = re.sub(r'/getNearest/[^/]+', '/getNearest/{id}', p)
+    p = re.sub(r'/detail/[^/]+', '/detail/{code}', p)
+    p = re.sub(r'/stores/\d+$', '/stores/{id}', p)
+    return p
+
+
+def biz_for(path):
+    """按 path 返回真机 (biz_scenario, biz_from);未命中用默认。"""
+    return BIZ_MAP.get(_norm_path(path), _BIZ_DEFAULT)
 
 # 当前请求的数美设备指纹 d（按请求隔离，LoginManager 加载凭证后设置；build_headers 兜底使用）
 import contextvars
@@ -268,7 +317,7 @@ def generate_x_hmac_digest(body, sign_key):
 
 
 def build_headers(token, sid='', body=None, method='GET', path='/', query_params=None,
-                  tid='', st=None, nonce=None, d='', biz_scenario='102', biz_from='1006'):
+                  tid='', st=None, nonce=None, d='', biz_scenario=None, biz_from=None):
     """
     构建完整的请求头
 
@@ -300,7 +349,7 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         'sid': sid,
         'sv': 'v4',
         'token': token,
-        'v': '7.0.41.0',
+        'v': '7.0.41.0',   # 必须与访问密钥 V4AK(HJ7..=7.0.41.0版) 匹配; 声明43.1会被网关拒(我们无5DLU密钥)
         'x-mcd-gw-v': '1',
     }
 
@@ -321,6 +370,12 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
     d = d or _active_d.get()
     # 未显式传 tid 时，用当前请求设置的 tid（Token 激活返回，真机登录场景带）
     tid = tid or _active_tid.get()
+
+    # biz_scenario / biz_from：未显式传则按 path 对齐真机（见 BIZ_MAP）
+    if biz_scenario is None or biz_from is None:
+        _bs, _bf = biz_for(path)
+        biz_scenario = biz_scenario if biz_scenario is not None else _bs
+        biz_from = biz_from if biz_from is not None else _bf
 
     # st / nonce（非签名头，默认自动生成，模拟真机）
     st_val = str(st if st is not None else int(time.time()))
@@ -419,7 +474,7 @@ def send_verification_code(phone, token, proxies=None):
     }
     body_str = json.dumps(body_data, separators=(',', ':'))
 
-    # 构建请求头（POST 请求到 API2，需传递 body 和 path）
+    # 构建请求头（POST 请求到 API2；biz 由 BIZ_MAP 按 path 自动对齐真机 = 500/1011）
     path = '/bff/passport/verifyCode/sms/send'
     headers = build_headers(token, sid='', body=body_str, method='POST', path=path)
     headers['Host'] = 'api2.mcd.cn'
@@ -462,7 +517,7 @@ def login(phone, verify_code, token, proxies=None):
     }
     body_str = json.dumps(body_data, separators=(',', ':'))
 
-    # 构建请求头（POST 请求到 API2，需传递 method 和 path）
+    # 构建请求头（POST 请求到 API2；biz 由 BIZ_MAP 按 path 自动对齐真机 = 500/1004）
     path = '/bff/passport/login/mobile'
     headers = build_headers(token, sid='', body=body_str, method='POST', path=path)
     headers['Host'] = 'api2.mcd.cn'
