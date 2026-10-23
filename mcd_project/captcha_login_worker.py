@@ -261,11 +261,38 @@ def make_proxy_auth_extension(host, port, user, pwd):
     return d
 
 
+# Windows 下浏览器候选：优先 Chrome，退回 Edge（同为 Chromium 内核，DrissionPage 可直接驱动）
+# 可用环境变量 MCD_BROWSER_PATH 强制指定，优先级最高
+_BROWSER_CANDIDATES = [
+    (r'C:\Program Files\Google\Chrome\Application\chrome.exe', 'Chrome'),
+    (r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe', 'Chrome'),
+    (r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe', 'Edge'),
+    (r'C:\Program Files\Microsoft\Edge\Application\msedge.exe', 'Edge'),
+]
+
+
+def resolve_browser_path():
+    """返回 (exe_path, 显示名)。exe_path 为 None 表示交给 DrissionPage 自己找（Mac/Linux）。"""
+    env = os.environ.get('MCD_BROWSER_PATH', '').strip()
+    if env:
+        return env, ('Edge' if 'msedge' in env.lower() else 'Chrome(自定义)')
+    if os.name != 'nt':
+        return None, 'Chrome(自动查找)'
+    for p, name in _BROWSER_CANDIDATES:
+        if os.path.isfile(p):
+            return p, name
+    return None, 'Chrome(自动查找)'
+
+
 def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='sm'):
     """proxy_parts: {host,port,user,pwd} 或 None。
     有账密且 PROXY_BROWSER_AUTH=True → 动态扩展带账密；否则白名单(只用 IP:端口)。
     tag: 失败截图/HTML 文件名前缀（一般传 phone），便于服务器上定位现场。"""
     co = ChromiumOptions()
+    _bp, _bname = resolve_browser_path()
+    if _bp:
+        co.set_browser_path(_bp)
+    log_info(f"[worker] 浏览器: {_bname}" + (f" -> {_bp}" if _bp else ""))
     co.auto_port(True)  # 独立端口+临时用户目录，避免连到残留浏览器
     ext_dir = None
     use_ext = bool(proxy_parts and proxy_parts.get('user') and PROXY_BROWSER_AUTH)
