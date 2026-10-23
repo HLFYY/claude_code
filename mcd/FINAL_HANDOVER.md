@@ -66,6 +66,15 @@ cat mcd_project/login_manager.py
 - ✅ **查询账号数据** - `GET /api/accounts`（传 phone 查单个、不传查全部，返回凭证 value 列表）
 - ✅ **客户端** - `run_api_client.py` 加 `SEND_LOCATION` 开关（True 带省市/False 不带）+ `PROXY_SOURCE` 常量选代理源（zdtps/shenlong，测不同代理）+ 省份默认江苏、城市默认南京
 - ✅ **Redis 同步脚本** - `mcd/tools/sync_redis_online_to_local.py`：线上 mcd*/mkt* 单向同步到本地（只读线上，写死方向，禁止反向）
+
+**🎉 v2.1 续：麦金卡开通（电商下单）+ 凭证/白名单加固** (2026-10-23)
+- ✅ **开通链路** - 规格 `GET /bff/myrewards/benefit/detail/spec/106`(skuId 17690/12534/12535/12536) → 下单 `POST /bff/ectrade/order/create`（返 **420 → 过数美滑块 → 带 `x-mcd-sec-verify` 重试**，与发码**完全同机制**）→ `cashier/channels`+`cashier/preorder` 出支付宝/微信支付参数
+- ✅ **异步化** - `POST /api/member/open` 入队 → `captcha_login_worker`（与发码**同一队列同一 worker，按 `payload.type` 串行过滑块**，滑块常重试 4-5 次故异步）→ 轮询 `GET /api/member/open_status`(done 带 orderId/payId)
+- ✅ **mcd_api** - `get_member_benefit_spec` / `ectrade_order_create`(底层,支持 `sec_verify`) / `create_ectrade_order`；`get_payment_channels` 加 `shop_id`、`create_payment` 加 `order_id`/`shop_id`（麦金卡 `source=1`）
+- ✅ **客户端** - `python run_api_client.py mcgold`（选套餐→开通→支付宝数据）；`parse_order_item` 统一解析 `omsOrder`(餐品)/`ecsOrder`(麦金卡)，`payment new` 也兼容麦金卡最新单
+- ✅ **凭证铁律** - 登录失败/状态失效**只更新 checked_at/check_status，绝不删凭证、不清空 token/sid**；修复 worker 重发码 `save_credentials(token,None,None)` 会清空 sid 的隐患（None/空=保留原值）；`clear_credentials` 已禁用删除
+- ✅ **zdtps 白名单** - server(start_gunicorn 启动前一次)/worker(启动)自动"先查再加"本机出口 IP；短效代理提取失败自愈再加一次（换网不重启也能恢复）
+- ⚠️ 关键坑：业务签名请求**绕系统代理**,mitm 抓不到下单(用 Charles);`6000232`=设备 d 脏;详见 `docs/踩坑与结论日志.md` 八、九节
 - 📄 接口详情见 `mcd_project/麦当劳API接口文档.md`（v2.1 已更新）
 
 **完整三步流程**：

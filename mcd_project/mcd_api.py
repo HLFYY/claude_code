@@ -1301,7 +1301,90 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         return False, {}, message
 
 
-def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, proxies=None):
+def get_member_benefit_spec(token, sid, benefit_id=106, scene=0, proxies=None):
+    """
+    获取麦金卡(付费会员)开通规格 (GET /bff/myrewards/benefit/detail/spec/{benefit_id})。
+
+    Args:
+        token/sid: 鉴权
+        benefit_id: 权益/活动 id（麦金卡=106，真机抓包实测）
+        scene: 场景，默认 0
+        proxies: 代理
+
+    Returns:
+        (success, data, message)。data.skuDetails 为各套餐:
+        skuId 17690=15天9.9 / 12534=30天19 / 12535=90天39 / 12536=365天118；另含 shopId、openRules 等。
+    """
+    path = f'/bff/myrewards/benefit/detail/spec/{benefit_id}'
+    params = {'scene': str(scene)}
+    headers = build_headers(token, sid=sid, body='', method='GET', path=path, query_params=params)
+    url = f'{API_BASE}{path}'
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
+    if success:
+        return True, data, "获取麦金卡规格成功"
+    return False, {}, message
+
+
+def ectrade_order_create(token, sid, mcd_id, sku_id, city_code='310100', shop_id=1,
+                         count=1, scene=1, execute_type=1, gift=0, sec_kill=0,
+                         pre_commit_no=None, sec_verify=None, proxies=None):
+    """
+    低层:发一次 /bff/ectrade/order/create,返回【完整响应 json(dict)】。
+    - 成功: {"success":true,"data":{"orderId","payId",...}}
+    - 需过滑块: {"success":false,"code":420,"data":{"securityContext":{"punishId","verifyType","verifySdk"}}}
+    - 设备风控: {"success":false,"code":6000232,"message":"账号环境存在异常"}
+    sec_verify: 过滑块后拼的 x-mcd-sec-verify(base64(punishId;verifySdk;ts;rid)),重试时带。
+    每次调用自动用新 preCommitNo(未显式传时),符合真机"重试换号"规则。
+    """
+    if not pre_commit_no:
+        pre_commit_no = f"{mcd_id}{int(time.time() * 1000)}"
+    body_data = {
+        "cityCode": str(city_code),
+        "goods": [{"count": int(count), "skuId": int(sku_id)}],
+        "preCommitNo": pre_commit_no,
+        "shopId": int(shop_id),
+        "scene": int(scene),
+        "executeType": int(execute_type),
+        "gift": int(gift),
+        "secKill": int(sec_kill),
+    }
+    body_str = json.dumps(body_data, separators=(',', ':'))
+    path = '/bff/ectrade/order/create'
+    headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path)
+    if sec_verify:
+        headers['x-mcd-sec-verify'] = sec_verify
+    url = f'{API_BASE}{path}'
+    try:
+        return requests.post(url, headers=headers, data=body_str, proxies=proxies,
+                             timeout=PROXY_REQUEST_TIMEOUT).json()
+    except Exception as e:
+        return {'success': False, 'code': -1, 'message': f'请求异常: {str(e)}'}
+
+
+def create_ectrade_order(token, sid, mcd_id, sku_id, city_code='310100', shop_id=1,
+                         count=1, scene=1, execute_type=1, gift=0, sec_kill=0,
+                         pre_commit_no=None, sec_verify=None, proxies=None):
+    """
+    电商下单 / 开通麦金卡 (POST /bff/ectrade/order/create) —— 发【一次】,不自动过滑块。
+
+    开通麦金卡: sku_id 取 get_member_benefit_spec 的套餐(如 17690=15天9.9)。成功返回 orderId/payId,
+    再走 get_payment_channels + create_payment 支付。若返回 420(data.securityContext)需过滑块后带
+    sec_verify 重试 —— 全自动过滑块的开通走服务端 /api/member/open(见 mcd_server)。
+
+    Returns:
+        (success, data, message)。420/风控时 success=False,data 仍带 securityContext,message 带 code。
+    """
+    r = ectrade_order_create(token, sid, mcd_id, sku_id, city_code=city_code, shop_id=shop_id,
+                             count=count, scene=scene, execute_type=execute_type, gift=gift,
+                             sec_kill=sec_kill, pre_commit_no=pre_commit_no, sec_verify=sec_verify,
+                             proxies=proxies)
+    data = r.get('data') or {}
+    if r.get('success'):
+        return True, data, r.get('message', '麦金卡下单成功')
+    return False, data, f"{r.get('code', '')}, {r.get('message', '')}"
+
+
+def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, shop_id=None, proxies=None):
     """
     获取支付渠道 (对应 curl: /bff/cashier/channels)
 
@@ -1311,7 +1394,8 @@ def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, proxies
         order_id: 订单ID
         pay_id: 支付ID
         mcd_id: 麦当劳用户ID (meddyId)
-        source: 来源 (默认0)
+        source: 来源 (普通下单 0；麦金卡/电商 1)
+        shop_id: 店铺/活动 shopId(麦金卡=1；传了才带,并附空 lastPayChannel,对齐真机)
         proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
@@ -1323,6 +1407,9 @@ def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, proxies
         'mcdId': mcd_id,
         'source': str(source)
     }
+    if shop_id is not None and str(shop_id) != '':
+        params['shopId'] = str(shop_id)
+        params['lastPayChannel'] = ''
     headers = build_headers(token, sid=sid, body='', method='GET', path='/bff/cashier/channels', query_params=params)
     url = f'{API_BASE}/bff/cashier/channels'
 
@@ -1334,7 +1421,8 @@ def get_payment_channels(token, sid, order_id, pay_id, mcd_id, source=0, proxies
         return False, {}, message
 
 
-def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, source=0, proxies=None):
+def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, source=0,
+                   order_id=None, shop_id=None, proxies=None):
     """
     创建支付订单 (对应 curl: /bff/cashier/preorder)
 
@@ -1344,11 +1432,13 @@ def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, so
         pay_id: 支付ID
         pay_channel: 支付渠道 (ALI=支付宝, WX=微信, UNION=银联)
         free_pay_flg: 是否免密支付
-        source: 来源 (默认0)
+        source: 来源 (普通下单 0；麦金卡/电商 1)
+        order_id: 订单ID(麦金卡 preorder 需带；传了才加)
+        shop_id: 店铺/活动 shopId(麦金卡=1；传了才加,字符串形式对齐真机)
         proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
-        (success, payment_data, message)
+        (success, payment_data, message)。data.channelPayData 为支付宝/微信拉起参数。
     """
     body_data = {
         "freePayFlg": free_pay_flg,
@@ -1356,6 +1446,10 @@ def create_payment(token, sid, pay_id, pay_channel='ALI', free_pay_flg=False, so
         "payId": pay_id,
         "source": source
     }
+    if order_id:
+        body_data["orderId"] = order_id
+    if shop_id is not None and str(shop_id) != '':
+        body_data["shopId"] = str(shop_id)
     body_str = json.dumps(body_data, separators=(',', ':'))
 
     headers = build_headers(token, sid=sid, body=body_str, method='POST', path='/bff/cashier/preorder')

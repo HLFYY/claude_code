@@ -38,9 +38,9 @@ from DrissionPage._units.actions import Actions
 from ddddocr import DdddOcr
 
 from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis, DATA_DIR
-from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, generate_token, activate_token
+from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, generate_token, activate_token, ectrade_order_create
 from login_manager import LoginManager
-from utils import log_info
+from utils import log_info, ensure_egress_whitelisted
 
 SM_URL = 'https://castatic.fengkongcloud.com/pr/v1.0.4/index.html'
 SM_ORG = 'qvdTr7A9k1DIU04ha4eP'
@@ -443,6 +443,82 @@ def handle_login(phone, city=None, force_new_device=False, headless=True,
         clear_processing(phone)  # 处理结束(成功/失败/异常)清掉该账号处理心跳
 
 
+def set_mcgold_status(phone, status, msg='', **extra):
+    """写麦金卡开通状态(queued/processing/done/failed)，done 时带 orderId/payId。"""
+    data = {'status': status, 'msg': msg, 'ts': int(time.time())}
+    data.update(extra)
+    _redis.setex(CAPTCHA_LOGIN_CONFIG['mcgold_status_key'].format(phone=phone),
+                 CAPTCHA_LOGIN_CONFIG['mcgold_status_ttl'],
+                 json.dumps(data, ensure_ascii=False))
+
+
+def handle_mcgold(payload, headless=True):
+    """
+    异步开通麦金卡/电商下单：order/create → 420 则过滑块(get_pass_rid,可内部重试4-5次)带
+    x-mcd-sec-verify 重试 → 成功写 done(orderId/payId)。与发码共用同一滑块方案。
+    """
+    phone = payload.get('phone')
+    sku_id = payload.get('sku_id')
+    shop_id = payload.get('shop_id', 1)
+    city_code = payload.get('city_code', '310100')
+    city = payload.get('city')
+    province = payload.get('province')
+    merchant_id = payload.get('merchant_id')
+    proxy_source = payload.get('proxy_source')
+    beat(phone)
+    try:
+        set_mcgold_status(phone, 'processing', '开始开通')
+        manager = LoginManager(phone, use_redis=True, city=city,
+                               province=province, merchant_id=merchant_id, proxy_source=proxy_source)
+        token, sid, mcd_id = manager.load_credentials()
+        manager.apply_location(province, city)
+        try:
+            manager.ensure_device()
+        except Exception as e:
+            log_info(f"[worker] {phone} ensure_device: {e}")
+        if not (token and sid):
+            set_mcgold_status(phone, 'failed', '未登录'); return
+        proxies = manager.get_login_proxy(is_send_code=True)  # 取新短效,滑块与下单同 IP
+        log_info(f"[worker] 麦金卡 {phone} sku_id={sku_id} shop_id={shop_id} proxy={_proxy_hp(proxies)}")
+
+        # 1) 下单；2) 命中 420 过滑块带 sec 重试(最多 2 轮外层)
+        r = ectrade_order_create(token, sid, mcd_id, sku_id, city_code=city_code,
+                                 shop_id=shop_id, proxies=proxies)
+        beat(phone)
+        for _ in range(2):
+            if r.get('success'):
+                break
+            if r.get('code') != 420:
+                break
+            sc = (r.get('data') or {}).get('securityContext', {})
+            punish_id, verify_sdk = sc.get('punishId'), sc.get('verifySdk')
+            log_info(f"[worker] 麦金卡 {phone} 命中420 punishId={punish_id} 过滑块…")
+            rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
+                               on_beat=lambda: beat(phone), tag=f'mcgold-{phone}')
+            if not rid:
+                set_mcgold_status(phone, 'failed', '滑块多次未通过'); return
+            beat(phone)
+            sec = base64.b64encode(f"{punish_id};{verify_sdk};{int(time.time()*1000)};{rid}".encode()).decode()
+            r = ectrade_order_create(token, sid, mcd_id, sku_id, city_code=city_code,
+                                     shop_id=shop_id, sec_verify=sec, proxies=proxies)
+            beat(phone)
+
+        if r.get('success'):
+            d = r.get('data') or {}
+            set_mcgold_status(phone, 'done', '开通下单成功',
+                              orderId=d.get('orderId'), payId=d.get('payId'))
+            log_info(f"[worker] 麦金卡 {phone} 成功 orderId={d.get('orderId')} payId={d.get('payId')}")
+        else:
+            set_mcgold_status(phone, 'failed', f"{r.get('code')}:{r.get('message')}")
+            log_info(f"[worker] 麦金卡 {phone} 失败 {r.get('code')}:{r.get('message')}")
+    except Exception as e:
+        import traceback
+        log_info(f"[worker] 麦金卡 {phone} 异常: {traceback.format_exc()}")
+        set_mcgold_status(phone, 'failed', f'异常:{e}')
+    finally:
+        clear_processing(phone)
+
+
 # ---------- 主循环 ----------
 def main():
     # 默认按环境：本机开发有头(方便看)、线上服务器无头；--show / --headless 手动覆盖
@@ -452,6 +528,10 @@ def main():
     if '--headless' in sys.argv:
         headless = True
     log_info(f"[worker] 启动，IS_LOCAL={IS_LOCAL} USE_PROXY={USE_PROXY} headless={headless}，监听 {CAPTCHA_LOGIN_CONFIG['queue_key']}")
+    try:
+        ensure_egress_whitelisted()  # 启动自动把本机出口IP加进 zdtps 白名单(多出口全加),免代理407
+    except Exception as e:
+        log_info(f"[worker] 自动加白名单跳过: {e}")
     cleanup_zombie_freezes()  # 启动清理上次崩溃残留的僵尸冻结
     while True:
         touch_worker_alive()  # 每轮上报全局心跳（含空闲），BLPOP 超时短，保证及时刷新
@@ -465,18 +545,25 @@ def main():
         phone = payload.get('phone')
         if not phone:
             continue
-        log_info(f"[worker] 取到任务 {phone} city={payload.get('city')} "
+        task = payload.get('type', 'login')   # 同队列按 type 分发：login(发码) / mcgold(开通麦金卡)
+        log_info(f"[worker] 取到任务 type={task} {phone} city={payload.get('city')} "
                  f"province={payload.get('province')} merchant_id={payload.get('merchant_id')} "
                  f"proxy_source={payload.get('proxy_source')}")
         try:
-            handle_login(phone, city=payload.get('city'),
-                         force_new_device=payload.get('force_new_device', False), headless=headless,
-                         province=payload.get('province'), merchant_id=payload.get('merchant_id'),
-                         proxy_source=payload.get('proxy_source'))
+            if task == 'mcgold':
+                handle_mcgold(payload, headless=headless)
+            else:
+                handle_login(phone, city=payload.get('city'),
+                             force_new_device=payload.get('force_new_device', False), headless=headless,
+                             province=payload.get('province'), merchant_id=payload.get('merchant_id'),
+                             proxy_source=payload.get('proxy_source'))
         except Exception as e:
             import traceback
             log_info(f"[worker] {phone} 异常: {traceback.format_exc()}")
-            set_status(phone, 'failed', f'异常:{e}'); unfreeze(phone)
+            if task == 'mcgold':
+                set_mcgold_status(phone, 'failed', f'异常:{e}')
+            else:
+                set_status(phone, 'failed', f'异常:{e}'); unfreeze(phone)
 
 
 if __name__ == '__main__':

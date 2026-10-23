@@ -123,6 +123,30 @@
 
 响应：`{"success": true, "data": [ {"phone":"...","sid":"...","check_status":"valid",...} ], "total": N}`
 
+### 6. 开通麦金卡（异步，自动过滑块）（v2.1 新增）
+`POST /api/member/open`
+
+入队交给 `captcha_login_worker`（与发码同一 worker、同一队列，按 `type` 分发，串行处理；worker 自动过数美滑块、420 可重试多次）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| phone | string | 是 | 手机号（须已登录） |
+| sku_id | int | 是 | 套餐 skuId（见 `get_member_benefit_spec`） |
+| shop_id | int | 否 | 默认 1 |
+| city_code | string | 否 | 默认 310100 |
+| province / city / merchant_id / proxy_source | string | 否 | 见公共参数 |
+
+响应：`{"success": true, "data": {"status": "queued"}, "message": "已入队，请轮询 /api/member/open_status"}`（worker 未运行返回 503）
+
+`GET /api/member/open_status?phone=` → 轮询开通状态：
+- `{"status":"queued"}` / `{"status":"processing"}` / `{"status":"none"}`
+- 成功：`{"status":"done","orderId":"ECS...","payId":"111...","msg":"开通下单成功"}`
+- 失败：`{"status":"failed","msg":"..."}`（如滑块多次未通过、6000232 设备异常）
+
+拿到 `orderId`/`payId` 后走 `get_payment_channels`(source=1,shop_id) + `create_payment`(ALI,order_id,shop_id,source=1) 拿支付宝支付数据。客户端一条龙：`python run_api_client.py mcgold`。
+
+> 注：`/api/mcd/create_ectrade_order` 是**底层一次性**下单（不自动过滑块，返回 420 需自行处理），自动过滑块的开通走 `/api/member/open`。
+
 ---
 
 ## 二、通用接口 `/api/mcd/<function_name>`
@@ -237,6 +261,17 @@
 - 参数：`order_id`
 - 对应上游：`GET /bff/order/orders/{order_id}`
 - 响应：订单详情对象
+
+**get_member_benefit_spec** — 获取麦金卡(付费会员)开通规格（v2.1 新增）
+- 参数：`benefit_id`(默认106=麦金卡)、`scene`(默认0)
+- 对应上游：`GET /bff/myrewards/benefit/detail/spec/{benefit_id}?scene=0`
+- 响应：`data.skuDetails`（skuId 17690=15天9.9 / 12534=30天19 / 12535=90天39 / 12536=365天118）+ `shopId`、`openRules` 等
+
+**create_ectrade_order** — 电商下单 / 开通麦金卡（v2.1 新增）
+- 参数：`sku_id`(套餐 skuId，必填)、`city_code`(默认310100)、`shop_id`(默认1)、`count`(默认1)、`scene`(默认1)、`execute_type`(默认1)、`gift`(默认0)、`sec_kill`(默认0)、`pre_commit_no`(不传自动=meddyId+毫秒时间戳)；`mcd_id` 由服务端自动注入
+- 对应上游：`POST /bff/ectrade/order/create`，body `{cityCode, goods:[{count,skuId}], preCommitNo, shopId, scene, executeType, gift, secKill}`
+- 开通麦金卡 = 调本接口下单拿 orderId/payId → 再走 get_payment_channels + create_payment 支付
+- ⚠️ 设备 `d` 被风控标记会返回 `code=6000232`「账号环境存在异常」；需干净 d
 
 ### 支付
 

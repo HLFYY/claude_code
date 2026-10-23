@@ -19,12 +19,12 @@ DATA_DIR = os.path.expanduser('~/datas/mcd')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # API 配置
-# API_BASE = 'http://127.0.0.1:5001'
-API_BASE = 'http://dns.xme.fan:5001'
+API_BASE = 'http://127.0.0.1:5001'
+# API_BASE = 'http://dns.xme.fan:5001'
 # 默认配置
-DEFAULT_PHONE = '18356966159'
-DEFAULT_PROVINCE = '江苏'
-DEFAULT_CITY = '南京'
+DEFAULT_PHONE = '18019701277'
+DEFAULT_PROVINCE = '上海'
+DEFAULT_CITY = '上海'
 DEFAULT_LATITUDE = 31.026543
 DEFAULT_LONGITUDE = 121.379931
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
@@ -33,7 +33,7 @@ PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
 PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
 # True = 登录/下单请求都带上省份+城市; False = 都不带(由服务端取凭证里已绑定的省市)
-SEND_LOCATION = False
+SEND_LOCATION = True
 # 代理源:用来测不同代理。'zdtps'=站大爷 / 'shenlong'=神龙 / ''=不传(用服务端默认 zdtps)
 PROXY_SOURCE = 'zdtps'
 
@@ -802,6 +802,120 @@ def order_flow():
     print("=" * 60)
 
 
+def parse_order_item(item):
+    """统一解析订单列表项:普通餐品(omsOrder) / 麦金卡电商(ecsOrder)。
+    返回 {kind, order_id, pay_id, status, name, amount, create_time, source, shop_id}。
+    source/shop_id 供后续支付用(餐品 source=0;麦金卡电商 source=1+shopId)。"""
+    oms = item.get('omsOrder')
+    ecs = item.get('ecsOrder')
+    if oms:
+        return {'kind': 'oms', 'order_id': oms.get('orderId', ''), 'pay_id': oms.get('payId', ''),
+                'status': oms.get('orderStatus', ''), 'name': oms.get('storeName', ''),
+                'amount': oms.get('realTotalAmount', ''), 'create_time': oms.get('createTime', ''),
+                'source': 0, 'shop_id': None}
+    if ecs:
+        goods = ecs.get('goods') or []
+        gname = goods[0].get('spuName', '') if goods else ''
+        tag = ecs.get('channelTag', '')
+        name = f"{gname}@{ecs.get('shopName', '')}" + (f"（{tag}）" if tag else '')
+        return {'kind': 'ecs', 'order_id': ecs.get('orderId', ''), 'pay_id': ecs.get('payId', ''),
+                'status': ecs.get('orderStatusTitle', ecs.get('orderStatus', '')), 'name': name,
+                'amount': ecs.get('realTotalAmount', ''), 'create_time': '',
+                'source': 1, 'shop_id': ecs.get('shopId', 1)}
+    return {'kind': 'unknown', 'order_id': '', 'pay_id': '', 'status': '',
+            'name': f"未知结构 keys={list(item.keys())}", 'amount': '', 'create_time': '',
+            'source': 0, 'shop_id': None}
+
+
+def show_payment_result(phone, result):
+    """展示支付数据(支付宝/微信) + 查询最新订单列表。payment 与 mcgold 共用。result=create_payment 响应。"""
+    print(f"✅ {result.get('message', '创建成功')}")
+
+    payment_data = result.get('data', {})
+
+    print(f"\n支付信息:")
+    print(f"  订单ID: {payment_data.get('orderId', '')}")
+    print(f"  支付ID: {payment_data.get('payId', '')}")
+    print(f"  支付状态: {payment_data.get('payStatus', '')}")
+    print(f"  支付渠道: {payment_data.get('channelPayDestination', '')}")
+
+    channel_pay_data = payment_data.get('channelPayData', '')
+    if channel_pay_data:
+        print(f"\n支付数据已生成 (长度: {len(channel_pay_data)} 字符)")
+
+        try:
+            pay_data_json = json.loads(channel_pay_data)
+
+            method = pay_data_json.get('method', '')
+            biz_content_str = pay_data_json.get('biz_content', '')
+
+            if biz_content_str:
+                biz_content = json.loads(biz_content_str)
+                out_trade_no = biz_content.get('out_trade_no', '')
+                total_amount = biz_content.get('total_amount', '')
+                subject = biz_content.get('subject', '')
+
+                print(f"\n支付信息:")
+                print(f"  支付方式: {method}")
+                print(f"  商户: {subject}")
+                print(f"  金额: ¥{total_amount}")
+                print(f"  交易号: {out_trade_no}")
+
+            # 保存支付字符串
+            with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
+                f.write(channel_pay_data)
+
+            view_data = input("\n是否查看完整支付数据? (y/n): ").strip().lower()
+
+            if view_data == 'y':
+                print(f"\n完整支付数据:")
+                print(json.dumps(pay_data_json, ensure_ascii=False, indent=2))
+
+        except json.JSONDecodeError:
+            print("⚠️  无法解析支付数据")
+        except Exception as e:
+            print(f"⚠️  处理支付数据时出错: {str(e)}")
+
+    # 查询订单列表
+    print(f"\n[步骤 4] 正在查询账号订单列表...")
+    result = api_call('/api/mcd/get_order_list', params={
+        'phone': phone,
+        'cursor': '',
+        'page_size': 10
+    })
+
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取订单列表失败')}")
+    else:
+        print(f"✅ {result.get('message', '获取成功')}")
+
+        order_list_data = result.get('data', {})
+        order_list = order_list_data.get('list', [])
+        has_next = order_list_data.get('hasNext', False)
+
+        if order_list:
+            print(f"\n最近 {len(order_list)} 个订单:")
+            print("-" * 80)
+            for idx, order_item in enumerate(order_list, 1):
+                o = parse_order_item(order_item)
+                label = {'oms': '餐品', 'ecs': '麦金卡/电商'}.get(o['kind'], '未知')
+                print(f"{idx}. [{label}] 订单ID: {o['order_id']}")
+                if o['create_time']:
+                    print(f"   时间: {o['create_time']}")
+                print(f"   状态: {o['status']}")
+                print(f"   {'门店' if o['kind'] == 'oms' else '商品'}: {o['name']}")
+                print(f"   金额: ¥{o['amount']}")
+                print("-" * 80)
+
+            if has_next:
+                print("提示: 还有更多订单，可以使用分页查询")
+        else:
+            print("\n暂无订单记录")
+
+    print("\n流程结束")
+    print("=" * 60)
+
+
 def payment_flow(arg2=''):
     """支付流程"""
     print("=" * 60)
@@ -813,6 +927,8 @@ def payment_flow(arg2=''):
     phone, token, sid, meddy_id = get_login_info()
     print("✅ 登录验证通过")
 
+    # 支付维度:餐品订单 source=0;麦金卡/电商 ecsOrder source=1 + shopId
+    pay_source, pay_shop_id, is_ecs = 0, None, False
     # 如果使用已有订单
     if arg2:
         if arg2 == 'old':
@@ -840,50 +956,59 @@ def payment_flow(arg2=''):
                 print(f"✅ {result.get('message', '获取成功')}")
                 order_list_data = result.get('data', {})
                 order_list = order_list_data.get('list', [])
-                order_data = order_list[0]['omsOrder']
-                order_id = order_data['orderId']
-                pay_id = order_data['payId']
+                if not order_list:
+                    print("❌ 没有订单"); sys.exit(1)
+                o = parse_order_item(order_list[0])   # 兼容 omsOrder/ecsOrder,复用解析
+                order_id, pay_id = o['order_id'], o['pay_id']
+                pay_source, pay_shop_id = o['source'], o['shop_id']
+                is_ecs = (o['kind'] == 'ecs')
+                print(f"   最新订单[{o['kind']}]: {o['name']} 状态={o['status']} 金额=¥{o['amount']}")
+                if not (order_id and pay_id):
+                    print(f"❌ 最新订单无法解析(kind={o['kind']})"); sys.exit(1)
 
         print(f"\n✅ 已加载已有支付信息")
         print(f"   订单ID: {order_id}")
         print(f"   支付ID: {pay_id}")
 
-        # 查询订单详情
-        print(f"\n正在查询订单详情...")
-        result = api_call('/api/mcd/get_order_detail', params={
-            'phone': phone,
-            'order_id': order_id
-        })
-
-        if not result.get('success'):
-            print(f"❌ {result.get('message', '获取订单详情失败')}")
-            sys.exit(1)
-
-        print(f"✅ {result.get('message', '获取成功')}")
-        order_detail = result.get('data', {})
-
-        order_status_code = order_detail.get('orderStatusCode', '')
-        order_status = order_detail.get('orderStatus', '')
-        mp_order_status_code = order_detail.get('mpOrderStatusCode', '')
-
-        print(f"\n订单状态:")
-        print(f"  状态码: {order_status_code}")
-        print(f"  状态: {order_status}")
-        print(f"  MP状态码: {mp_order_status_code}")
-
-        if order_status_code == '1' and mp_order_status_code == '10':
-            print(f"\n✅ 订单状态为待支付，继续支付流程")
+        # 查询订单详情(仅餐品 omsOrder 有这套状态码;麦金卡 ecs 无,跳过,用列表里的状态即可)
+        if is_ecs:
+            print("   (麦金卡/电商订单,跳过餐品状态码校验,直接进入支付)")
         else:
-            if order_status_code == '7' and mp_order_status_code == '60':
-                print(f"\n❌ 订单已取消，无法继续支付")
-            elif order_status_code == '6' and mp_order_status_code == '40':
-                pickup_code = order_detail["pickupCode"]
-                print(f"\n✅ 订单状态为已完成，获取取餐码-{pickup_code}")
-            else:
-                print(f"\n⚠️  订单不是待支付状态，无法继续支付")
-                print(f"   订单状态: {order_status}")
+            print(f"\n正在查询订单详情...")
+            result = api_call('/api/mcd/get_order_detail', params={
+                'phone': phone,
+                'order_id': order_id
+            })
 
-            sys.exit(1)
+            if not result.get('success'):
+                print(f"❌ {result.get('message', '获取订单详情失败')}")
+                sys.exit(1)
+
+            print(f"✅ {result.get('message', '获取成功')}")
+            order_detail = result.get('data', {})
+
+            order_status_code = order_detail.get('orderStatusCode', '')
+            order_status = order_detail.get('orderStatus', '')
+            mp_order_status_code = order_detail.get('mpOrderStatusCode', '')
+
+            print(f"\n订单状态:")
+            print(f"  状态码: {order_status_code}")
+            print(f"  状态: {order_status}")
+            print(f"  MP状态码: {mp_order_status_code}")
+
+            if order_status_code == '1' and mp_order_status_code == '10':
+                print(f"\n✅ 订单状态为待支付，继续支付流程")
+            else:
+                if order_status_code == '7' and mp_order_status_code == '60':
+                    print(f"\n❌ 订单已取消，无法继续支付")
+                elif order_status_code == '6' and mp_order_status_code == '40':
+                    pickup_code = order_detail["pickupCode"]
+                    print(f"\n✅ 订单状态为已完成，获取取餐码-{pickup_code}")
+                else:
+                    print(f"\n⚠️  订单不是待支付状态，无法继续支付")
+                    print(f"   订单状态: {order_status}")
+
+                sys.exit(1)
 
     else:
         # 正常流程：提交订单
@@ -961,13 +1086,12 @@ def payment_flow(arg2=''):
 
         print(f"✅ 支付信息已保存到: {PAY_INFO_FILE}")
 
-    # 获取支付渠道
+    # 获取支付渠道(麦金卡/电商带 source=1 + shopId)
     print(f"\n[步骤 2] 正在获取支付渠道...")
-    result = api_call('/api/mcd/get_payment_channels', method='POST', data={
-        'phone': phone,
-        'order_id': order_id,
-        'pay_id': pay_id,
-    })
+    ch_data = {'phone': phone, 'order_id': order_id, 'pay_id': pay_id, 'source': pay_source}
+    if is_ecs:
+        ch_data['shop_id'] = pay_shop_id
+    result = api_call('/api/mcd/get_payment_channels', method='POST', data=ch_data)
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '获取支付渠道失败')}")
@@ -1005,107 +1129,113 @@ def payment_flow(arg2=''):
 
     print(f"\n已选择: {channel_name} ({channel_code})")
 
-    # 创建支付
+    # 创建支付(麦金卡/电商带 source=1 + orderId + shopId)
     print(f"\n[步骤 3] 正在创建支付订单...")
-    result = api_call('/api/mcd/create_payment', method='POST', data={
-        'phone': phone,
-        'pay_id': pay_id,
-        'pay_channel': channel_code
-    })
+    pay_data = {'phone': phone, 'pay_id': pay_id, 'pay_channel': channel_code, 'source': pay_source}
+    if is_ecs:
+        pay_data['order_id'] = order_id
+        pay_data['shop_id'] = pay_shop_id
+    result = api_call('/api/mcd/create_payment', method='POST', data=pay_data)
 
     if not result.get('success'):
         print(f"❌ {result.get('message', '创建支付失败')}")
         sys.exit(1)
 
-    print(f"✅ {result.get('message', '创建成功')}")
+    show_payment_result(phone, result)
 
-    payment_data = result.get('data', {})
 
-    print(f"\n支付信息:")
-    print(f"  订单ID: {payment_data.get('orderId', '')}")
-    print(f"  支付ID: {payment_data.get('payId', '')}")
-    print(f"  支付状态: {payment_data.get('payStatus', '')}")
-    print(f"  支付渠道: {payment_data.get('channelPayDestination', '')}")
-
-    channel_pay_data = payment_data.get('channelPayData', '')
-    if channel_pay_data:
-        print(f"\n支付数据已生成 (长度: {len(channel_pay_data)} 字符)")
-
-        try:
-            pay_data_json = json.loads(channel_pay_data)
-
-            method = pay_data_json.get('method', '')
-            biz_content_str = pay_data_json.get('biz_content', '')
-
-            if biz_content_str:
-                biz_content = json.loads(biz_content_str)
-                out_trade_no = biz_content.get('out_trade_no', '')
-                total_amount = biz_content.get('total_amount', '')
-                subject = biz_content.get('subject', '')
-
-                print(f"\n支付信息:")
-                print(f"  支付方式: {method}")
-                print(f"  商户: {subject}")
-                print(f"  金额: ¥{total_amount}")
-                print(f"  交易号: {out_trade_no}")
-
-            # 保存支付字符串
-            with open(PAY_MONEY_FILE, 'w', encoding='utf-8') as f:
-                f.write(channel_pay_data)
-
-            view_data = input("\n是否查看完整支付数据? (y/n): ").strip().lower()
-
-            if view_data == 'y':
-                print(f"\n完整支付数据:")
-                print(json.dumps(pay_data_json, ensure_ascii=False, indent=2))
-
-        except json.JSONDecodeError:
-            print("⚠️  无法解析支付数据")
-        except Exception as e:
-            print(f"⚠️  处理支付数据时出错: {str(e)}")
-
-    # 查询订单列表
-    print(f"\n[步骤 4] 正在查询账号订单列表...")
-    result = api_call('/api/mcd/get_order_list', params={
-        'phone': phone,
-        'cursor': '',
-        'page_size': 10
-    })
-
-    if not result.get('success'):
-        print(f"❌ {result.get('message', '获取订单列表失败')}")
-    else:
-        print(f"✅ {result.get('message', '获取成功')}")
-
-        order_list_data = result.get('data', {})
-        order_list = order_list_data.get('list', [])
-        has_next = order_list_data.get('hasNext', False)
-
-        if order_list:
-            print(f"\n最近 {len(order_list)} 个订单:")
-            print("-" * 80)
-            for idx, order_item in enumerate(order_list, 1):
-                oms_order = order_item.get('omsOrder', {})
-                order_id_display = oms_order.get('orderId', '')
-                create_time = oms_order.get('createTime', '')
-                order_status = oms_order.get('orderStatus', '')
-                store_name = oms_order.get('storeName', '')
-                real_total = oms_order.get('realTotalAmount', '')
-
-                print(f"{idx}. 订单ID: {order_id_display}")
-                print(f"   时间: {create_time}")
-                print(f"   状态: {order_status}")
-                print(f"   门店: {store_name}")
-                print(f"   金额: ¥{real_total}")
-                print("-" * 80)
-
-            if has_next:
-                print("提示: 还有更多订单，可以使用分页查询")
-        else:
-            print("\n暂无订单记录")
-
-    print("\n流程结束")
+def mcgold_flow():
+    """麦金卡开通流程：取规格→选套餐(不同天数)→开通(服务端自动过滑块)→拿支付宝支付数据。"""
     print("=" * 60)
+    print("麦当劳麦金卡开通流程")
+    print("=" * 60)
+
+    phone, token, sid, meddy_id = get_login_info()
+    print("✅ 登录验证通过")
+
+    # 1. 取麦金卡规格(不同天数套餐)
+    print("\n[步骤 1] 获取麦金卡套餐...")
+    result = api_call('/api/mcd/get_member_benefit_spec', params={'phone': phone, 'benefit_id': 106})
+    if not result.get('success'):
+        print(f"❌ {result.get('message', '获取套餐失败')}")
+        sys.exit(1)
+    spec = result.get('data', {})
+    sku_list = spec.get('skuDetails', []) or []
+    shop_id = spec.get('shopId', 1)
+    if not sku_list:
+        print("❌ 无可用套餐")
+        sys.exit(1)
+
+    print(f"\n可选麦金卡套餐 (shopId={shop_id}):")
+    for i, sku in enumerate(sku_list, 1):
+        print(f"{i}. {sku.get('day', '')}  ¥{sku.get('price', '')}  "
+              f"{sku.get('discountText', '')}  (skuId={sku.get('skuId')})")
+
+    idx = input(f"\n请选择套餐 (1-{len(sku_list)}): ").strip()
+    try:
+        idx = int(idx) - 1
+        assert 0 <= idx < len(sku_list)
+    except (ValueError, AssertionError):
+        print("❌ 无效选择")
+        sys.exit(1)
+    sku = sku_list[idx]
+    sku_id = sku.get('skuId')
+    print(f"\n已选: {sku.get('day', '')} ¥{sku.get('price', '')} (skuId={sku_id})")
+
+    # 2. 开通下单(异步：入队→worker 自动过滑块→轮询结果)
+    print("\n[步骤 2] 提交开通(异步，由 worker 过滑块，可能重试多次)...")
+    result = api_call('/api/member/open', method='POST',
+                      data={'phone': phone, 'sku_id': sku_id, 'shop_id': shop_id, **_extra_params()})
+    if not result.get('success'):
+        print(f"❌ 入队失败: {result.get('message')}")
+        sys.exit(1)
+    print(f"⏳ {result.get('message', '已入队')}，等待 worker 过滑块开通...")
+
+    # 轮询开通状态（queued/processing/done/failed），最多等 15 分钟
+    poll_interval, poll_timeout, waited = 10, 15 * 60, 0
+    order_id = pay_id = ''
+    while waited < poll_timeout:
+        st = api_call('/api/member/open_status', params={'phone': phone})
+        sdata = st.get('data', {}) if st.get('success') else {}
+        status = sdata.get('status')
+        if status == 'done':
+            order_id = sdata.get('orderId', ''); pay_id = sdata.get('payId', '')
+            print(f"✅ 开通下单成功: orderId={order_id}  payId={pay_id}")
+            break
+        if status == 'failed':
+            print(f"❌ 开通失败: {sdata.get('msg', '')}")
+            sys.exit(1)
+        print(f"   状态: {status or 'none'} ... 已等待 {waited}s", flush=True)
+        time.sleep(poll_interval)
+        waited += poll_interval
+    else:
+        print("❌ 等待开通超时(15 分钟)")
+        sys.exit(1)
+    if not order_id or not pay_id:
+        print("❌ 未返回 orderId/payId")
+        sys.exit(1)
+
+    # 3. 获取支付渠道(麦金卡 source=1 + shopId)
+    print("\n[步骤 3] 获取支付渠道...")
+    result = api_call('/api/mcd/get_payment_channels',
+                      params={'phone': phone, 'order_id': order_id, 'pay_id': pay_id,
+                              'source': 1, 'shop_id': shop_id})
+    if result.get('success'):
+        chans = result.get('data', {}).get('channelInfos', [])
+        print(f"✅ 可用渠道: {[c.get('code') for c in chans]}")
+    else:
+        print(f"⚠️  获取渠道失败(继续按支付宝下单): {result.get('message')}")
+
+    # 4. 创建支付宝支付, 拿支付数据
+    print("\n[步骤 4] 创建支付宝支付...")
+    result = api_call('/api/mcd/create_payment', method='POST',
+                      data={'phone': phone, 'pay_id': pay_id, 'order_id': order_id,
+                            'shop_id': shop_id, 'source': 1, 'pay_channel': 'ALI'})
+    if not result.get('success'):
+        print(f"❌ 创建支付失败: {result.get('message')}")
+        sys.exit(1)
+    # 与 payment 流程一致:打印支付数据 + 查询最新订单(复用)
+    show_payment_result(phone, result)
 
 
 def main():
@@ -1115,6 +1245,7 @@ def main():
         print("  python run_api_client.py order   - 下单流程")
         print("  python run_api_client.py payment - 支付流程（提交订单并保存支付信息）")
         print("  python run_api_client.py payment old - 使用已保存的订单ID和支付ID")
+        print("  python run_api_client.py mcgold  - 开通麦金卡（选套餐→开通→支付宝支付数据）")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -1126,9 +1257,11 @@ def main():
     elif mode == 'payment':
         arg2 = sys.argv[2] if len(sys.argv) > 2 else ''
         payment_flow(arg2=arg2)
+    elif mode == 'mcgold':
+        mcgold_flow()
     else:
         print(f"❌ 未知模式: {mode}")
-        print("支持的模式: store, order, payment")
+        print("支持的模式: store, order, payment, mcgold")
         sys.exit(1)
 
 

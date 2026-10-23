@@ -329,6 +329,27 @@ def zdtps_whitelist_add(ip=None, merchant_id: Optional[str] = None):
     return ok, data.get('msg')
 
 
+def ensure_egress_whitelisted(merchant_id: Optional[str] = None) -> List[str]:
+    """探测本机出口公网 IP(多出口) → 先查 zdtps 白名单,只加【不在里面】的 IP。返回在白名单内的出口 IP。"""
+    ips = get_egress_ip(want_all=True) or []
+    if not ips:
+        log_info('⚠️  未探测到出口IP,跳过白名单自动添加')
+        return []
+    current = zdtps_whitelist_list(merchant_id)   # None=查询失败
+    if current is None:
+        missing = ips                              # 查不到(接口异常),判断不了就全加,保证可用
+    else:
+        missing = [ip for ip in ips if ip not in current]
+    if not missing:
+        log_info(f'✓ 出口IP已在白名单,无需添加: {ips}')
+        return ips
+    ok, msg = zdtps_whitelist_add(ip=missing, merchant_id=merchant_id)
+    log_info(f'{"✓" if ok else "❌"} 白名单新增 {missing}: {msg}')
+    if ok:
+        return ips
+    return [ip for ip in ips if current and ip in current]  # 新增失败,返回已在白名单的那部分
+
+
 def zdtps_whitelist_del(ip, merchant_id: Optional[str] = None):
     """删白名单 IP(必填,str/逗号分隔/list)。返回 (ok, msg)。"""
     ipstr = ip if isinstance(ip, str) else ','.join(ip)
@@ -696,6 +717,15 @@ def get_short_proxy(
 
     try:
         ips = _extract_for_source(src_cfg, province, city, count)
+        if not ips and src_cfg.get('type') == 'zdtps':
+            # 自愈:提取失败多半是换了网络出口、当前IP不在白名单(判断不了具体原因就直接)
+            #       取当前网络IP+加该源白名单一次,再重试一次(office↔home 换网没重启也能恢复)。
+            log_info(f'⚠️  {source} 提取失败,尝试自动加白名单后重试…')
+            try:
+                if ensure_egress_whitelisted(merchant_id):
+                    ips = _extract_for_source(src_cfg, province, city, count)
+            except Exception as e:
+                log_info(f'自愈加白名单异常: {e}')
         if not ips:
             log_info(f'❌ 提取短效代理失败 source={source} loc={area_city}')
             return None

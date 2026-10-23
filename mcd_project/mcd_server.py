@@ -138,6 +138,7 @@ try:
     utils.seed_proxy_sources(MERCHANT_ID_DEFAULT)
 except Exception as _e:
     print(f'⚠️  seed 代理源跳过: {_e}', flush=True)
+# 注:自动加白名单放在 start_gunicorn() 启动前只跑一次(避免每个 gunicorn worker 都探测/加一遍)。
 
 
 def _freeze_key(phone):
@@ -431,6 +432,69 @@ def accounts_query():
     except Exception as e:
         return jsonify({'success': False, 'message': f'查询账号失败: {str(e)}'}), 500
     return jsonify({'success': True, 'data': out, 'total': len(out)})
+
+
+def _mcgold_status_key(phone):
+    return CAPTCHA_LOGIN_CONFIG['mcgold_status_key'].format(phone=phone)
+
+
+def enqueue_mcgold(phone, sku_id, shop_id=1, city_code='310100', city=None,
+                   province=None, merchant_id=None, proxy_source=None):
+    """麦金卡开通入队(与登录同一队列,type=mcgold,同一 worker 串行处理) + 置 queued 状态 + 处理心跳。"""
+    _cap_redis.setex(_processing_key(phone), CAPTCHA_LOGIN_CONFIG['processing_ttl'], str(int(time.time())))
+    _cap_redis.setex(_mcgold_status_key(phone), CAPTCHA_LOGIN_CONFIG['mcgold_status_ttl'],
+                     json.dumps({'status': 'queued', 'msg': '已入队', 'ts': int(time.time())}, ensure_ascii=False))
+    _cap_redis.rpush(CAPTCHA_LOGIN_CONFIG['queue_key'], json.dumps({
+        'type': 'mcgold', 'phone': phone, 'sku_id': sku_id, 'shop_id': shop_id, 'city_code': city_code,
+        'city': city, 'province': province,
+        'merchant_id': merchant_id or MERCHANT_ID_DEFAULT, 'proxy_source': proxy_source or PROXY_SOURCE_DEFAULT,
+    }, ensure_ascii=False))
+
+
+@app.route('/api/member/open', methods=['POST'])
+def member_open_order():
+    """
+    开通麦金卡 / 电商下单(【异步】,自动过滑块) —— 入队交给 captcha_login_worker(与发码同一 worker)。
+    body: {phone, sku_id, shop_id?=1, city_code?=310100, city?/province?/merchant_id?/proxy_source?}
+    返回 queued；之后轮询 GET /api/member/open_status(done 时含 orderId/payId),再走支付拿支付宝数据。
+    """
+    data = request.json or {}
+    phone = data.get('phone')
+    sku_id = data.get('sku_id')
+    city = data.get('city')
+    province, merchant_id, proxy_source = _biz_params(data)
+    shop_id = data.get('shop_id', 1)
+    city_code = data.get('city_code', '310100')
+
+    if not phone or not sku_id:
+        return jsonify({'success': False, 'message': '缺少 phone 或 sku_id 参数'}), 400
+    if not worker_alive():
+        return jsonify({'success': False, 'message': '开通服务(captcha worker)未运行，请先启动 captcha_login_worker 再试'}), 503
+
+    # 确保有设备 d(与发码链路一致);失败不阻断入队
+    try:
+        _lm = get_login_manager(phone, city, province, merchant_id, proxy_source)
+        _lm.apply_location(province, city)
+        _lm.ensure_device()
+    except Exception as e:
+        app.logger.warning(f"[member_open] {phone} 设备绑定失败(继续入队): {e}")
+
+    enqueue_mcgold(phone, sku_id, shop_id=shop_id, city_code=city_code, city=city,
+                   province=province, merchant_id=merchant_id, proxy_source=proxy_source)
+    app.logger.info(f"[member_open] {phone} sku_id={sku_id} 已入队，轮询 /api/member/open_status")
+    return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '已入队，请轮询 /api/member/open_status'})
+
+
+@app.route('/api/member/open_status', methods=['GET'])
+def member_open_status():
+    """查询麦金卡开通状态：queued/processing/done(含 orderId/payId)/failed/none。"""
+    phone = request.args.get('phone')
+    if not phone:
+        return jsonify({'success': False, 'message': '缺少 phone 参数'}), 400
+    raw = _cap_redis.get(_mcgold_status_key(phone))
+    if not raw:
+        return jsonify({'success': True, 'data': {'status': 'none'}, 'message': '无状态(未入队或已过期)'})
+    return jsonify({'success': True, 'data': json.loads(raw)})
 
 
 # ========== 通用 mcd_api 接口 ==========
@@ -841,6 +905,12 @@ def health():
 def start_gunicorn():
     bind_address = '0.0.0.0:5001'
     worker_count = 5
+
+    # 启动 server 前只加一次白名单(多 worker 不重复探测/添加)
+    try:
+        utils.ensure_egress_whitelisted(MERCHANT_ID_DEFAULT)
+    except Exception as _e:
+        print(f'⚠️  自动加白名单跳过: {_e}', flush=True)
 
     cmd = [
         sys.executable, '-m', 'gunicorn',

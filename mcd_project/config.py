@@ -17,6 +17,25 @@ REDIS_SET_URL = dict(
     password='123.456.',
 )
 
+# ========== 全局代理开关 ==========
+
+# 本机开发=True / 线上服务器=False（按 hostname 判定，沿用项目惯例）
+IS_LOCAL = 'houjie-' in socket.gethostname()
+# 本机(住宅IP)不走代理，线上服务器走白名单住宅代理；也可手动覆盖为 True/False
+USE_PROXY = True
+
+# 代理模式（USE_PROXY=True 时生效）：
+#   'static_after_login' = 登录成功后绑定静态代理，之后所有请求走静态（原逻辑）
+#   'always_short'       = 全程短效代理，不绑静态；/api/login/send_code 每次换新代理，
+#                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
+PROXY_MODE = 'always_short'
+
+# 浏览器(自动化过滑块)代理认证方式：
+#   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
+#   False = 白名单(浏览器只用 IP:端口，代理侧按 IP 放行)
+# 注意：requests(发码/业务请求)始终用完整账密代理，不受此开关影响。
+PROXY_BROWSER_AUTH = True
+
 
 def make_redis(**overrides):
     """统一的 Redis 客户端：慢/抖动时快速失败+重试+keepalive，别再卡 60 秒。
@@ -39,30 +58,12 @@ def make_redis(**overrides):
         retry_on_timeout=True,      # 超时自动重试一次
     )
     kw.update(overrides)
-    print(f'{time.strftime("%Y-%m-%d %H:%M:%S")}, Redis配置:{kw}', flush=True)
+    if IS_LOCAL:
+        print(f'{time.strftime("%Y-%m-%d %H:%M:%S")}, Redis配置:{kw}', flush=True)
     try:
         return redis.Redis(health_check_interval=30, **kw)  # 用前 PING 探活，剔除死连接(redis>=3.3)
     except TypeError:
         return redis.Redis(**kw)  # 旧版(3.2.1)无 health_check_interval
-
-# ========== 全局代理开关 ==========
-
-# 本机开发=True / 线上服务器=False（按 hostname 判定，沿用项目惯例）
-IS_LOCAL = 'houjie-' in socket.gethostname()
-# 本机(住宅IP)不走代理，线上服务器走白名单住宅代理；也可手动覆盖为 True/False
-USE_PROXY = True
-
-# 代理模式（USE_PROXY=True 时生效）：
-#   'static_after_login' = 登录成功后绑定静态代理，之后所有请求走静态（原逻辑）
-#   'always_short'       = 全程短效代理，不绑静态；/api/login/send_code 每次换新代理，
-#                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
-PROXY_MODE = 'always_short'
-
-# 浏览器(自动化过滑块)代理认证方式：
-#   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
-#   False = 白名单(浏览器只用 IP:端口，代理侧按 IP 放行)
-# 注意：requests(发码/业务请求)始终用完整账密代理，不受此开关影响。
-PROXY_BROWSER_AUTH = True
 
 # ========== 验证码(滑块)登录 worker 配置 ==========
 
@@ -82,6 +83,10 @@ CAPTCHA_LOGIN_CONFIG = {
     'processing_ttl': 120,                            # 单账号处理心跳 TTL(秒，够一次过滑块)
     'blpop_timeout': 10,                              # worker BLPOP 超时(秒)，兼顾刷心跳频次与空闲时的 Redis 压力
     'beat_min_interval': 5,                           # beat 节流：两次心跳写最小间隔(秒)
+
+    # 麦金卡开通(电商下单)异步任务：与登录共用同一队列(queue_key)+同一 worker，按 payload.type 分发。
+    'mcgold_status_key': 'mcd:captcha:mcgold:status:{phone}',  # 开通状态 JSON(queued/processing/done/failed + orderId/payId)
+    'mcgold_status_ttl': 15 * 60,                     # 开通状态窗口(秒)
 }
 
 # ========== 代理配置 ==========

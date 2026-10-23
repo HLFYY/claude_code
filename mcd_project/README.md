@@ -42,7 +42,14 @@
 - **查询账号数据**：`GET /api/accounts`（传 phone 查单个、不传查全部）
 - 客户端 `run_api_client.py`：`SEND_LOCATION` 开关控制是否带省市（省份默认江苏、城市默认南京），`PROXY_SOURCE` 常量选代理源（zdtps/shenlong）方便测不同代理
 
-> 详细接口见 `麦当劳API接口文档.md`。迁移旧凭证：`python -c "import utils; utils.migrate_credentials('100001')"`（只同步有 sid 的，按 city 补 province）。
+✅ **麦金卡开通（电商下单）** 🎉 v2.1 新增
+- 链路：规格 `get_member_benefit_spec`(/bff/myrewards/benefit/detail/spec/106) → 下单 `/bff/ectrade/order/create`（返 **420 → 过数美滑块 → 带 `x-mcd-sec-verify` 重试**，和发码同机制）→ `cashier/channels`+`cashier/preorder` 拿支付宝/微信支付数据
+- 异步：`POST /api/member/open` 入队 → `captcha_login_worker`（**与发码同一 worker、同一队列、按 type 串行过滑块**）→ 轮询 `GET /api/member/open_status`
+- 客户端 `python run_api_client.py mcgold`：选不同天数套餐 → 开通 → 拿支付宝支付数据（订单解析 `parse_order_item` 兼容 `omsOrder` 餐品 / `ecsOrder` 麦金卡）
+- 凭证安全：登录失败/失效**只更新 checked_at/check_status、绝不删凭证或清空 token/sid**
+- zdtps 白名单：server/worker 启动自动"先查再加"本机出口 IP；短效代理失败自愈再加一次（换网不重启也能恢复）
+
+> 详细接口见 `麦当劳API接口文档.md`、踩坑见 `../mcd/docs/踩坑与结论日志.md`（八、麦金卡；九、凭证/白名单）。迁移旧凭证：`python -c "import utils; utils.migrate_credentials('100001')"`（只同步有 sid 的，按 city 补 province）。
 
 ## 项目结构
 

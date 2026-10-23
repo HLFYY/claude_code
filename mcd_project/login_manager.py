@@ -567,6 +567,10 @@ class LoginManager:
             c_keep = self.city_bound or _old_row.get('city', '') or ''
             chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
             chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            # token/sid/meddy 传入 None/空 = "不改,保留原值"(禁止把已登录凭证的 token/sid 清空)
+            token = token if token else _old_row.get('token')
+            sid = sid if sid else _old_row.get('sid')
+            meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             # Redis 存储
@@ -611,6 +615,10 @@ class LoginManager:
             c_keep = self.city_bound or _old_row.get('city', '') or ''
             chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
             chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            # token/sid/meddy 传入 None/空 = "不改,保留原值"(禁止把已登录凭证的 token/sid 清空)
+            token = token if token else _old_row.get('token')
+            sid = sid if sid else _old_row.get('sid')
+            meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             all_credentials[self.phone] = {
@@ -993,36 +1001,15 @@ class LoginManager:
 
     def clear_credentials(self) -> None:
         """
-        清除当前手机号的凭证（从文件或 Redis 和内存中删除）
+        [已禁用删除] 按业务要求:任何情况下都不删除存储里的登录凭证、也不清空 token/sid。
+        本方法保留以兼容旧调用,但【只重置内存引用,不动 Redis/文件里的凭证】。
+        如需真正删除,请人工在 Redis 操作,代码里禁止。
         """
-        # 清除内存
+        log_info(f"⚠️  clear_credentials 被调用(手机号 {self.phone}) —— 按规则不删除存储凭证,仅重置内存引用")
+        # 仅重置内存引用(不写回、不删除存储;避免影响已登录凭证)
         self.token = None
         self.sid = None
         self.meddy_id = None
-
-        if self.use_redis:
-            # Redis 存储
-            try:
-                self.redis_client.hdel(self.redis_key, self.phone)
-                log_info(f"✓ 已清除凭证 (手机号: {self.phone})")
-            except Exception as e:
-                log_info(f"✗ 清除凭证失败: {e}")
-        else:
-            # 文件存储
-            if os.path.exists(self.credentials_file):
-                try:
-                    with open(self.credentials_file, 'r', encoding='utf-8') as f:
-                        all_credentials = json.load(f)
-
-                    if self.phone in all_credentials:
-                        del all_credentials[self.phone]
-
-                        with open(self.credentials_file, 'w', encoding='utf-8') as f:
-                            json.dump(all_credentials, f, indent=2, ensure_ascii=False)
-
-                        log_info(f"✓ 已清除凭证 (手机号: {self.phone})")
-                except Exception as e:
-                    log_info(f"✗ 清除凭证失败: {e}")
 
 
 if __name__ == '__main__':
