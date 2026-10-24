@@ -8,13 +8,19 @@
     阶段一  环境自检 + 安装 Git / OpenSSH
             （全部优先走国内镜像：华为云 git-for-windows、清华 PyPI）
     阶段二  清理旧 Python 环境（默认执行，-NoPurge 可跳过）
-            · 卸载 registry 里所有非 3.9 的 Python（3.12 / 3.11 / 3.13 …）
+            · 先结束占用 Python 的进程 / 停掉以它为 exe 的服务
+              （旧版本卸载失败基本都是「文件被占用」，而残留的 MSI 会让后面安装 1603）
+            · 卸载 registry 里所有非 3.9 的 Python（3.12 / 3.11 / 3.13 …），并复查是否真卸干净
             · 删除残留目录（Program Files\Python3xx、%LOCALAPPDATA%\Programs\Python\Python3xx、
               %APPDATA%\Python、pip 缓存）
             · 保留已存在的 3.9.x 解释器，只把它的第三方包全部卸干净（等同于「重装环境」）
             · 删掉旧的 .venv
-    阶段三  安装 Python 3.9.13（python.org 最后一个 Windows 安装版；cp39 ABI 与 Mac 的
-            3.9.17 完全一致，wheel 通用），静默装到 Program Files 并加 PATH
+    阶段三  准备 Python 3.9.13（python.org 最后一个 Windows 安装版；cp39 ABI 与 Mac 的
+            3.9.17 完全一致，wheel 通用）
+            · 先全盘探测已有 3.9：PATH / py -0p / where / 注册表 InstallPath / 常见目录 / 各盘根目录
+              （注册表那条是关键，能覆盖装到自定义目录或另一个用户目录的情况）
+            · 找不到才装，且分 4 级重试：全用户安装 → /repair → 清掉残骸重装 → 当前用户安装，
+              最后还有「MSI 组件逐个装」兜底；日志写 %TEMP%\python39_install.log
     阶段四  SSH key：已存在就直接展示，不存在就生成后展示
     阶段五  暂停，等你把公钥加进 GitHub Deploy keys，回车继续
     阶段六  验证 SSH 连接 -> 稀疏 clone（只取 mcd_project，约 1.2MB）
@@ -117,7 +123,7 @@ $MirrorGitFallback = "https://mirrors.huaweicloud.com/git-for-windows/v2.56.0.wi
 $MirrorPyBase      = "https://mirrors.huaweicloud.com/python"
 
 function Get-MirrorFile {
-    param([string] $Url, [string] $OutFile, [string] $Label = "文件")
+    param([string] $Url, [string] $OutFile, [string] $Label = "文件", [int] $MinBytes = 100000)
 
     Info ("下载 " + $Label + " ...")
     Info ("  " + $Url)
@@ -129,7 +135,7 @@ function Get-MirrorFile {
                 Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 900
                 if (Test-Path $OutFile) {
                     $len = (Get-Item $OutFile).Length
-                    if ($len -gt 100000) {
+                    if ($len -gt $MinBytes) {
                         Ok ("下载完成 " + [math]::Round($len / 1MB, 1) + " MB")
                         return $true
                     }
@@ -232,26 +238,99 @@ function Get-PyVersion([string]$exe) {
     return $null
 }
 
-# 返回 3.9.x 的解释器；优先 Path 上的，其次 python.org 的固定安装位置
-function Get-Python39 {
-    $cands = @()
-    foreach ($c in @("python", "python3")) {
-        if (Has-Exe $c) {
-            $src = (Get-Command $c).Source
-            if ($src -and $src -notmatch 'WindowsApps') { $cands += $src }
+# 注册表里登记的解释器路径（PythonCore\<tag>\InstallPath）。
+# 这是唯一能覆盖「装到自定义目录」或「装在另一个用户的 LOCALAPPDATA」的信息源，
+# 光扫 PATH + 几个固定目录会漏，漏了就会重复安装同一版本 → MSI 返回 1603。
+function Get-RegisteredPythonPaths {
+    $out = @()
+    foreach ($root in @(
+        "HKLM:\SOFTWARE\Python\PythonCore",
+        "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore",
+        "HKCU:\SOFTWARE\Python\PythonCore"
+    )) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($tag in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            $ipKey = Join-Path $tag.PSPath "InstallPath"
+            if (-not (Test-Path $ipKey)) { continue }
+            $props = Get-ItemProperty $ipKey -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($cand in @($props.'(default)', $props.ExecutablePath)) {
+                if (-not $cand) { continue }
+                if ($cand -match '\.exe$') { $out += $cand }
+                else { $out += (Join-Path $cand "python.exe") }
+            }
         }
     }
-    $cands += @(
+    return $out | Where-Object { $_ } | Select-Object -Unique
+}
+
+# 所有可能存在的 python.exe（不判断版本），去重后返回
+function Get-PythonCandidates {
+    $c = @()
+
+    # 1) PATH
+    foreach ($n in @("python", "python3", "python3.9")) {
+        $cmd = Get-Command $n -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and $cmd.Source -notmatch 'WindowsApps') {
+            $real = (& $cmd.Source -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
+            if ($real) { $c += $real } else { $c += $cmd.Source }
+        }
+    }
+
+    # 2) py 启动器（-0p 会列出所有已注册版本及其真实路径）
+    if (Has-Exe "py") {
+        $list = (& py -0p 2>$null | Out-String)
+        foreach ($line in ($list -split "`r?`n")) {
+            if ($line -match '([A-Za-z]:\\.*python\.exe)') { $c += $Matches[1] }
+        }
+        foreach ($t in @("-3.9", "-3")) {
+            $e = (& py $t -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
+            if ($e) { $c += $e }
+        }
+    }
+
+    # 3) where.exe
+    if (Has-Exe "where.exe") {
+        $w = (& where.exe python 2>$null | Out-String)
+        if ($w) { $c += ($w -split "`r?`n" | Where-Object { $_ -match 'python\.exe\s*$' }) }
+    }
+
+    # 4) 注册表登记的 InstallPath
+    $c += Get-RegisteredPythonPaths
+
+    # 5) python.org 默认安装位置
+    $c += @(
         "$env:ProgramFiles\Python39\python.exe",
         "${env:ProgramFiles(x86)}\Python39\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python39\python.exe"
+        "$env:LOCALAPPDATA\Programs\Python\Python39\python.exe",
+        "C:\Python39\python.exe"
     )
-    # py 启动器兜底
-    if (Has-Exe "py") {
-        $pyPath = (& py -3.9 -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
-        if ($pyPath) { $cands += $pyPath }
+
+    # 6) 各盘根目录
+    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        if ($d.Root) { $c += (Join-Path $d.Root "Python39\python.exe") }
     }
-    foreach ($p in $cands) {
+
+    return $c | Where-Object { $_ -and ($_ -match '\.exe\s*$') } |
+        ForEach-Object { $_.Trim() } | Select-Object -Unique
+}
+
+# 把探测结果打出来，装不上时至少知道机器上到底有什么
+function Show-PythonScan {
+    $rows = @()
+    foreach ($p in (Get-PythonCandidates)) {
+        if (-not (Test-Path $p)) { continue }
+        $v = Get-PyVersion $p
+        if ($v) { $rows += ("  · " + $p + "   ->   " + $v) }
+        else { $rows += ("  · " + $p + "   ->   无法运行（文件损坏 / 缺 DLL / 权限不足）") }
+    }
+    if ($rows.Count -eq 0) { Info "  没找到任何 python.exe" }
+    else { $rows | ForEach-Object { Info $_ } }
+}
+
+# 返回 3.9.x 的解释器；找不到返回 $null
+function Get-Python39 {
+    foreach ($p in (Get-PythonCandidates)) {
         if (-not (Test-Path $p)) { continue }
         $v = Get-PyVersion $p
         if ($v -and $v -like "$TargetPyShort.*") { return @{ Exe = $p; Ver = $v } }
@@ -274,61 +353,294 @@ function Get-PythonInstalls {
     return $all | Sort-Object DisplayVersion -Unique
 }
 
-function Uninstall-PythonEntry($entry) {
-    $dn  = $entry.DisplayName
-    $us  = $entry.UninstallString
-    Info ("卸载 " + $dn + " ...")
-    if ($us -match 'MsiExec\.exe\s+/[IX]?\s*(\{[0-9A-Fa-f\-]+\})') {
-        Start-Process -FilePath "msiexec.exe" -ArgumentList @("/x$($Matches[1])", "/qn", "/norestart") -Wait
-        return
+function Get-InstallerHint([int]$code) {
+    switch ($code) {
+        0     { return "成功" }
+        3010  { return "成功，需要重启" }
+        1602  { return "用户取消" }
+        1603  { return "致命错误：常见原因是「有未完成的挂起重启」「同版本已注册但文件不全」「上级安装事务失败残留」「没真正提权」" }
+        1605  { return "该产品未安装" }
+        1618  { return "另一个安装正在进行（MSI 全局互斥），稍后重试" }
+        1619  { return "安装包无法打开" }
+        1638  { return "该版本已安装过" }
+        -1    { return "安装程序没能启动" }
+        default { return "未知错误" }
     }
-    $exe = $us
-    if ($exe -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
-    elseif ($exe -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
-    if (Test-Path $exe) {
-        Start-Process -FilePath $exe -ArgumentList @("/uninstall", "/quiet") -Wait -ErrorAction SilentlyContinue
+}
+
+# 列出所有 python 进程（含真实路径，拿不到路径的说明是别的用户的进程）
+function Get-PythonProcs {
+    $out = @()
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^python' })) {
+        $path = $null
+        try { $path = $p.Path } catch {}
+        $out += [pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Path = $path }
     }
-    else {
-        Warn ("找不到卸载程序：" + $us)
+    return $out
+}
+
+# 结束占着某个目录的进程 + 停掉以该目录为 exe 的服务。
+# 3.12 卸载失败的根因就是 python.exe 被别的程序（服务 / IDE / 旧 worker）打开着。
+function Release-PathHolders([string]$pathLike) {
+    $norm = $pathLike.TrimEnd('\')
+
+    $svcs = @()
+    try {
+        $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+            $_.PathName -and ($_.PathName -like ("*" + $norm + "*")) -and $_.State -eq "Running"
+        })
     }
+    catch {}
+    foreach ($s in $svcs) {
+        Info ("停止服务 " + $s.Name + "（" + $s.DisplayName + "）...")
+        & sc.exe stop $s.Name | Out-Null
+    }
+    if ($svcs.Count -gt 0) { Start-Sleep -Seconds 3 }
+
+    $holders = @(Get-PythonProcs | Where-Object {
+        $_.Path -and ($_.Path -like ($norm + "\*"))
+    })
+    foreach ($h in $holders) {
+        Warn ("结束占用进程 " + $h.Name + " (PID " + $h.Id + ")  " + $h.Path)
+        try { Stop-Process -Id $h.Id -Force -ErrorAction Stop }
+        catch { Warn ("  结束失败：" + $_.Exception.Message) }
+    }
+    if ($holders.Count -gt 0) { Start-Sleep -Seconds 2 }
+
+    $left = @(Get-PythonProcs | Where-Object { $_.Path -and ($_.Path -like ($norm + "\*")) })
+    return ($left.Count -eq 0)
 }
 
 function Remove-DirSafe([string]$path) {
     if (-not (Test-Path $path)) { return }
-    try {
-        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
-        Info ("已删除 " + $path)
+    for ($i = 1; $i -le 2; $i++) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            Info ("已删除 " + $path)
+            return
+        }
+        catch {
+            if ($i -eq 1) {
+                Release-PathHolders $path | Out-Null
+                Start-Sleep -Seconds 2
+            }
+            else {
+                Warn ("删除失败（仍被占用）：" + $path)
+                Warn ("  " + $_.Exception.Message)
+                Warn "  处理：先关掉占用它的程序/服务（或重启服务器）再重跑；不处理也不影响后面的安装"
+            }
+        }
     }
-    catch { Warn ("删除失败（可能被占用）：" + $path + "  " + $_.Exception.Message) }
+}
+
+function Uninstall-PythonEntry($entry) {
+    $dn = $entry.DisplayName
+    $us = $entry.UninstallString
+    Info ("卸载 " + $dn + " ...")
+
+    # 先放开占用，否则 msiexec 会 1603、目录也删不掉
+    $ver = $entry.DisplayVersion
+    $tag = $null
+    if ($ver -match '^(\d+)\.(\d+)\.') { $tag = $Matches[1] + "." + $Matches[2] }
+    elseif ($dn -match 'Python\s+(\d+)\.(\d+)') { $tag = $Matches[1] + "." + $Matches[2] }
+    if ($tag) {
+        $dirTag = "Python" + ($tag -replace '\.', '')
+        foreach ($base in @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA\Programs\Python")) {
+            if (-not $base) { continue }
+            $d = Join-Path $base $dirTag
+            if (Test-Path $d) { Release-PathHolders $d | Out-Null }
+        }
+    }
+
+    if ($us -match 'MsiExec\.exe\s+/[IX]?\s*(\{[0-9A-Fa-f\-]+\})') {
+        $msi = $Matches[1]
+        $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/x$msi", "/qn", "/norestart") -Wait -PassThru
+        $code = if ($p) { $p.ExitCode } else { -1 }
+        if ($code -ne 0 -and $code -ne 3010 -and $code -ne 1605) {
+            Warn ("  卸载返回 " + $code + "（" + (Get-InstallerHint $code) + "）")
+        }
+        return
+    }
+
+    $exe = $us
+    if ($exe -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+    elseif ($exe -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
+    if (Test-Path $exe) {
+        $p = Start-Process -FilePath $exe -ArgumentList @("/uninstall", "/quiet") -Wait -PassThru -ErrorAction SilentlyContinue
+        if ($p -and $p.ExitCode -ne 0) { Warn ("  卸载返回 " + $p.ExitCode) }
+    }
+    else { Warn ("找不到卸载程序：" + $us) }
+}
+
+# MSI 事务是否残留 / 是否有挂起重启（两者都会让新安装直接 1603）
+function Test-PendingReboot {
+    try {
+        $v = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
+            -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($v) { return $true }
+    }
+    catch {}
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") { return $true }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { return $true }
+    return $false
+}
+
+# 单独跑一次安装包，返回退出码；日志留着好查 1603 的真实原因
+function Invoke-PySetup {
+    param([string]$Exe, [string]$ArgStr, [string]$LogFile)
+    $full = $ArgStr.Trim() + ' /log "' + $LogFile + '"'
+    try {
+        $p = Start-Process -FilePath $Exe -ArgumentList $full -Wait -PassThru -ErrorAction Stop
+        if ($p) { return [int]$p.ExitCode }
+    }
+    catch { Warn ("启动安装程序失败：" + $_.Exception.Message) }
+    return -1
+}
+
+# 兜底：直接用 python.org 的 MSI 组件装（等于手工执行安装包内部的每一步）
+function Install-Python39ByMsi {
+    $allUsers = if ($isAdmin) { 1 } else { 0 }
+    $target = if ($allUsers) { "$env:ProgramFiles\Python39" } else { "$env:LOCALAPPDATA\Programs\Python\Python39" }
+
+    $msiDir = Join-Path $env:TEMP "py39msi"
+    New-Item -ItemType Directory -Path $msiDir -Force -ErrorAction SilentlyContinue | Out-Null
+
+    # 顺序有讲究：ucrt 要先装，path 最后写环境变量
+    $order = @("ucrt.msi", "core.msi", "lib.msi", "exe.msi", "tcltk.msi", "tools.msi", "pip.msi", "path.msi")
+    foreach ($f in $order) {
+        $dst = Join-Path $msiDir $f
+        if (Test-Path $dst) { continue }
+        $u = "$MirrorPyBase/$TargetPyFull/amd64/$f"
+        if (-not (Get-MirrorFile -Url $u -OutFile $dst -Label ("Python 组件 " + $f) -MinBytes 512)) {
+            Warn ("拿不到 " + $f + "，MSI 方式放弃")
+            return $false
+        }
+    }
+
+    Info ("用 MSI 组件安装到 " + $target + " ...")
+    foreach ($f in $order) {
+        $argStr = '/i "' + (Join-Path $msiDir $f) + '" /qn /norestart TARGETDIR="' + $target + '"'
+        if ($allUsers) { $argStr += ' ALLUSERS=1' }
+        $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $argStr -Wait -PassThru -ErrorAction SilentlyContinue
+        $code = if ($p) { $p.ExitCode } else { -1 }
+        if ($code -ne 0 -and $code -ne 3010 -and $code -ne 1605) {
+            Warn ("  " + $f + " 返回 " + $code + "（" + (Get-InstallerHint $code) + "）")
+        }
+    }
+    Refresh-Path
+    return [bool](Get-Python39)
 }
 
 function Install-Python3913 {
     $url = "$MirrorPyBase/$TargetPyFull/python-$TargetPyFull-amd64.exe"
     $exe = Join-Path $env:TEMP "python-$TargetPyFull-amd64.exe"
-    if (-not (Get-MirrorFile -Url $url -OutFile $exe -Label "Python $TargetPyFull")) {
-        return $null
+    if (-not (Get-MirrorFile -Url $url -OutFile $exe -Label "Python $TargetPyFull")) { return $null }
+
+    $logFile = Join-Path $env:TEMP "python39_install.log"
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+
+    if (Test-PendingReboot) {
+        Warn "系统有未完成的挂起重启（PendingFileRenameOperations / CBS RebootPending）"
+        Warn "一体化安装包 python-$TargetPyFull-amd64.exe 在这种机器上基本必报 1603"
+        Info "先改走 MSI 组件逐个装（绕开安装包的事务逻辑，通常能过）..."
+        if (Install-Python39ByMsi) {
+            $found = Get-Python39
+            if ($found) {
+                Ok ("Python " + $found.Ver + " 安装完成（MSI 组件方式）：" + $found.Exe)
+                Remove-Item $exe -Force -ErrorAction SilentlyContinue
+                return $found
+            }
+        }
+        Warn "MSI 组件方式也没成，继续试一体化安装包 ..."
+        Info "若仍 1603：先跑 deploy\install_python39.ps1（含 zip 兜底），不必重启服务器"
+    }
+    $msiexecs = @(Get-Process msiexec -ErrorAction SilentlyContinue)
+    if ($msiexecs.Count -gt 0) {
+        Warn ("有 " + $msiexecs.Count + " 个 msiexec 进程在跑（多半是上次失败的安装/卸载残留），等 15 秒 ...")
+        Start-Sleep -Seconds 15
+    }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress") {
+        Warn "注册表残留 Installer\InProgress（上次安装被中断），这种状态会一直 1603，建议重启后再装"
     }
 
-    Info "静默安装 Python $TargetPyFull ..."
-    # 管理员 → 全用户装到 Program Files；否则退回当前用户装到 %LOCALAPPDATA%\Programs\Python
-    $allUsers = 1
-    if (-not $isAdmin) { $allUsers = 0; Warn "非管理员：改为当前用户安装" }
-    $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
-        "/quiet", "InstallAllUsers=$allUsers", "PrependPath=1",
-        "Include_test=0", "Include_launcher=1", "Shortcuts=0",
-        "Include_pip=1", "AssociateFiles=0"
-    )
-    Remove-Item $exe -Force -ErrorAction SilentlyContinue
-    Refresh-Path
+    $allUsersDir = "$env:ProgramFiles\Python39"
+    $userDir     = "$env:LOCALAPPDATA\Programs\Python\Python39"
+    $commonArgs  = "PrependPath=1 Include_test=0 Include_launcher=1 Shortcuts=0 Include_pip=1 AssociateFiles=0"
 
-    $found = Get-Python39
-    if ($found) { Ok ("Python " + $found.Ver + " 安装完成：" + $found.Exe); return $found }
-    Warn ("Python $TargetPyFull 安装后仍未检测到（退出码 " + $p.ExitCode + "）")
+    # 注册表里还挂着 3.9 的登记，但探测不到 python.exe → 说明是「注册了但文件不全」的残骸
+    $stale = @(Get-PythonInstalls | Where-Object { $_.DisplayVersion -like "$TargetPyShort.*" })
+
+    $attempts = @()
+    if ($isAdmin) {
+        if ($stale.Count -gt 0) {
+            # 已经「注册了但文件不全」，直接装同一个版本必然 1603，先走修复/清残骸
+            Warn ("注册表里挂着 " + $stale.Count + " 个 3.9 登记但找不到 python.exe，先修复再装")
+            $attempts += @{ Name = "修复已有 3.9 安装（/repair）"; Args = ("/quiet /repair InstallAllUsers=1 TargetDir=`"$allUsersDir`"") }
+            $attempts += @{ Name = "清掉 3.9 残骸后重装"; Args = ("/quiet InstallAllUsers=1 TargetDir=`"$allUsersDir`" " + $commonArgs); PurgeFirst = $true }
+            $attempts += @{ Name = "全用户安装到 Program Files"; Args = ("/quiet InstallAllUsers=1 TargetDir=`"$allUsersDir`" " + $commonArgs) }
+        }
+        else {
+            $attempts += @{ Name = "全用户安装到 Program Files"; Args = ("/quiet InstallAllUsers=1 TargetDir=`"$allUsersDir`" " + $commonArgs) }
+        }
+    }
+    $attempts += @{ Name = "当前用户安装到 %LOCALAPPDATA%"; Args = ("/quiet InstallAllUsers=0 TargetDir=`"$userDir`" " + $commonArgs) }
+
+    $i = 0
+    foreach ($a in $attempts) {
+        $i++
+        Info ("[" + $i + "/" + ($attempts.Count + 1) + "] " + $a.Name + " ...")
+
+        if ($a.PurgeFirst) {
+            foreach ($s in $stale) { Uninstall-PythonEntry $s }
+            Start-Sleep -Seconds 2
+            if (Test-PendingReboot) { Warn "  清完残骸后系统要求重启，安装可能仍失败" }
+        }
+
+        $code = Invoke-PySetup -Exe $exe -ArgStr $a.Args -LogFile $logFile
+        Refresh-Path
+        $found = Get-Python39
+        if ($found) {
+            Ok ("Python " + $found.Ver + " 安装完成：" + $found.Exe)
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            return $found
+        }
+        Warn ("  失败，退出码 " + $code + "（" + (Get-InstallerHint $code) + "）")
+        if ($code -eq 1618) { Start-Sleep -Seconds 20 }
+    }
+
+    Info ("[" + ($attempts.Count + 1) + "/" + ($attempts.Count + 1) + "] 改用 MSI 组件安装 ...")
+    if (Install-Python39ByMsi) {
+        $found = Get-Python39
+        if ($found) {
+            Ok ("Python " + $found.Ver + " 安装完成（MSI 方式）：" + $found.Exe)
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            return $found
+        }
+    }
+
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    if (Test-Path $logFile) {
+        Warn ("安装日志：" + $logFile + "（末尾 12 行）")
+        Get-Content $logFile -Tail 12 -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
+    }
     return $null
 }
 
 # 把某个解释器里的第三方包全部卸掉（保留 pip / setuptools / wheel）
 function Clear-SitePackages([string]$vpy) {
+    # 残缺的安装可能连 pip 都没有，先 ensurepip 补上，否则下面全白做
+    $probe = (& $vpy -m pip --version 2>&1 | Out-String)
+    if ($probe -notmatch '^pip \d') {
+        Info "该解释器没有 pip，用 ensurepip 补 ..."
+        & $vpy -m ensurepip --default-pip 2>&1 | Out-Null
+        $probe = (& $vpy -m pip --version 2>&1 | Out-String)
+        if ($probe -notmatch '^pip \d') {
+            Warn "pip 仍不可用，跳过依赖清理（阶段 7 会重新装 pip）"
+            return
+        }
+    }
+
     $frozen = (& $vpy -m pip freeze --all 2>$null) | Where-Object {
         $_ -match '==' -and $_ -notmatch '^(pip|setuptools|wheel|distribute|pkg[-_]resources)=='
     }
@@ -391,18 +703,78 @@ else {
     if ($installs -and $installs.Count -gt 0) {
         Info ("注册表里发现 " + $installs.Count + " 个 Python：")
         foreach ($i in $installs) { Info ("  · " + $i.DisplayName + "  [" + $i.DisplayVersion + "]") }
+    }
+    else { Info "注册表里没有 python.org 安装记录" }
 
+    # 先把占着 Python 的进程 / 服务放掉。
+    # 旧版 3.12 卸载失败就是 python.exe 被别的程序打开着，msiexec 直接 1603，
+    # 而残留的 MSI 事务会让后面装 3.9 也跟着 1603。
+    $procs = @(Get-PythonProcs)
+    if ($procs.Count -gt 0) {
+        Info ("发现 " + $procs.Count + " 个 python 进程在运行：")
+        foreach ($p in $procs) {
+            $pp = if ($p.Path) { $p.Path } else { "<路径不可见，可能是其他用户的进程>" }
+            Info ("  · " + $p.Name + " (PID " + $p.Id + ")  " + $pp)
+        }
+
+        $pySvc = @()
+        try {
+            $pySvc = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+                $_.PathName -match '\\Python3\d+\\' -and $_.State -eq 'Running'
+            })
+        }
+        catch {}
+        foreach ($s in $pySvc) {
+            Info ("停止服务 " + $s.Name + "（" + $s.DisplayName + "）...")
+            & sc.exe stop $s.Name | Out-Null
+        }
+        if ($pySvc.Count -gt 0) { Start-Sleep -Seconds 3 }
+
+        if ($isAdmin) {
+            $killed = 0
+            foreach ($p in $procs) {
+                try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed++ } catch {}
+            }
+            Start-Sleep -Seconds 2
+            if ($killed -gt 0) { Ok ("已结束 " + $killed + " 个占用进程（否则旧版本卸不干净）") }
+            $left = @(Get-PythonProcs)
+            if ($left.Count -gt 0) {
+                Warn ("还有 " + $left.Count + " 个 python 进程没能结束（多半属于其他用户或系统服务）：")
+                foreach ($p in $left) { Warn ("  · " + $p.Name + " (PID " + $p.Id + ")") }
+            }
+        }
+        else { Warn "非管理员：无法结束这些进程，卸载很可能失败，建议右键「以管理员身份运行」重跑" }
+    }
+
+    if ($installs -and $installs.Count -gt 0) {
         $keep = $installs | Where-Object { $_.DisplayVersion -like "$TargetPyShort.*" }
         $drop = $installs | Where-Object { $_.DisplayVersion -notlike "$TargetPyShort.*" }
         if ($drop -and $drop.Count -gt 0) {
             if (-not $isAdmin) { Warn "非管理员：卸载其他版本 Python 可能失败，建议以管理员重跑" }
             foreach ($d in $drop) { Uninstall-PythonEntry $d }
             Refresh-Path
-            Ok ("已卸载 " + $drop.Count + " 个非 $TargetPyShort 版本")
+            Start-Sleep -Seconds 2
+
+            # 校验是否真卸掉了。注册表还挂着 = 失败（文件被占用是最常见原因），
+            # 这种残骸留着，后面装 3.9 会直接 1603，所以必须明确告警。
+            $still = @(Get-PythonInstalls | Where-Object { $_.DisplayVersion -notlike "$TargetPyShort.*" })
+            if ($still.Count -eq 0) {
+                Ok ("已卸载 " + $drop.Count + " 个非 " + $TargetPyShort + " 版本")
+            }
+            else {
+                Warn ("有 " + $still.Count + " 个没卸干净：")
+                foreach ($s in $still) { Warn ("  · " + $s.DisplayName + "  [" + $s.DisplayVersion + "]") }
+                Warn "  这很可能是文件被占用导致的。最省事的办法是重启服务器后重跑本脚本；"
+                Warn "  也可以到「设置 → 应用」里手动卸载这几个，再重跑。"
+                Warn "  不处理的话，后面安装 3.9 大概率直接返回 1603。"
+            }
         }
-        if ($keep) { Ok ("保留 Python $TargetPyShort（" + ($keep | Select-Object -First 1).DisplayName + "），只清依赖") }
+        if ($keep) {
+            Ok ("保留 Python $TargetPyShort（" + ($keep | Select-Object -First 1).DisplayName + "），只清依赖")
+            $kp = Get-RegisteredPythonPaths | Where-Object { $_ -like "*Python39*" }
+            if ($kp) { foreach ($x in $kp) { Info ("  注册表登记位置：" + $x) } }
+        }
     }
-    else { Info "注册表里没有 python.org 安装记录" }
 
     # 残留目录（只删非 3.9 的）
     foreach ($base in @("$env:ProgramFiles", ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs\Python")) {
@@ -433,10 +805,24 @@ if ($py) {
     }
 }
 else {
+    Info "已扫到的 python.exe："
+    Show-PythonScan
+    Info "没有可用的 3.9.x，开始安装 ..."
+
     $py = Install-Python3913
     if (-not $py) {
         Fail "缺少可用的 Python $TargetPyShort"
-        Info "手动安装后重跑：https://mirrors.huaweicloud.com/python/$TargetPyFull/"
+        Info ("安装日志：" + (Join-Path $env:TEMP "python39_install.log"))
+        if (Test-PendingReboot) {
+            Info "系统有未完成的挂起重启 —— 这是 1603 最常见的原因"
+            Info "但不能重启的话，先跑这个（三条路兜底，含纯 zip 解压，不需要重启）："
+            Info ("  powershell -ExecutionPolicy Bypass -File " + (Join-Path $ScriptDir "install_python39.ps1"))
+        }
+        else {
+            Info "如果日志里是 1603：重启服务器后重跑（可清掉残留的 MSI 事务）"
+            Info ("也可以先跑 " + (Join-Path $ScriptDir "install_python39.ps1") + " 绕开一体化安装包")
+        }
+        Info ("手动安装：" + "$MirrorPyBase/$TargetPyFull/")
         Info "安装时务必勾选 Add python.exe to PATH"
         Die "中止"
     }

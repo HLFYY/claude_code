@@ -20,9 +20,12 @@
 > （**36 个包**，只含 `captcha_login_worker.py` 的导入闭包，全部钉死版本）。
 > Windows 上装 python.org 最后一个带安装包的 3.9.13 —— cp39 ABI 与 3.9.17 相同，所有 cp39 wheel 通用。
 
-> **注意**：脚本本身也在仓库里，所以第一次要先把它弄到服务器上——直接复制粘贴这三个文件的内容即可：
+> **注意**：脚本本身也在仓库里，所以第一次要先把它弄到服务器上——直接复制粘贴这些文件的内容即可：
 > `deploy/setup.bat`、`deploy/setup_windows.ps1`、`deploy/requirements-win-py39.txt`
 > （**三个都要**，第三个是版本锁定清单；漏了脚本会去仓库里的 `mcd_project\deploy\` 找）。
+>
+> 如果 Python 死活装不上（尤其 **1603**，见第五节 5.2），再补一个 `deploy/install_python39.ps1`
+> —— 它是「不能重启服务器」时专用的单独装机脚本。
 >
 > **代码默认拉到「脚本所在目录」下的 `claude_code\`**（例如脚本在 `C:\setup\`，代码就在 `C:\setup\claude_code\`）。
 > 如果脚本本身就在已经 clone 好的仓库里跑（比如在 `claude_code\mcd_project\deploy\` 下双击），
@@ -103,8 +106,8 @@ nssm start mcd-captcha-worker
 | 阶段 | 动作 | 幂等性 |
 |---|---|---|
 | 1 | 检查/安装 OpenSSH、Git | 已存在则跳过 |
-| 2 | **清理旧 Python 环境**：卸载 registry 里所有非 3.9 的 Python、删残留目录、删旧 `.venv` | 保留 3.9.x，`-NoPurge` 可跳过 |
-| 3 | 复用已有 3.9.x，否则装 **Python 3.9.13**；把该解释器的第三方包全部卸干净 | 重复执行等于「重装环境」 |
+| 2 | **清理旧 Python 环境**：先结束占用 Python 的进程/服务 → 卸载 registry 里所有非 3.9 的 Python → **校验是否真卸掉** → 删残留目录、删旧 `.venv` | 保留 3.9.x，`-NoPurge` 可跳过 |
+| 3 | 复用已有 3.9.x（PATH / `py -0p` / `where` / **注册表 InstallPath** / 常见目录 全扫一遍），否则装 **Python 3.9.13**（4 级重试 + MSI 组件兜底）；把该解释器的第三方包全部卸干净 | 重复执行等于「重装环境」 |
 | 4 | 查 SSH key：有则展示，无则 `ssh-keygen -t ed25519` 生成后展示 | 有 key 绝不覆盖 |
 | 5 | 暂停等你加 Deploy key（加 `-SkipPause` 可跳过） | — |
 | 6 | `ssh -T` 验证 → `git clone` 或 `git pull` → 设仓库级 `core.sshCommand` | 仓库已存在就 pull |
@@ -240,6 +243,77 @@ python -c "import onnxruntime; print(onnxruntime.__version__)"   :: 必须是 1.
 ```
 
 两份文件按包名逐行比对即可：除第四节列出的 2 处偏差（pycryptodome 3.9.8→3.9.9、pyreadline3 仅 Windows）+ 不装 flask/schedule/paramiko/frida/gunicorn 之外，应完全一致（34/36 逐版本相同）。脚本自己的校验在阶段 7 末尾直接打印「不符」列表。
+
+### 5.2 Python 卸载 / 安装报 **1603**（踩过）
+
+```
+[WARN] Python 3.9.13 安装后仍未检测到（退出码 1603）
+```
+
+1603 是 MSI 的「致命错误」，**几乎都不是安装包本身的问题**，按概率排：
+
+| 原因 | 现象 | 处理 |
+|---|---|---|
+| **旧版本卸载时文件被占用** | 阶段 2 显示「已卸载」但注册表里还在 | 脚本现在会先结束占用进程/服务、并在卸载后复查；仍失败就**重启服务器**再跑 |
+| **有未完成的挂起重启** | `PendingFileRenameOperations` / `CBS RebootPending` | 重启服务器，再重跑 |
+| **上次安装被中断，`Installer\InProgress` 残留** | 之后每次装都 1603 | 重启服务器 |
+| **同版本已注册但文件不全** | 注册表有 `Python 3.9.13`，但找不到 `python.exe` | 脚本会自动把探测扩到注册表 `InstallPath`；再不济走 `/repair` → 清残骸重装 |
+| 没真正提权 | 非管理员跑 | 右键「以管理员身份运行」 |
+
+所以遇到 1603 的**标准动作就是：重启服务器 → 重跑脚本**。脚本已经把日志写到
+`%TEMP%\python39_install.log`，失败时会自动打印末尾 12 行；里面出现
+`Another version of this product is already installed` 就是「同版本已注册」。
+
+#### 5.2.1 服务器不能重启怎么办（生产机上还有别人在用）
+
+**别重启。** 1603 是被「一体化安装包」的事务卡住的，换成官方 MSI 组件逐个装就能绕过去。
+用 `deploy/install_python39.ps1`，它三条路依次试，任何一条成功就停：
+
+| 路线 | 做法 | 特点 |
+|---|---|---|
+| A | `msiexec /i` 装 `core/lib/exe/...` 各组件 | 最接近正规安装：写注册表、写 PATH |
+| B | `msiexec /a` 把组件**解包**到目标目录 | 不写注册表、不做文件替换，**最不容易被 1603 拦** |
+| C | 解压 `python-3.9.13-embed-amd64.zip` | 完全不经 MSI，纯解压 + 单独补 pip |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_python39.ps1
+# 装完接着跑主脚本，阶段 3 会直接「复用已有 Python 3.9.13」
+powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -SkipPause
+```
+
+**连脚本都不方便传上去**的话，把下面这段直接粘进管理员 PowerShell 也能装（就是路线 A）：
+
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+$d = "$env:TEMP\py39msi"; New-Item -ItemType Directory $d -Force | Out-Null
+$f = 'ucrt.msi','core.msi','lib.msi','exe.msi','dev.msi','tcltk.msi','tools.msi','pip.msi','path.msi'
+foreach ($n in $f) { Invoke-WebRequest "https://mirrors.huaweicloud.com/python/3.9.13/amd64/$n" -OutFile "$d\$n" -UseBasicParsing }
+foreach ($n in $f) {
+    $code = (Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$d\$n`" /qn /norestart TARGETDIR=`"C:\Program Files\Python39`" ALLUSERS=1").ExitCode
+    "{0,-14} {1}" -f $n, $code
+}
+& "C:\Program Files\Python39\python.exe" -V
+```
+
+`ucrt/dev/tcltk/tools/pip/path` 这几个装失败无所谓（非必需），只要 `core/lib/exe` 是 0 就行。
+若 `core.msi` 也返回 1603，就说明这台机器的 MSI 服务本身有问题，直接走路线 C（zip）：
+
+```powershell
+Invoke-WebRequest "https://mirrors.huaweicloud.com/python/3.9.13/python-3.9.13-embed-amd64.zip" -OutFile "$env:TEMP\py39.zip" -UseBasicParsing
+Expand-Archive "$env:TEMP\py39.zip" "C:\Python39" -Force
+# 嵌入式包默认关掉了 site，必须改 python39._pth：
+Set-Content "C:\Python39\python39._pth" "python39.zip`r`n.`r`nLib\site-packages`r`nimport site" -Encoding ASCII
+& "C:\Python39\python.exe" -V
+```
+
+> 注意 `path.msi` / 手动加 PATH 只影响「新开的终端」。脚本生成的 `run_worker.bat` 用的是
+> **python.exe 绝对路径**，PATH 没配好也能跑。
+>
+> 另外 Windows Server 2025 上 `WindowsApps` 里有个 `python.exe` 占位符，`python -V` 可能弹应用商店。
+> 到「设置 → 应用 → 应用执行别名」把 `python.exe` / `python3.exe` 关掉即可。
+
+顺带说明：老版本脚本会在这种残留状态下**反复重装同一个 3.9.13**，因为探测只看了 PATH 和几个固定目录，
+漏掉了装在 `%LOCALAPPDATA%\Programs\Python\Python39` 或自定义目录的情况 —— 现在这条路已经堵上了。
 
 ### 6. Redis 连不上
 

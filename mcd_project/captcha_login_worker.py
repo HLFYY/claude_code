@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import shutil
 import base64
@@ -121,17 +122,29 @@ def cleanup_zombie_freezes():
 
 # ---------- 数美滑块(DrissionPage) ----------
 def get_tracks(distance):
-    trace, start, v0, t = [], 0.0, 0.5, 0.2
-    faster = distance * 3 / 5
-    while start < distance:
-        a = 1.8 if start < faster else round(random.uniform(-0.7, -0.9), 2)
-        move = max(1, int(v0 * t + 0.5 * a * t * t))
-        v0 += a * t
-        if start + move >= distance:
-            trace.append(round(distance - start)); start = distance
-        else:
-            start += move; trace.append(round(move))
-    return trace
+    """人类化滑动轨迹：ease-out 加速 → 轻微过冲 → 回拉修正，并带手腕弧线 Y 抖动与变速。
+    返回 [(dx, dy, dt), ...]：dx/dy=该步相对位移(px)，dt=该步后停顿(s)。"""
+    if distance <= 0:
+        return []
+    tracks = []
+    overshoot = random.uniform(8, 22)                    # 先冲过目标一点(人类强特征)
+    peak = distance + overshoot
+    steps = max(25, int(distance / random.uniform(6.0, 9.0)))
+    cur = 0.0
+    for i in range(steps):
+        p = (i + 1) / steps
+        pos = peak * (1 - (1 - p) ** 3)                  # ease-out cubic：先快后慢
+        dx = pos - cur
+        cur = pos
+        dy = math.sin(p * math.pi) * random.uniform(0.5, 1.6)   # 手腕弧线(中间起伏最大)
+        tracks.append((dx, dy, random.uniform(0.006, 0.018)))
+    # 回拉：peak → distance，2~5 小步(模拟过冲后往回修正)
+    back = peak - distance
+    bn = random.randint(2, 5)
+    for i in range(bn):
+        tracks.append((-back / bn + random.uniform(-0.6, 0.6),
+                       random.uniform(-0.6, 0.6), random.uniform(0.02, 0.06)))
+    return tracks
 
 
 # 失败现场取证目录（服务器上滑块抓不到 fverify 时用）
@@ -306,32 +319,32 @@ def _slide_once(page):
     page.listen.start('ca/v2/fverify')
     ac = Actions(page)
     ac.hold(btn)
-    time.sleep(random.uniform(0.1, 0.25))
-    for tr in tracks:
-        ac.move(tr, random.randint(-4, 4), duration=0.05)
-    # 闭环校正：仍按住时量拼图块当前落点，与期望(piece_move)的残差补上。
-    #   拼图块位移 = 按钮位移 ×(bg_w-fg_w)/track，所以 按钮要补 = 残差 × track/(bg_w-fg_w)。
+    time.sleep(random.uniform(0.12, 0.3))        # 按下后的起手停顿
+    for dx, dy, dt in tracks:                     # 人类化轨迹(ease-out+过冲+回拉+弧线抖动)
+        ac.move(dx, dy, duration=0)
+        time.sleep(dt)
+    time.sleep(random.uniform(0.05, 0.12))        # 停稳一下再(必要时)微调
+    # 末段微调：量落点，只有残差偏大(>5px)时缓慢修一次(人也会最后轻推一下)；小残差不动，避免生硬补偿被判机器。
     btn_per_piece = (track / (bg_w - fg_w)) if (track > 1 and bg_w > fg_w > 0) else 1.0
     _curpos = None
     try:
-        for _corr in range(3):            # 最多补 3 次
-            _curpos = page.run_js(
-                'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
-                'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
-                'return (f&&b)?(f.getBoundingClientRect().left-b.getBoundingClientRect().left):null;')
-            if _curpos is None:
-                break
-            resid = piece_move - _curpos   # 还差多少(显示px，正=还需右移)
-            if abs(resid) <= 1.5:
-                break
-            step = resid * btn_per_piece   # 换算成按钮要补的像素
-            ac.move(step * 0.6, random.randint(-2, 2), duration=0.08)   # 分两小步补，更自然
-            ac.move(step * 0.4, random.randint(-2, 2), duration=0.08)
-            time.sleep(random.uniform(0.05, 0.12))
-        log_info(f"[worker][dbg] 闭环校正: 补前落点={_curpos} 期望{piece_move:.1f} btn_per_piece={btn_per_piece:.3f}")
+        _curpos = page.run_js(
+            'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
+            'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
+            'return (f&&b)?(f.getBoundingClientRect().left-b.getBoundingClientRect().left):null;')
+        if _curpos is not None:
+            resid = piece_move - _curpos
+            if abs(resid) > 5:
+                step = resid * btn_per_piece
+                # 分 2~3 小步缓慢推过去，带轻微抖动
+                parts = random.randint(2, 3)
+                for _k in range(parts):
+                    ac.move(step / parts, random.uniform(-1, 1), duration=0)
+                    time.sleep(random.uniform(0.03, 0.08))
+        log_info(f"[worker][dbg] 末段微调: 落点={_curpos} 期望{piece_move:.1f} btn_per_piece={btn_per_piece:.3f}")
     except Exception as _e:
-        log_info(f"[worker][dbg] 闭环校正异常: {_e}")
-    time.sleep(random.uniform(0.1, 0.2))
+        log_info(f"[worker][dbg] 末段微调异常: {_e}")
+    time.sleep(random.uniform(0.12, 0.25))        # 释放前的停顿
     ac.release(btn)
     # 落点核对：拖完拼图块左边缘相对 bg 的位移 vs 期望(piece_move)。误差大=公式/拖拽没到位；误差小还REJECT=行为被判。
     try:
