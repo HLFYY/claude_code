@@ -22,6 +22,7 @@ from config import DATA_DIR, REDIS_SET_URL, PROXY_REQUEST_TIMEOUT, USE_PROXY, ma
 from mcd_api import (
     generate_token,
     activate_token,
+    login_refresh,
     send_verification_code,
     login,
     build_headers,
@@ -492,6 +493,17 @@ class LoginManager:
         # 绑定:持久化 token(+tid),save_credentials 会保留 sid/meddy/d/省市/检测字段
         self.save_credentials(self.token, self.sid, self.meddy_id)
         log_info(f"✓ ensure_token: {self.phone} 已生成并绑定设备 token(tid={'有' if self.tid else '无'})")
+        # 闸门:补完 token/tid 后,用 refresh 校验"这套 sid+新设备头"是否被服务端接受。
+        # 通过才返回 token；不通过(sid 失效/换设备被拒)返回 None,让上层按未登录处理→重登。
+        try:
+            r_ok, r_msg = login_refresh(self.token, self.sid, d=self.d or '', proxies=proxies)
+        except Exception as e:
+            r_ok, r_msg = False, str(e)
+        if not r_ok:
+            log_info(f"✗ ensure_token: {self.phone} refresh 校验未通过({r_msg})，"
+                     f"sid 可能失效或换设备被拒，按未登录处理(建议重登)")
+            return None
+        log_info(f"✓ ensure_token: {self.phone} refresh 校验通过，登录态有效")
         return self.token
 
     def _update_credential(self, fields: dict) -> None:

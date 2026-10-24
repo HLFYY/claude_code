@@ -64,6 +64,7 @@ BIZ_MAP = {
     '/bff/passport/verifyCode/sms/send': ('500', '1011'),
     '/bff/passport/login/mobile': ('500', '1004'),
     '/bff/passport/login/session/refresh': ('500', '1020'),
+    '/bff/passport/login/refresh': ('500', '1020'),
     '/bff/store/cities': ('100', '1002'),
     '/bff/store/cities/group': ('103', '1007'),
     '/bff/store/stores': ('103', '1013'),
@@ -449,6 +450,39 @@ def activate_token(token, proxies=None):
         return True, tid, "Token 激活成功"
     else:
         return False, '', message
+
+
+def login_refresh(token, sid, d='', proxies=None):
+    """
+    登录态刷新/校验（闸门）: POST /bff/passport/login/refresh
+
+    无请求体（真机为空体，但空体仍参与 x-hmac-digest 签名）。只凭请求头里的
+    sid + token + v4 HMAC 签名校验"当前登录态是否被服务端接受"——服务端返回
+    data=true 即通过。biz_scenario/biz_from 按真机 = 500/1020（见 BIZ_MAP）。
+
+    注意：refresh 只"校验/续期"，不会把 token 绑定到 sid、也不会下发新 sid；
+    失败只说明这套 sid+设备头此刻不被接受（sid 失效 / 换设备被拒），应走重登。
+
+    Args:
+        token: 设备 Token（应为账号固定 token，非每次随机）
+        sid: 登录会话 SID
+        d: 数美设备指纹（可空；非签名头，有则带上更贴近真机）
+        proxies: 代理字典
+
+    Returns:
+        (success, message)  success=True 表示登录态有效
+    """
+    path = '/bff/passport/login/refresh'
+    body_str = ''  # 空体
+    headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path, d=d)
+    headers['Host'] = 'api2.mcd.cn'
+
+    url = f'{API2_BASE}{path}'
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
+
+    if success:
+        return True, "登录态刷新成功"
+    return False, message
 
 
 def send_verification_code(phone, token, proxies=None):

@@ -57,7 +57,7 @@ def _get_redis():
 # 把本机/服务器的公网出口 IP 查出来,用于加进代理白名单(站大爷/神龙都按 IP 放行)。
 # 我们网络有多个出口 → 多站点各查一次汇总;proxies={'http':None,'https':None} 强制直连(不走任何代理)。
 _IP_QUERY_SITES = [
-    'https://api.ipify.org', 'http://icanhazip.com', 'http://ifconfig.me/ip',
+    'http://icanhazip.com', 'http://ifconfig.me/ip',
     'http://ipinfo.io/ip', 'http://ipecho.net/plain', 'http://ip114.top/',
 ]
 _IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
