@@ -479,10 +479,45 @@ def set_mcgold_status(phone, status, msg='', **extra):
                  json.dumps(data, ensure_ascii=False))
 
 
+_VIP_CODE_VALID = '420'        # 要求过滑块：账号没被拦，只是要人机验证
+_VIP_CODE_INVALID = '6000232'  # 系统检测您的账号环境存在异常，暂时无法下单
+_VIP_MSG_INVALID = '异常'      # 服务端明确说异常 → 账号/设备侧不能开
+
+
+def _vip_verdict(r):
+    """判定「该账号能否开麦金卡」，返回 'valid' / 'invalid' / 'error'。
+
+    口径要严格：**只有拿到一手证据才下结论**，其余一律 error，留给下一轮重测。
+
+    - 'valid'   ← r.success（真开出来了）
+                 或 code == 420（要求过滑块，说明账号本身没被拦）
+    - 'invalid' ← code == 6000232（「系统检测您的账号环境存在异常，暂时无法下单」）
+                 或 message 里含「异常」（服务端明确拒绝）
+    - 'error'   ← 其余全部：代理异常、网络超时、连接重置、未知错误码……
+                  这类结果是"没测出来"，不能当作账号资质写进凭证。
+    """
+    if not isinstance(r, dict):
+        return 'error'
+    if r.get('success'):
+        return 'valid'
+    code = str(r.get('code') if r.get('code') is not None else '').strip()
+    if code == _VIP_CODE_VALID:
+        return 'valid'
+    msg = str(r.get('message') or '')
+    if code == _VIP_CODE_INVALID or _VIP_MSG_INVALID in msg:
+        return 'invalid'
+    return 'error'
+
+
 def handle_mcgold(payload, headless=True):
     """
     异步开通麦金卡/电商下单：order/create → 420 则过滑块(get_pass_rid,可内部重试4-5次)带
     x-mcd-sec-verify 重试 → 成功写 done(orderId/payId)。与发码共用同一滑块方案。
+
+    凭证回写(vip_status/vip_time)的口径：**账号能否开麦金卡**，不是本次下单成败。
+    success 或 420 → valid；6000232 或 message 含「异常」 → invalid；
+    其余（代理/网络异常、未知码） → error，不当作账号资质，留给下一轮重测。
+    成功/失败/异常都在 finally 统一写。
     """
     phone = payload.get('phone')
     sku_id = payload.get('sku_id')
@@ -493,6 +528,8 @@ def handle_mcgold(payload, headless=True):
     merchant_id = payload.get('merchant_id')
     proxy_source = payload.get('proxy_source')
     beat(phone)
+    manager = None      # 供 finally 回写凭证状态(构造失败时为 None)
+    vip_result = None   # 'valid'/'invalid'/'error'，finally 里统一写 vip_status/vip_time
     try:
         set_mcgold_status(phone, 'processing', '开始开通')
         manager = LoginManager(phone, use_redis=True, city=city,
@@ -525,6 +562,8 @@ def handle_mcgold(payload, headless=True):
             rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
                                on_beat=lambda: beat(phone), tag=f'mcgold-{phone}')
             if not rid:
+                # 能走到这里说明 r.code == 420 → 账号本身可开，只是本次滑块没过
+                vip_result = _vip_verdict(r)
                 set_mcgold_status(phone, 'failed', '滑块多次未通过'); return
             beat(phone)
             sec = base64.b64encode(f"{punish_id};{verify_sdk};{int(time.time()*1000)};{rid}".encode()).decode()
@@ -536,19 +575,28 @@ def handle_mcgold(payload, headless=True):
             d = r.get('data') or {}
             set_mcgold_status(phone, 'done', '开通下单成功',
                               orderId=d.get('orderId'), payId=d.get('payId'))
-            try:
-                manager.record_vip('valid')  # 下单成功→写凭证 vip_status/vip_time(同 check_* 定义,含义是麦金卡)
-            except Exception as _e:
-                log_info(f"[worker] 麦金卡 {phone} 写 vip 状态失败: {_e}")
+            vip_result = 'valid'   # 成功状态由 finally 统一回写凭证
             log_info(f"[worker] 麦金卡 {phone} 成功 orderId={d.get('orderId')} payId={d.get('payId')}")
         else:
+            # 严格三分类：420 → valid(账号可开)；6000232 / message 含「异常」 → invalid；
+            # 其余（代理/网络抖动、未知码） → error，本次不算结论，下轮重测
+            vip_result = _vip_verdict(r)
             set_mcgold_status(phone, 'failed', f"{r.get('code')}:{r.get('message')}")
-            log_info(f"[worker] 麦金卡 {phone} 失败 {r.get('code')}:{r.get('message')}")
+            log_info(f"[worker] 麦金卡 {phone} 失败 {r.get('code')}:{r.get('message')} "
+                     f"(vip_status={vip_result})")
     except Exception as e:
         import traceback
+        vip_result = 'error'   # 异常 ≠ 账号不能开：可能是代理/网络问题，不下结论
         log_info(f"[worker] 麦金卡 {phone} 异常: {traceback.format_exc()}")
         set_mcgold_status(phone, 'failed', f'异常:{e}')
     finally:
+        # 成功/失败都回写凭证(vip_status + vip_time)，供 batch 脚本按状态分流
+        if manager is not None and vip_result:
+            try:
+                manager.record_vip(vip_result)
+                log_info(f"[worker] 麦金卡 {phone} 已写 vip_status={vip_result}")
+            except Exception as _e:
+                log_info(f"[worker] 麦金卡 {phone} 写 vip 状态失败: {_e}")
         clear_processing(phone)
 
 

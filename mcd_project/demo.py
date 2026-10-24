@@ -1,4 +1,7 @@
 import json
+import re
+import sys
+from datetime import datetime
 from urllib.parse import quote
 import requests
 import redis
@@ -128,32 +131,38 @@ def _read_accounts_from_excel(excel_path):
 
 
 def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
-                          env='local', merchant_id=None, cities=None, mode='add'):
-    """批量跑麦金卡开通：读 Excel → 逐账号按 mode 过滤 → 调 mcgold_flow。
+                          env='local', merchant_id=None, cities=None,
+                          sku_pick='last', pause_on_success=False):
+    """批量跑麦金卡开通：读 Excel → 逐账号按凭证状态决定动作 → 调 mcgold_flow。
 
-    两种模式(mode)：
-      - 'add'  新增：只处理【没有 token】的账号；写入凭证(token 空，由服务端 ensure_token
-               补全)后再跑 mcgold_flow。已有 token 的跳过。
-      - 'check' 检查：只处理【已有 token】的账号；不写凭证，直接跑 mcgold_flow。无 token 的跳过。
+    不再区分 mode，统一逻辑（按该账号在 Redis 凭证里的状态分支）：
 
-    城市分配：凭证里带 province/city 就用凭证里的；没有则从 cities(MAJOR_CITIES) 依次轮取，
-             省份由 CITY_PROVINCE 推。
+      | 凭证状态                          | 动作                                  | 请求省市来源        |
+      |-----------------------------------|---------------------------------------|--------------------|
+      | 不存在                             | 写入凭证(token 空/sid/meddyId)后测试     | cities 依次取       |
+      | vip_status == 'valid'（能开/已开） | **跳过，不测试**                        | —                  |
+      | vip_status == 'invalid'（确定不能开）| 清空 token + province + city 后测试   | cities 依次取       |
+      | vip_status == 'error'（没测出来）   | **保留凭证原样**，直接重测               | 凭证里的 province/city |
+      | vip_status 不存在/为空              | **不改 Redis**，直接测试                 | 凭证里的 province/city |
 
-    其它：
+    其它约定：
+    - 套餐自动取服务端返回列表的**最后一个**（当前是麦金卡365天 ¥118，skuId=12536），
+      不再交互式选择；传 sku_pick='first' 可改取第一个。
+    - 跑完**不删除** Redis 里的账号凭证。
+    - vip_status **以 worker 回写为准**，三态口径：valid=能开/已开，invalid=服务端
+      明确拒绝(6000232 或 message 含「异常」)，error=本次没测出来(代理/网络/未知码)。
+      只有 invalid 才清 token 换城市重来；error 视为状态未定，凭证原样保留重测。
+      demo 只在 worker 没回写（凭证里仍为空）时兜底，且兜底只认「真开通成功」。
     - env 同时决定：Redis 走本地/线上，mcgold_flow 请求本地(127.0.0.1:5001)/线上(dns.xme.fan:5001)。
-    - mcgold_flow 内选套餐仍需手动输入(逐账号一次)。
-    - 开通成功：打印成功并暂停等回车；失败且 env=='online' 删除该账号线上凭证(本地不删)。
-    - 结尾汇总每个账号的下单结果(成功/失败/跳过 + 账号 + 城市)。
 
     Args:
         excel_path: Excel 路径(列: phone/sid/meddyId)
         env: 'local' / 'online'
         merchant_id: 商户ID，默认 100001
         cities: 城市列表(轮取)，默认 MAJOR_CITIES
-        mode: 'add'(新增,只看无token) / 'check'(检查,只看有token)
+        sku_pick: 'last'(默认，取最后一个套餐) / 'first'
+        pause_on_success: 成功后是否暂停等回车（批量跑建议 False）
     """
-    if mode not in ('add', 'check'):
-        raise ValueError(f"mode 只能是 'add' 或 'check'，收到: {mode!r}")
     import run_api_client as rc_mod   # 延迟导入：导入时会打印 API_BASE
 
     merchant_id = merchant_id or MERCHANT_ID_DEFAULT
@@ -166,8 +175,37 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
     rconn, conf = _redis_conn(env)
     key = CREDENTIALS_KEY_TMPL.format(merchant_id=merchant_id)
     accounts = _read_accounts_from_excel(excel_path)
-    print(f"[batch] mode={mode} env={env} Redis={conf['host']}:{conf['port']} 域名={base} "
-          f"key={key} 账号数={len(accounts)}")
+    # 只有「新账号」和「失败重试」才消耗城市位，跳过/保留的账号不占位
+    city_seq = {'n': 0}
+
+    def _next_city():
+        """从 cities 依次取（循环），返回 (city, province)。"""
+        c = cities[city_seq['n'] % len(cities)]
+        city_seq['n'] += 1
+        return c, CITY_PROVINCE.get(c, c)
+
+    def _load(phone):
+        """读凭证，返回 dict；不存在或解析失败返回 None。"""
+        raw = rconn.hget(key, phone)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _save(phone, row):
+        rconn.hset(key, phone, json.dumps(row, ensure_ascii=False))
+
+    def _set_vip(phone, status):
+        """兜底回写 vip_status/vip_time（仅在 worker 没写时用），保留其余字段。"""
+        row = _load(phone) or {}
+        row['vip_status'] = status
+        row['vip_time'] = datetime.now().isoformat()
+        _save(phone, row)
+
+    print(f"[batch] env={env} Redis={conf['host']}:{conf['port']} 域名={base} "
+          f"key={key} 账号数={len(accounts)} sku={sku_pick}")
 
     def _open_status(phone):
         """查该账号麦金卡开通最终状态，返回 (status, msg, orderId, payId)。"""
@@ -178,88 +216,130 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
         except Exception as e:
             return None, str(e), '', ''
 
+    # mcgold_flow 内部用 input() 选套餐 —— 临时给模块挂一个自动应答，只影响该模块
+    _orig_input = getattr(rc_mod, 'input', None)
+
+    def _auto_pick(prompt=''):
+        m = re.search(r'1-(\d+)', str(prompt))
+        if not m:
+            return ''
+        return str(int(m.group(1))) if sku_pick == 'last' else '1'
+
+    rc_mod.input = _auto_pick
+
     results = []   # [{phone, city, province, result, detail}]
-    for idx, (phone, sid, meddy) in enumerate(accounts, 1):
-        if idx < 0:
-            print(f'手动跳过{idx}')
-            continue
-        # 1. 读凭证
-        raw = rconn.hget(key, phone)
-        cur = {}
-        if raw:
+    try:
+        for idx, (phone, sid, meddy) in enumerate(accounts, 1):
+            # ---------- 1. 读凭证，决定分支 ----------
+            cur = _load(phone)
+            if cur is None:
+                # ① 账号不存在 → 写入凭证(token 空，由服务端 ensure_token 补全)
+                _save(phone, {'token': '', 'sid': sid, 'meddy_id': meddy,
+                              'vip_status': '', 'vip_time': ''})
+                city, province = _next_city()
+                print("\n" + "=" * 60)
+                print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} "
+                      f"[新账号] 已写入凭证(空 token)")
+            else:
+                vs = (cur.get('vip_status') or '').strip().lower()
+                if vs == 'valid':
+                    # ② 已成功过 → 不测试
+                    print(f"\n[{idx}/{len(accounts)}] phone={phone} [已成功 vip_status=valid] 跳过")
+                    results.append({'phone': phone,
+                                    'city': cur.get('city', ''), 'province': cur.get('province', ''),
+                                    'result': '跳过', 'detail': 'vip_status=valid 已开通'})
+                    continue
+                if vs == 'invalid':
+                    # ③ 服务端明确拒绝过 → 清空 token 与省市，换城市重来
+                    cur['token'] = ''
+                    cur['province'] = ''
+                    cur['city'] = ''
+                    _save(phone, cur)
+                    city, province = _next_city()
+                    print("\n" + "=" * 60)
+                    print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} "
+                          f"[确定不能开 vip_status=invalid] 已清空 token/province/city")
+                else:
+                    # ④ 'error'（上次没测出来）或 vip_status 缺失 → 凭证原样不动，直接重测
+                    city = cur.get('city') or ''
+                    province = cur.get('province') or (CITY_PROVINCE.get(city, city) if city else '')
+                    if not city:
+                        city, province = _next_city()   # 凭证里连城市都没有，兜底轮取
+                    tag = '状态未定 vip_status=error' if vs == 'error' else '无 vip_status'
+                    print("\n" + "=" * 60)
+                    print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province or '-'}/{city or '-'} "
+                          f"[{tag}] 不改 Redis，沿用凭证省市")
+
+            # ---------- 2. 调 mcgold_flow：喂该手机号(触发服务端 ensure_token)，省市走 _extra_params ----------
+            rc_mod._CURRENT_PROVINCE = province
+            rc_mod._CURRENT_CITY = city
+
+            def _auto_login_info(_phone=phone, _prov=province, _city=city):
+                """替代交互式 get_login_info：直接用该手机号查状态(触发 ensure_token)，不手输。"""
+                rc_mod._CURRENT_PROVINCE = _prov
+                rc_mod._CURRENT_CITY = _city
+                res = rc_mod.api_call('/api/login/status',
+                                      params={'phone': _phone, **rc_mod._extra_params()})
+                d = res.get('data', {}) if res.get('success') else {}
+                if not d.get('is_logged_in'):
+                    raise RuntimeError(f"{_phone} 未登录/凭证无效: {res}")
+                return _phone, d.get('token'), d.get('sid'), d.get('meddy_id')
+
+            rc_mod.get_login_info = _auto_login_info
+            flow_err = ''                                # 记录本地这侧的异常原因，供后面自愈
             try:
-                cur = json.loads(raw)
-            except Exception:
-                cur = {}
-        has_token = bool(cur.get('token'))
+                rc_mod.mcgold_flow()
+            except SystemExit as e:                      # mcgold_flow 内失败会 sys.exit，拦下继续下一个
+                flow_err = f'exit({e.code})'
+                print(f"  ✗ mcgold_flow 退出(code={e.code})，继续下一个")
+            except Exception as e:
+                flow_err = str(e)
+                print(f"  ✗ mcgold_flow 异常: {e}，继续下一个")
 
-        # 城市：凭证里带 province/city 就用凭证的；没有则从 cities 依次轮取
-        if cur.get('city'):
-            city = cur.get('city')
-            province = cur.get('province') or CITY_PROVINCE.get(city, city)
-        else:
-            city = cities[(idx - 1) % len(cities)]
-            province = CITY_PROVINCE.get(city, city)
-
-        print("\n" + "=" * 60)
-        print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} has_token={has_token}")
-
-        # 2. 按 mode 过滤 + 决定是否写入
-        if mode == 'add':
-            if has_token:                            # 新增模式：有 token 的跳过
-                print(f"  [新增] 已有 token，跳过")
+            # ---------- 3. 以服务端开通状态为准记录本次结果 ----------
+            status, msg, order_id, pay_id = _open_status(phone)
+            if status == 'done':
+                print(f"  ✅ 开通成功 phone={phone} 城市={province}/{city} "
+                      f"orderId={order_id} payId={pay_id}")
                 results.append({'phone': phone, 'city': city, 'province': province,
-                                'result': '跳过', 'detail': '已有 token(新增模式)'})
-                continue
-            write_credential(phone, sid, meddy, env=env, merchant_id=merchant_id)  # 写空 token
-        else:  # mode == 'check'
-            if not has_token:                        # 检查模式：无 token 的跳过
-                print(f"  [检查] 无 token，跳过")
+                                'result': '成功', 'detail': f'orderId={order_id} payId={pay_id}'})
+                if pause_on_success:
+                    input(f"  >>> 账号 {phone} 开通成功，按回车继续下一个账号...")
+            else:
+                print(f"  ✗ 开通失败 phone={phone} 城市={province}/{city} status={status} {msg}")
                 results.append({'phone': phone, 'city': city, 'province': province,
-                                'result': '跳过', 'detail': '无 token(检查模式)'})
-                continue
-            # 检查模式不写凭证，直接用现有的
+                                'result': '失败', 'detail': f'status={status} {msg}'})
+                # 注意：不删除 Redis 凭证（账号与 sid 保留，供下次重试）
 
-        # 3. 调 mcgold_flow：喂该手机号(触发服务端 ensure_token)，省市走 _extra_params
-        rc_mod._CURRENT_PROVINCE = province
-        rc_mod._CURRENT_CITY = city
+            # ---------- 4. vip_status 以 worker 写回的为准 ----------
+            # worker 判的是「账号能否开麦金卡」（success/420 → valid，6000232 或 message
+            # 含「异常」 → invalid，其余 → error）。这里只在 worker 没写时兜底，且兜底
+            # 严格只认「真开通成功」：open_status 非 done 时原因不可辨（可能是 420 没过滑
+            # 块，也可能是代理断了），一律记 error，不下 invalid 的结论。
+            after = _load(phone) or {}
+            if not (after.get('vip_status') or '').strip():
+                verdict = 'valid' if status == 'done' else 'error'
+                _set_vip(phone, verdict)
+                extra = '' if verdict == 'valid' else '（open_status 非 done，原因不可辨，下轮重测）'
+                print(f"  [兜底] worker 未回写 vip_status，记为 {verdict}{extra}")
 
-        def _auto_login_info(_phone=phone, _prov=province, _city=city):
-            """替代交互式 get_login_info：直接用该手机号查状态(触发 ensure_token)，不手输。"""
-            rc_mod._CURRENT_PROVINCE = _prov
-            rc_mod._CURRENT_CITY = _city
-            res = rc_mod.api_call('/api/login/status',
-                                  params={'phone': _phone, **rc_mod._extra_params()})
-            d = res.get('data', {}) if res.get('success') else {}
-            if not d.get('is_logged_in'):
-                raise RuntimeError(f"{_phone} 未登录/凭证无效: {res}")
-            return _phone, d.get('token'), d.get('sid'), d.get('meddy_id')
-
-        rc_mod.get_login_info = _auto_login_info
-        try:
-            rc_mod.mcgold_flow()
-        except SystemExit as e:                      # mcgold_flow 内失败会 sys.exit，拦下继续下一个
-            print(f"  ✗ mcgold_flow 退出(code={e.code})，继续下一个")
-        except Exception as e:
-            print(f"  ✗ mcgold_flow 异常: {e}，继续下一个")
-
-        # 4. 以服务端开通状态为准判定下单结果
-        status, msg, order_id, pay_id = _open_status(phone)
-        if status == 'done':
-            print(f"  ✅ 开通成功 phone={phone} 城市={province}/{city} "
-                  f"orderId={order_id} payId={pay_id}")
-            results.append({'phone': phone, 'city': city, 'province': province,
-                            'result': '成功', 'detail': f'orderId={order_id} payId={pay_id}'})
-            # 成功：暂停，等我手动确认(处理支付/记录)后再继续下一个
-            input(f"  >>> 账号 {phone} 开通成功，按回车继续下一个账号...")
+            # 本地这侧就登录失败（凭证不可用）→ 清 token 让服务端重新 ensure_token，
+            # 否则下一轮 error 分支会保留旧 token、反复卡在未登录
+            if '未登录' in flow_err:
+                row = _load(phone) or {}
+                if row.get('token'):
+                    row['token'] = ''
+                    _save(phone, row)
+                    print("  [自愈] 凭证未登录，已清空 token 待服务端重新生成")
+    finally:
+        # 恢复模块本来的 input，避免影响其它调用
+        if _orig_input is None:
+            try:
+                del rc_mod.input
+            except AttributeError:
+                pass
         else:
-            print(f"  ✗ 开通失败 phone={phone} 城市={province}/{city} status={status} {msg}")
-            results.append({'phone': phone, 'city': city, 'province': province,
-                            'result': '失败', 'detail': f'status={status} {msg}'})
-            # 失败且走线上 Redis：删掉该账号凭证(本地测试不删)
-            if env == 'online' and mode == 'add':
-                rconn.hdel(key, phone)
-                print(f"  🗑 线上失败，已删除凭证 {key} field={phone}")
+            rc_mod.input = _orig_input
 
     # ===== 结果汇总 =====
     ok = sum(1 for r in results if r['result'] == '成功')
@@ -346,9 +426,10 @@ if __name__ == '__main__':
     # write_credential('19338807286', '0innBrouP0...', 'MEDDY196678424740382833', env='local')
 
     # sync_credential_to_online('15977852477')
-    # 批量: 读 Excel → 按 mode 过滤 → 逐账号跑麦金卡开通(选套餐需手输)
-    # 用法: python demo.py <local|online> <add|check>   默认 local add
-    import sys
+    # 批量: 读 Excel → 按凭证状态分支(新/成功跳过/失败重试/无状态) → 逐账号跑麦金卡开通
+    # 用法: python demo.py <local|online> [last|first]   默认 local last
+    #   last  = 套餐自动取最后一个（麦金卡365天 ¥118, skuId=12536）
+    #   first = 套餐自动取第一个
     env = sys.argv[1] if len(sys.argv) > 1 else 'local'
-    mode = sys.argv[2] if len(sys.argv) > 2 else 'add'
-    run_mcgold_from_excel(env=env, mode=mode)
+    sku_pick = sys.argv[2] if len(sys.argv) > 2 else 'last'
+    run_mcgold_from_excel(env=env, sku_pick=sku_pick)

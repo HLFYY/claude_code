@@ -21,6 +21,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # API 配置
 # API_BASE = 'http://127.0.0.1:5001'
 API_BASE = 'http://dns.xme.fan:5001'
+print(f'请求接口地址:{API_BASE}')
 # 默认配置
 DEFAULT_PHONE = '18019701277'
 DEFAULT_PROVINCE = '上海'
@@ -33,7 +34,7 @@ PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
 PAY_MONEY_FILE = os.path.join(DATA_DIR, 'save_payment_money.json')
 
 # True = 登录/下单请求都带上省份+城市; False = 都不带(由服务端取凭证里已绑定的省市)
-SEND_LOCATION = True
+SEND_LOCATION = False
 # 代理源:用来测不同代理。'zdtps'=站大爷 / 'shenlong'=神龙 / ''=不传(用服务端默认 zdtps)
 PROXY_SOURCE = 'zdtps'
 
@@ -1192,7 +1193,7 @@ def mcgold_flow():
     print(f"⏳ {result.get('message', '已入队')}，等待 worker 过滑块开通...")
 
     # 轮询开通状态（queued/processing/done/failed），最多等 15 分钟
-    poll_interval, poll_timeout, waited = 10, 15 * 60, 0
+    poll_interval, poll_timeout, waited = 5, 15 * 60, 0
     order_id = pay_id = ''
     while waited < poll_timeout:
         st = api_call('/api/member/open_status', params={'phone': phone})
