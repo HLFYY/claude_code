@@ -218,23 +218,41 @@ def _slide_once(page):
         log_info(f"[worker][dbg] 取滑块图失败 bg={bool(bg_bytes)} fg={bool(fg_bytes)}")
         return None, None
     res = _ocr.slide_match(fg_bytes, bg_bytes, simple_target=True)
-    native_w = Image.open(io.BytesIO(bg_bytes)).size[0]
-    # 显示宽度用 getBoundingClientRect 的 CSS 宽度：与拖动(Actions.move)同坐标系、与 DPR 无关；
-    # 避免 Windows 显示缩放把 bg_ele.size(物理像素)放大→缺口偏，也避开 Linux 无头 getBoxModel 的 NoRectError。
+    native_w = Image.open(io.BytesIO(bg_bytes)).size[0]   # OCR 结果所在坐标系 = 下载图的原生宽
+    # 一次性量取(都是 CSS 像素，与拖动 Actions.move 同坐标系、与 DPR 无关)：
+    #   bg 显示宽、bg 原生宽(naturalWidth)、拼图块相对 bg 的左偏移。
+    disp_w = dom_native = 0
+    fg_left = 0.0
     try:
-        disp_w = page.run_js('return document.querySelector(".shumei_captcha_loaded_img_bg").getBoundingClientRect().width') or 0
+        _m = page.run_js(
+            'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
+            'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
+            'var rb=b.getBoundingClientRect();'
+            'var rf=f?f.getBoundingClientRect():null;'
+            'return [rb.width, b.naturalWidth||0, rf?(rf.left-rb.left):0];')
+        if _m:
+            disp_w = _m[0] or 0
+            dom_native = _m[1] or 0
+            fg_left = _m[2] or 0
     except Exception:
-        disp_w = 0
+        pass
     if not disp_w or disp_w <= 1:
         try:
-            disp_w = bg_ele.size[0]      # 兜底
+            disp_w = bg_ele.size[0]      # 兜底(可能含 DPR)
         except Exception:
             log_info("[worker][dbg] 取滑块显示宽度失败，本轮跳过"); return None, None
-    zoom = disp_w / native_w
-    distance = res['target'][0] * zoom
+    # 等比：显示宽/原生宽。优先用 DOM 的 naturalWidth(和下载图同一张，最自洽)，取不到用下载图宽。
+    base_native = dom_native if dom_native > 1 else native_w
+    zoom = disp_w / base_native
+    # 缺口 x(原生) → 显示距离；再减掉拼图块当前左偏移(fg_left)——消除"每次都过一点"
+    raw = res['target'][0] * (base_native / native_w) * zoom      # = target * disp_w/native_w
+    distance = raw - fg_left
+    if distance < 0:
+        distance = raw
     distance -= random.randint(0, max(1, int(distance * 0.02)))
     log_info(f"[worker][dbg] slide_match target={res['target']} native_w={native_w} "
-             f"disp_w={disp_w} zoom={zoom:.3f} distance={distance:.0f}")
+             f"dom_native={dom_native} disp_w={disp_w:.1f} zoom={zoom:.3f} "
+             f"fg_left={fg_left:.1f} raw={raw:.1f} distance={distance:.0f}")
     tracks = get_tracks(distance)
 
     btn = page.ele('.shumei_captcha_slide_btn')
