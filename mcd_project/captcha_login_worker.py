@@ -178,11 +178,39 @@ def _fetch_img(ele):
     return None
 
 
+def _imgs_ready(page):
+    """滑块前景/背景图是否真正加载完(complete 且 naturalWidth>0)。
+    Windows 上常拖到"图片加载中…"的占位图→OCR 对空白算→缺口错，拖前必须先确认加载完。"""
+    try:
+        return bool(page.run_js(
+            'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
+            'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
+            'return !!(b&&f&&b.complete&&f.complete&&b.naturalWidth>0&&f.naturalWidth>0);'))
+    except Exception:
+        return False
+
+
 def _slide_once(page):
     bg_ele = page.ele('.shumei_captcha_loaded_img_bg', timeout=3)
     fg_ele = page.ele('.shumei_captcha_loaded_img_fg', timeout=3)
     if not bg_ele or not fg_ele:
         log_info(f"[worker][dbg] 滑块图元素缺失 bg={bool(bg_ele)} fg={bool(fg_ele)}")
+        return None, None
+    # 下载/识别缺口【之前】先等图真正加载完(不是"图片加载中"占位)——否则 OCR 对着空白算，缺口必错。
+    # 最多 2 轮、每轮轮询 ~5s：加载好→直接继续；没好→再等 1 轮；仍没好→本轮跳过(交回去点刷新换新图重试)。
+    loaded = False
+    for _rnd in range(2):
+        _t = time.time()
+        while time.time() - _t < 5:
+            if _imgs_ready(page):
+                loaded = True
+                break
+            time.sleep(0.3)
+        if loaded:
+            break
+        log_info(f"[worker][dbg] 滑块图第{_rnd + 1}轮未加载完(图片加载中…)，继续等…")
+    if not loaded:
+        log_info("[worker][dbg] 滑块图2轮仍未加载完，本轮跳过刷新重试")
         return None, None
     bg_bytes = _fetch_img(bg_ele)
     fg_bytes = _fetch_img(fg_ele)
@@ -191,7 +219,17 @@ def _slide_once(page):
         return None, None
     res = _ocr.slide_match(fg_bytes, bg_bytes, simple_target=True)
     native_w = Image.open(io.BytesIO(bg_bytes)).size[0]
-    disp_w = bg_ele.size[0]
+    # 显示宽度用 getBoundingClientRect 的 CSS 宽度：与拖动(Actions.move)同坐标系、与 DPR 无关；
+    # 避免 Windows 显示缩放把 bg_ele.size(物理像素)放大→缺口偏，也避开 Linux 无头 getBoxModel 的 NoRectError。
+    try:
+        disp_w = page.run_js('return document.querySelector(".shumei_captcha_loaded_img_bg").getBoundingClientRect().width') or 0
+    except Exception:
+        disp_w = 0
+    if not disp_w or disp_w <= 1:
+        try:
+            disp_w = bg_ele.size[0]      # 兜底
+        except Exception:
+            log_info("[worker][dbg] 取滑块显示宽度失败，本轮跳过"); return None, None
     zoom = disp_w / native_w
     distance = res['target'][0] * zoom
     distance -= random.randint(0, max(1, int(distance * 0.02)))
@@ -300,10 +338,11 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-dev-shm-usage')  # 容器 /dev/shm 太小会崩
     co.set_argument('--disable-blink-features=AutomationControlled')  # 去自动化标记,navigator.webdriver 不为 true(数美 bot 检测常命中点)
+    co.set_argument('--force-device-scale-factor=1')  # 强制 DPR=1：避免 Windows 显示缩放(125%/150%)把测量放大→缺口偏，三端一致
+    co.set_argument('--window-size=1280,800')         # 固定窗口尺寸(非无头也固定)
     if headless:
         co.set_argument('--headless=new')  # 新无头(扩展/服务器都更稳)
         co.set_argument('--disable-gpu')
-        co.set_argument('--window-size=1280,800')
     if proxy_parts:
         if use_ext:
             ext_dir = make_proxy_auth_extension(proxy_parts['host'], proxy_parts['port'],

@@ -22,6 +22,12 @@ MAJOR_CITIES = [
     '南京', '苏州', '郑州', '长沙', '青岛', '沈阳', '大连', '宁波', '厦门', '福州',
 ]
 
+# 累计被服务端判 invalid 的次数（Redis Hash：field=手机号，value=次数）。
+# 单次 invalid 不代表账号废了（可能是城市/代理/设备当时的组合问题），要连吃够
+# VIP_INVALID_CLEAR_AT 次才认为"当前 token + 省市这套组合"确实走不通，那时才清空重来。
+VIP_INVALID_COUNT_KEY_TMPL = 'mkt:prod:{merchant_id}:vip_invalid'
+VIP_INVALID_CLEAR_AT = 3
+
 
 def _redis_conn(env):
     """按 env 返回 (redis客户端, 连接信息dict)。'local'=本机 / 'online'=线上。"""
@@ -137,13 +143,21 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
 
     不再区分 mode，统一逻辑（按该账号在 Redis 凭证里的状态分支）：
 
-      | 凭证状态                          | 动作                                  | 请求省市来源        |
-      |-----------------------------------|---------------------------------------|--------------------|
-      | 不存在                             | 写入凭证(token 空/sid/meddyId)后测试     | cities 依次取       |
-      | vip_status == 'valid'（能开/已开） | **跳过，不测试**                        | —                  |
-      | vip_status == 'invalid'（确定不能开）| 清空 token + province + city 后测试   | cities 依次取       |
-      | vip_status == 'error'（没测出来）   | **保留凭证原样**，直接重测               | 凭证里的 province/city |
-      | vip_status 不存在/为空              | **不改 Redis**，直接测试                 | 凭证里的 province/city |
+      | 凭证状态                                    | 动作                              | 请求省市来源          |
+      |--------------------------------------------|-----------------------------------|----------------------|
+      | 不存在                                       | 写入凭证(token 空/sid/meddyId)后测试 | cities 依次取         |
+      | vip_status == 'valid'（能开/已开）           | **跳过，不测试**                    | —                    |
+      | vip_status == 'invalid' 且累计次数 < 3        | 凭证原样（**沿用已有 token + 省市**） | 凭证里的 province/city |
+      | vip_status == 'invalid' 且累计次数 >= 3       | 清空 token，换 cities 的下一个城市    | cities 依次取         |
+      | vip_status == 'error'（没测出来）             | **保留凭证原样**，直接重测            | 凭证里的 province/city |
+      | vip_status 不存在/为空                        | **不改 Redis**，直接测试              | 凭证里的 province/city |
+
+    invalid 计数（Redis Hash `mkt:prod:{merchant_id}:vip_invalid`，field=手机号）：
+    - 每次跑完最终 vip_status == 'invalid' → 次数 +1；
+    - 最终 vip_status == 'valid' → **删掉该账号的计数**（归零，重新开始）；
+    - error / 跳过 / 无状态 → 不动计数。
+    计数 >= VIP_INVALID_CLEAR_AT(3) 时清空 token + 换城市，同时把计数归零，
+    等于开启新一轮累计（否则第 4、5 次会连续立刻清空）。
 
     其它约定：
     - 套餐自动取服务端返回列表的**最后一个**（当前是麦金卡365天 ¥118，skuId=12536），
@@ -151,7 +165,6 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
     - 跑完**不删除** Redis 里的账号凭证。
     - vip_status **以 worker 回写为准**，三态口径：valid=能开/已开，invalid=服务端
       明确拒绝(6000232 或 message 含「异常」)，error=本次没测出来(代理/网络/未知码)。
-      只有 invalid 才清 token 换城市重来；error 视为状态未定，凭证原样保留重测。
       demo 只在 worker 没回写（凭证里仍为空）时兜底，且兜底只认「真开通成功」。
     - env 同时决定：Redis 走本地/线上，mcgold_flow 请求本地(127.0.0.1:5001)/线上(dns.xme.fan:5001)。
 
@@ -204,6 +217,30 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
         row['vip_time'] = datetime.now().isoformat()
         _save(phone, row)
 
+    # ---- invalid 累计计数（独立 Hash，不塞进凭证 JSON，免得和 worker 的写入互相覆盖）----
+    cnt_key = VIP_INVALID_COUNT_KEY_TMPL.format(merchant_id=merchant_id)
+
+    def _invalid_cnt(phone):
+        """读该账号已累计的 invalid 次数；没有/读不到都算 0。"""
+        try:
+            return int(rconn.hget(cnt_key, phone) or 0)
+        except Exception:
+            return 0
+
+    def _bump_invalid(phone):
+        """invalid 次数 +1，返回累计后的值。"""
+        try:
+            return int(rconn.hincrby(cnt_key, phone, 1))
+        except Exception:
+            return -1
+
+    def _reset_invalid(phone):
+        """清零该账号的 invalid 计数（成功时用）。"""
+        try:
+            rconn.hdel(cnt_key, phone)
+        except Exception:
+            pass
+
     print(f"[batch] env={env} Redis={conf['host']}:{conf['port']} 域名={base} "
           f"key={key} 账号数={len(accounts)} sku={sku_pick}")
 
@@ -227,6 +264,13 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
 
     rc_mod.input = _auto_pick
 
+    # SEND_LOCATION 是 run_api_client 的模块级开关。它关着时 _extra_params() 不返回省市，
+    # demo 这边算好的城市就传不出去了 —— /api/member/open 的 body 里没有 city，
+    # server 入队 payload 也是 city=None，worker 提代理只能 adr=不限(池里 city=any)。
+    # 批量跑必须打开，跑完恢复。
+    _orig_send_loc = getattr(rc_mod, 'SEND_LOCATION', False)
+    rc_mod.SEND_LOCATION = True
+
     results = []   # [{phone, city, province, result, detail}]
     try:
         for idx, (phone, sid, meddy) in enumerate(accounts, 1):
@@ -234,9 +278,12 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
             cur = _load(phone)
             if cur is None:
                 # ① 账号不存在 → 写入凭证(token 空，由服务端 ensure_token 补全)
-                _save(phone, {'token': '', 'sid': sid, 'meddy_id': meddy,
-                              'vip_status': '', 'vip_time': ''})
+                # 城市一并写进凭证：worker 按 city 提代理，不写就只能提 adr=不限(any)
                 city, province = _next_city()
+                _save(phone, {'token': '', 'sid': sid, 'meddy_id': meddy,
+                              'province': province, 'city': city,
+                              'vip_status': '', 'vip_time': ''})
+                _reset_invalid(phone)      # 凭证是新建的，顺手清掉可能残留的旧计数
                 print("\n" + "=" * 60)
                 print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} "
                       f"[新账号] 已写入凭证(空 token)")
@@ -250,15 +297,31 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
                                     'result': '跳过', 'detail': 'vip_status=valid 已开通'})
                     continue
                 if vs == 'invalid':
-                    # ③ 服务端明确拒绝过 → 清空 token 与省市，换城市重来
-                    cur['token'] = ''
-                    cur['province'] = ''
-                    cur['city'] = ''
-                    _save(phone, cur)
-                    city, province = _next_city()
-                    print("\n" + "=" * 60)
-                    print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} "
-                          f"[确定不能开 vip_status=invalid] 已清空 token/province/city")
+                    n_inv = _invalid_cnt(phone)
+                    if n_inv >= VIP_INVALID_CLEAR_AT:
+                        # ③a 连吃够 3 次 invalid → 当前 token+省市这套组合确实走不通，
+                        #     清 token、换下一个城市，并把计数归零重新开始累计。
+                        #     （城市直接写进凭证：worker 读凭证就能按城市提代理，
+                        #      不必依赖请求参数透传）
+                        city, province = _next_city()
+                        cur['token'] = ''
+                        cur['province'] = province
+                        cur['city'] = city
+                        _save(phone, cur)
+                        _reset_invalid(phone)
+                        print("\n" + "=" * 60)
+                        print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province}/{city} "
+                              f"[invalid 已 {n_inv} 次] 已清空 token、换城市，计数归零")
+                    else:
+                        # ③b 次数还不够 → 不动凭证，沿用已有 token + 省市重测一次
+                        city = cur.get('city') or ''
+                        province = cur.get('province') or (CITY_PROVINCE.get(city, city) if city else '')
+                        if not city:
+                            city, province = _next_city()   # 凭证里连城市都没有，兜底轮取
+                        tag = f'invalid 仅 {n_inv}/{VIP_INVALID_CLEAR_AT} 次'
+                        print("\n" + "=" * 60)
+                        print(f"[{idx}/{len(accounts)}] phone={phone} 城市={province or '-'}/{city or '-'} "
+                              f"[{tag}] 沿用凭证 token 与省市")
                 else:
                     # ④ 'error'（上次没测出来）或 vip_status 缺失 → 凭证原样不动，直接重测
                     city = cur.get('city') or ''
@@ -322,6 +385,20 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
                 _set_vip(phone, verdict)
                 extra = '' if verdict == 'valid' else '（open_status 非 done，原因不可辨，下轮重测）'
                 print(f"  [兜底] worker 未回写 vip_status，记为 {verdict}{extra}")
+                after = _load(phone) or {}          # 重新读，拿最终结论
+
+            # 按最终 vip_status 维护 invalid 计数：invalid 累加，valid 清零，error 不动
+            final_vs = (after.get('vip_status') or '').strip().lower()
+            if final_vs == 'valid':
+                _reset_invalid(phone)
+                print(f"  [计数] vip_status=valid，已清空无效计数")
+            elif final_vs == 'invalid':
+                n_new = _bump_invalid(phone)
+                if n_new < 0:
+                    print("  [计数] 写 Redis 失败，本次 invalid 未累加")
+                else:
+                    print(f"  [计数] invalid 累计 {n_new}/{VIP_INVALID_CLEAR_AT} 次"
+                          + (" → 下次会清空 token + 换城市" if n_new >= VIP_INVALID_CLEAR_AT else ""))
 
             # 本地这侧就登录失败（凭证不可用）→ 清 token 让服务端重新 ensure_token，
             # 否则下一轮 error 分支会保留旧 token、反复卡在未登录
@@ -332,7 +409,11 @@ def run_mcgold_from_excel(excel_path='/Users/houjie/Desktop/mcd-sid数据.xlsx',
                     _save(phone, row)
                     print("  [自愈] 凭证未登录，已清空 token 待服务端重新生成")
     finally:
-        # 恢复模块本来的 input，避免影响其它调用
+        # 恢复模块本来的 input / SEND_LOCATION，避免影响其它调用
+        try:
+            rc_mod.SEND_LOCATION = _orig_send_loc
+        except Exception:
+            pass
         if _orig_input is None:
             try:
                 del rc_mod.input
