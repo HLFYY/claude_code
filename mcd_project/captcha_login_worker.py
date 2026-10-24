@@ -536,6 +536,10 @@ def handle_mcgold(payload, headless=True):
             d = r.get('data') or {}
             set_mcgold_status(phone, 'done', '开通下单成功',
                               orderId=d.get('orderId'), payId=d.get('payId'))
+            try:
+                manager.record_vip('valid')  # 下单成功→写凭证 vip_status/vip_time(同 check_* 定义,含义是麦金卡)
+            except Exception as _e:
+                log_info(f"[worker] 麦金卡 {phone} 写 vip 状态失败: {_e}")
             log_info(f"[worker] 麦金卡 {phone} 成功 orderId={d.get('orderId')} payId={d.get('payId')}")
         else:
             set_mcgold_status(phone, 'failed', f"{r.get('code')}:{r.get('message')}")

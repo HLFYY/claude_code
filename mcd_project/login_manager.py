@@ -163,6 +163,9 @@ class LoginManager:
         # 登录态检测:checked_at=最近检测时间(ISO,区别于 cookie 保存时间 saved_at);check_status=valid/invalid/error
         self.checked_at: str = ''
         self.check_status: str = ''
+        # 麦金卡状态:vip_time=最近开通下单时间(ISO);vip_status=valid/invalid/error(定义同 check_*,含义是麦金卡)
+        self.vip_time: str = ''
+        self.vip_status: str = ''
 
         # 凭证文件路径
         if credentials_file is None:
@@ -287,6 +290,18 @@ class LoginManager:
             self._merge_cred_fields({'checked_at': self.checked_at, 'check_status': status})
         except Exception as e:
             log_info(f'⚠️  写检测状态失败 {self.phone}: {e}')
+
+    def record_vip(self, status: str) -> None:
+        """
+        记录麦金卡开通的时间+结果到凭证(vip_time/vip_status),不动 saved_at。
+        麦金卡下单成功/检测时调用。status 取值同 check_status:'valid'(已开通)/'invalid'/'error'。
+        """
+        self.vip_status = status
+        self.vip_time = datetime.now().isoformat()
+        try:
+            self._merge_cred_fields({'vip_time': self.vip_time, 'vip_status': status})
+        except Exception as e:
+            log_info(f'⚠️  写麦金卡状态失败 {self.phone}: {e}')
 
     def get_login_proxy(self, is_send_code: bool = False) -> Optional[Dict[str, str]]:
         """
@@ -426,7 +441,14 @@ class LoginManager:
                     if action in ["temp_switch", "permanent_switch", "permanent_switch_immediate"]:
                         retry_count = 0
                 else:
-                    # 短效代理(未绑定)：简单重试，不走观察期/换绑
+                    # 短效代理(未绑定/全程短效)：代理有问题就换掉——清该城市池强制提新 IP 再重试
+                    try:
+                        from utils import get_short_proxy
+                        get_short_proxy(self.city, province=self.province, source=self.proxy_source,
+                                        merchant_id=self.merchant_id, as_dict=True, force_new=True)
+                        log_info(f"  代理失败({str(e)[:40]})，已换新短效 IP 重试 (city={self.city})")
+                    except Exception:
+                        pass
                     retry_count += 1
 
         # 所有重试都失败
@@ -611,12 +633,15 @@ class LoginManager:
             c_keep = self.city_bound or _old_row.get('city', '') or ''
             chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
             chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            vip_at_keep = self.vip_time or _old_row.get('vip_time', '') or ''
+            vip_st_keep = self.vip_status or _old_row.get('vip_status', '') or ''
             # token/sid/meddy 传入 None/空 = "不改,保留原值"(禁止把已登录凭证的 token/sid 清空)
             token = token if token else _old_row.get('token')
             sid = sid if sid else _old_row.get('sid')
             meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
+            self.vip_time, self.vip_status = vip_at_keep, vip_st_keep
             # Redis 存储
             credential_data = {
                 'token': token,
@@ -630,6 +655,8 @@ class LoginManager:
                 'city': c_keep,
                 'checked_at': chk_at_keep,
                 'check_status': chk_st_keep,
+                'vip_time': vip_at_keep,
+                'vip_status': vip_st_keep,
                 'saved_at': datetime.now().isoformat()
             }
             try:
@@ -659,12 +686,15 @@ class LoginManager:
             c_keep = self.city_bound or _old_row.get('city', '') or ''
             chk_at_keep = self.checked_at or _old_row.get('checked_at', '') or ''
             chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
+            vip_at_keep = self.vip_time or _old_row.get('vip_time', '') or ''
+            vip_st_keep = self.vip_status or _old_row.get('vip_status', '') or ''
             # token/sid/meddy 传入 None/空 = "不改,保留原值"(禁止把已登录凭证的 token/sid 清空)
             token = token if token else _old_row.get('token')
             sid = sid if sid else _old_row.get('sid')
             meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
+            self.vip_time, self.vip_status = vip_at_keep, vip_st_keep
             all_credentials[self.phone] = {
                 'token': token,
                 'sid': sid,
@@ -677,6 +707,8 @@ class LoginManager:
                 'city': c_keep,
                 'checked_at': chk_at_keep,
                 'check_status': chk_st_keep,
+                'vip_time': vip_at_keep,
+                'vip_status': vip_st_keep,
                 'saved_at': datetime.now().isoformat()
             }
 
@@ -727,6 +759,8 @@ class LoginManager:
         self.city_bound = ''
         self.checked_at = ''
         self.check_status = ''
+        self.vip_time = ''
+        self.vip_status = ''
         set_active_d('')  # 先重置，避免同 worker 上个账号的 d 残留
         set_active_tid('')
         if self.use_redis:
@@ -754,6 +788,8 @@ class LoginManager:
                 self.city_bound = cred.get('city', '') or ''
                 self.checked_at = cred.get('checked_at', '') or ''
                 self.check_status = cred.get('check_status', '') or ''
+                self.vip_time = cred.get('vip_time', '') or ''
+                self.vip_status = cred.get('vip_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
 
@@ -794,6 +830,8 @@ class LoginManager:
                 self.city_bound = cred.get('city', '') or ''
                 self.checked_at = cred.get('checked_at', '') or ''
                 self.check_status = cred.get('check_status', '') or ''
+                self.vip_time = cred.get('vip_time', '') or ''
+                self.vip_status = cred.get('vip_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
 
