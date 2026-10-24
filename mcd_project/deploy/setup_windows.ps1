@@ -2,32 +2,43 @@
 <#
 .SYNOPSIS
     mcd_project / captcha_login_worker.py  Windows 全新服务器一键部署
+    Python 与所有依赖版本严格对齐 Mac 环境 /Users/houjie/venv/python3-forcrawl
 
 .DESCRIPTION
-    阶段一  环境自检 + 安装 Git / Python / OpenSSH / 浏览器
-            （全部优先走国内镜像：华为云 git-for-windows、华为云 python、清华 PyPI；
-              winget 仅作最后兜底，因为它在国内常卡在 GitHub CDN）
-    阶段二  SSH key：已存在就直接展示，不存在就生成后展示
-    阶段三  暂停，等你把公钥加进 GitHub Deploy keys，回车继续
-    阶段四  验证 SSH 连接 -> 稀疏 clone（只取 mcd_project，约 1.2MB）
-    阶段五  装依赖（默认装到系统 Python，不建 venv）、验证 Redis 连通
-    阶段六  生成 run_worker.bat
+    阶段一  环境自检 + 安装 Git / OpenSSH
+            （全部优先走国内镜像：华为云 git-for-windows、清华 PyPI）
+    阶段二  清理旧 Python 环境（默认执行，-NoPurge 可跳过）
+            · 卸载 registry 里所有非 3.9 的 Python（3.12 / 3.11 / 3.13 …）
+            · 删除残留目录（Program Files\Python3xx、%LOCALAPPDATA%\Programs\Python\Python3xx、
+              %APPDATA%\Python、pip 缓存）
+            · 保留已存在的 3.9.x 解释器，只把它的第三方包全部卸干净（等同于「重装环境」）
+            · 删掉旧的 .venv
+    阶段三  安装 Python 3.9.13（python.org 最后一个 Windows 安装版；cp39 ABI 与 Mac 的
+            3.9.17 完全一致，wheel 通用），静默装到 Program Files 并加 PATH
+    阶段四  SSH key：已存在就直接展示，不存在就生成后展示
+    阶段五  暂停，等你把公钥加进 GitHub Deploy keys，回车继续
+    阶段六  验证 SSH 连接 -> 稀疏 clone（只取 mcd_project，约 1.2MB）
+    阶段七  按 deploy/requirements-win-py39.txt 精确装机（36 个包，全部指定版本；
+            只含 captcha_login_worker 的导入闭包，不装 flask / schedule / paramiko 等）
+            + 逐包比对版本，打印偏离项
+    阶段八  验证 Redis 连通
+    阶段九  生成 run_worker.bat
 
     默认代码目录（-TargetDir 可改）：
       · 脚本被单独复制到一个空目录 → 代码 clone 到「脚本所在目录\claude_code」
       · 脚本本身就在已 clone 的仓库里 → 直接复用那个仓库，不再嵌套 clone
     默认不创建虚拟环境，直接用系统 Python（加 -UseVenv 才建 .venv）
 
-    幂等设计：重复执行安全（key 不覆盖、仓库存在则 pull）。
+    幂等设计：重复执行安全（key 不覆盖、仓库存在则 pull、已装好的包不重装）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File setup_windows.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -TargetDir D:\code\claude_code -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple
+    powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -Yes
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -UseVenv
+    powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -NoPurge -TargetDir D:\code\claude_code
 #>
 [CmdletBinding()]
 param(
@@ -37,7 +48,8 @@ param(
     [switch] $SkipPause,
     [switch] $SkipChrome,
     [switch] $FullClone,
-    [switch] $UseVenv
+    [switch] $UseVenv,
+    [switch] $NoPurge
 )
 
 # 默认把代码拉到「脚本所在目录」下面，不再固定 C:\claude_code
@@ -67,6 +79,12 @@ if (-not $TargetDir) {
 }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 
+# 目标版本（与 Mac 对齐）
+$TargetPyShort = "3.9"
+$TargetPyFull  = "3.9.13"     # python.org 最后一个带 Windows 安装包的版本
+$TargetPipVer  = "26.0.1"     # 与 Mac 的 pip 一致
+$TargetSetuptoolsVer = "60.5.0"
+
 $ErrorActionPreference = "Continue"
 
 # 国内服务器：强制 TLS1.2，否则 PS 5.1 的 Invoke-WebRequest 在国内镜像上会握手失败
@@ -92,36 +110,11 @@ function Refresh-Path {
 }
 function Has-Exe ($name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
 
-function Ensure-Exe {
-    param([string] $Exe, [string] $WingetId, [string] $Label)
-
-    if (Has-Exe $Exe) { Ok ("$Label 已安装 (" + (Get-Command $Exe).Source + ")"); return $true }
-
-    if (-not (Has-Exe "winget")) {
-        Fail "$Label 未安装，且本机没有 winget，无法自动安装"
-        Info "请手动安装后重新运行：https://git-scm.com/download/win"
-        if ($WingetId -like "Python*") { Info "Python 下载：https://www.python.org/downloads/windows/（装 3.12，勾选 Add to PATH）" }
-        if ($WingetId -like "Google*") { Info "Chrome 下载：https://www.google.cn/chrome/" }
-        return $false
-    }
-
-    Warn "$Label 未安装，用 winget 安装 $WingetId ..."
-    & winget install --id $WingetId -e --source winget `
-        --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Null
-    Refresh-Path
-    if (Has-Exe $Exe) { Ok "$Label 安装完成"; return $true }
-    Fail "$Label 安装失败（可能需要管理员权限，或 winget 源不可用）"
-    return $false
-}
-
 # ---------------- 国内镜像直下（绕开 winget / GitHub CDN） ----------------
-# winget 装 Git/Python 时安装包托管在 GitHub Releases + 微软 CDN，国内经常卡死在 0 字节。
 $MirrorGitIndex    = "https://mirrors.huaweicloud.com/git-for-windows/.index.json"
 $MirrorGitBase     = "https://mirrors.huaweicloud.com/git-for-windows"
 $MirrorGitFallback = "https://mirrors.huaweicloud.com/git-for-windows/v2.56.0.windows.2/Git-2.56.0.2-64-bit.exe"
 $MirrorPyBase      = "https://mirrors.huaweicloud.com/python"
-# 华为云 python 镜像从 3.12.11 起只同步源码包，Windows 安装包最新只到 3.12.10
-$PythonVersions    = @("3.12.10", "3.12.9", "3.11.9")
 
 function Get-MirrorFile {
     param([string] $Url, [string] $OutFile, [string] $Label = "文件")
@@ -229,44 +222,143 @@ function Install-Git {
     return $false
 }
 
-function Install-Python312 {
-    foreach ($v in $PythonVersions) {
-        $url = "$MirrorPyBase/$v/python-$v-amd64.exe"
-        $exe = Join-Path $env:TEMP "python-$v-amd64.exe"
-        if (-not (Get-MirrorFile -Url $url -OutFile $exe -Label "Python $v")) { continue }
+# ---------------- Python 探测 / 清理 / 安装 ----------------
+function Get-PyVersion([string]$exe) {
+    try {
+        $v = (& $exe -c "import sys;print('%d.%d.%d'%sys.version_info[:3])" 2>$null | Out-String).Trim()
+        if ($v -match '^3\.\d+\.\d+$') { return $v }
+    }
+    catch {}
+    return $null
+}
 
-        Info "静默安装 Python $v（全用户安装 + 加入 PATH）..."
-        $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
-            "/quiet", "InstallAllUsers=1", "PrependPath=1",
-            "Include_test=0", "Include_launcher=1", "Shortcuts=0"
-        )
-        Remove-Item $exe -Force -ErrorAction SilentlyContinue
-        Refresh-Path
-
-        $found = Get-PyExe
-        if ($found) { Ok ("Python " + $found.Ver + " 安装完成"); return $found }
-        Warn ("Python $v 安装后仍未检测到（退出码 " + $p.ExitCode + "）")
+# 返回 3.9.x 的解释器；优先 Path 上的，其次 python.org 的固定安装位置
+function Get-Python39 {
+    $cands = @()
+    foreach ($c in @("python", "python3")) {
+        if (Has-Exe $c) {
+            $src = (Get-Command $c).Source
+            if ($src -and $src -notmatch 'WindowsApps') { $cands += $src }
+        }
+    }
+    $cands += @(
+        "$env:ProgramFiles\Python39\python.exe",
+        "${env:ProgramFiles(x86)}\Python39\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python39\python.exe"
+    )
+    # py 启动器兜底
+    if (Has-Exe "py") {
+        $pyPath = (& py -3.9 -c "import sys;print(sys.executable)" 2>$null | Out-String).Trim()
+        if ($pyPath) { $cands += $pyPath }
+    }
+    foreach ($p in $cands) {
+        if (-not (Test-Path $p)) { continue }
+        $v = Get-PyVersion $p
+        if ($v -and $v -like "$TargetPyShort.*") { return @{ Exe = $p; Ver = $v } }
     }
     return $null
+}
+
+# 从注册表列出所有已安装的 Python
+function Get-PythonInstalls {
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $all = @()
+    foreach ($k in $keys) {
+        $all += Get-ItemProperty $k -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match '^Python\s+3\.\d+\.\d+' -and $_.UninstallString }
+    }
+    return $all | Sort-Object DisplayVersion -Unique
+}
+
+function Uninstall-PythonEntry($entry) {
+    $dn  = $entry.DisplayName
+    $us  = $entry.UninstallString
+    Info ("卸载 " + $dn + " ...")
+    if ($us -match 'MsiExec\.exe\s+/[IX]?\s*(\{[0-9A-Fa-f\-]+\})') {
+        Start-Process -FilePath "msiexec.exe" -ArgumentList @("/x$($Matches[1])", "/qn", "/norestart") -Wait
+        return
+    }
+    $exe = $us
+    if ($exe -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+    elseif ($exe -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
+    if (Test-Path $exe) {
+        Start-Process -FilePath $exe -ArgumentList @("/uninstall", "/quiet") -Wait -ErrorAction SilentlyContinue
+    }
+    else {
+        Warn ("找不到卸载程序：" + $us)
+    }
+}
+
+function Remove-DirSafe([string]$path) {
+    if (-not (Test-Path $path)) { return }
+    try {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        Info ("已删除 " + $path)
+    }
+    catch { Warn ("删除失败（可能被占用）：" + $path + "  " + $_.Exception.Message) }
+}
+
+function Install-Python3913 {
+    $url = "$MirrorPyBase/$TargetPyFull/python-$TargetPyFull-amd64.exe"
+    $exe = Join-Path $env:TEMP "python-$TargetPyFull-amd64.exe"
+    if (-not (Get-MirrorFile -Url $url -OutFile $exe -Label "Python $TargetPyFull")) {
+        return $null
+    }
+
+    Info "静默安装 Python $TargetPyFull ..."
+    # 管理员 → 全用户装到 Program Files；否则退回当前用户装到 %LOCALAPPDATA%\Programs\Python
+    $allUsers = 1
+    if (-not $isAdmin) { $allUsers = 0; Warn "非管理员：改为当前用户安装" }
+    $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+        "/quiet", "InstallAllUsers=$allUsers", "PrependPath=1",
+        "Include_test=0", "Include_launcher=1", "Shortcuts=0",
+        "Include_pip=1", "AssociateFiles=0"
+    )
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    Refresh-Path
+
+    $found = Get-Python39
+    if ($found) { Ok ("Python " + $found.Ver + " 安装完成：" + $found.Exe); return $found }
+    Warn ("Python $TargetPyFull 安装后仍未检测到（退出码 " + $p.ExitCode + "）")
+    return $null
+}
+
+# 把某个解释器里的第三方包全部卸掉（保留 pip / setuptools / wheel）
+function Clear-SitePackages([string]$vpy) {
+    $frozen = (& $vpy -m pip freeze --all 2>$null) | Where-Object {
+        $_ -match '==' -and $_ -notmatch '^(pip|setuptools|wheel|distribute|pkg[-_]resources)=='
+    }
+    if (-not $frozen -or $frozen.Count -eq 0) { Ok "该解释器没有第三方包，无需清理"; return }
+    Info ("待卸载 " + $frozen.Count + " 个包 ...")
+    $lst = Join-Path $env:TEMP "mcd_purge.txt"
+    Set-Content -Path $lst -Value $frozen -Encoding ASCII
+    & $vpy -m pip uninstall -y -r $lst 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    Remove-Item $lst -Force -ErrorAction SilentlyContinue
+    Ok "第三方包已全部卸除"
 }
 
 # ========================================================
 Write-Host ""
 Write-Host "  mcd captcha_login_worker  Windows 部署脚本" -ForegroundColor White
+Write-Host ("  目标环境 Python " + $TargetPyFull + "  /  依赖与 Mac venv 完全一致") -ForegroundColor DarkGray
 Write-Host ("  主机 " + $env:COMPUTERNAME + "   时间 " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")) -ForegroundColor DarkGray
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) { Ok "当前是管理员权限" }
-else { Warn "当前不是管理员：自动安装软件 / 打开 OpenSSH 功能可能失败" }
+else { Warn "当前不是管理员：卸载/安装 Python、打开 OpenSSH 功能可能失败，建议右键「以管理员身份运行」" }
 
 try {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-    Info ("系统: " + $os.Caption + "  " + $os.Version)
+    Info ("系统: " + $os.Caption + "  " + $os.OSArchitecture + "  " + $os.Version)
 }
 catch { Info "系统: $([Environment]::OSVersion.VersionString)" }
 
 # ========================================================
-Step 1 "环境自检 / 安装基础软件"
+Step 1 "环境自检 / 安装基础软件（Git / OpenSSH）"
 
 if (-not (Has-Exe "ssh")) {
     Warn "未检测到 ssh.exe，尝试安装 OpenSSH 客户端 ..."
@@ -286,76 +378,79 @@ if (-not (Has-Exe "ssh")) {
 }
 if (Has-Exe "ssh") { Ok "OpenSSH 就绪 ($((Get-Command ssh).Source))" }
 
-# Git：优先华为云镜像直下；winget 仅兜底（国内常卡在 GitHub CDN 的 0 字节）
 if (-not (Install-Git)) { Die "缺少 Git" }
 
-function Get-PyExe {
-    foreach ($c in @("python", "python3", "py")) {
-        if (-not (Has-Exe $c)) { continue }
-        $v = (& $c -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null | Out-String).Trim()
-        if ($v -match '^\d+\.\d+$') { return @{ Exe = $c; Ver = $v } }
-    }
-    return $null
-}
+# ========================================================
+Step 2 "清理旧 Python 环境（对齐到 Python $TargetPyShort）"
 
-$py = Get-PyExe
-if (-not $py) {
-    $py = Install-Python312          # 优先进国内镜像，不碰 winget
+if ($NoPurge) {
+    Warn "已指定 -NoPurge，跳过旧 Python / 旧依赖清理"
 }
-if (-not $py -and (Has-Exe "winget")) {
-    Warn "镜像安装全部失败，回退 winget ..."
-    if (Ensure-Exe -Exe "python" -WingetId "Python.Python.3.12" -Label "Python 3.12") {
-        Refresh-Path
-        $py = Get-PyExe
-    }
-}
-if (-not $py) {
-    Fail "缺少可用的 Python"
-    Info "手动下载后重跑：https://mirrors.huaweicloud.com/python/3.12.10/"
-    Info "安装时务必勾选 Add python.exe to PATH"
-    Die "中止"
-}
-$pyExe = $py.Exe
-$pyVer = $py.Ver
-Ok "Python $pyVer ($pyExe)"
-if ($pyVer -notmatch '^3\.(9|1[0-2])$') {
-    Warn "建议 Python 3.9~3.12；3.13 上 ddddocr 依赖的 onnxruntime 可能没有 wheel"
-}
+else {
+    $installs = Get-PythonInstalls
+    if ($installs -and $installs.Count -gt 0) {
+        Info ("注册表里发现 " + $installs.Count + " 个 Python：")
+        foreach ($i in $installs) { Info ("  · " + $i.DisplayName + "  [" + $i.DisplayVersion + "]") }
 
-# 浏览器：DrissionPage 驱动 Chromium 内核即可，Chrome 或 Edge 都行
-# 优先级：Chrome > Edge（Edge 是 Windows 自带，可省掉 ~100MB 下载）
-if (-not $SkipChrome) {
-    $chromeCandidates = @(
-        (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
-        (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
-        (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
-    ) | Where-Object { $_ -and (Test-Path $_) }
-
-    $edgeCandidates = @(
-        (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
-        (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe")
-    ) | Where-Object { $_ -and (Test-Path $_) }
-
-    if ($chromeCandidates) {
-        Ok ("Chrome 已安装 (" + $chromeCandidates[0] + ")")
-        Ok "worker 将使用 Chrome（优先级最高）"
+        $keep = $installs | Where-Object { $_.DisplayVersion -like "$TargetPyShort.*" }
+        $drop = $installs | Where-Object { $_.DisplayVersion -notlike "$TargetPyShort.*" }
+        if ($drop -and $drop.Count -gt 0) {
+            if (-not $isAdmin) { Warn "非管理员：卸载其他版本 Python 可能失败，建议以管理员重跑" }
+            foreach ($d in $drop) { Uninstall-PythonEntry $d }
+            Refresh-Path
+            Ok ("已卸载 " + $drop.Count + " 个非 $TargetPyShort 版本")
+        }
+        if ($keep) { Ok ("保留 Python $TargetPyShort（" + ($keep | Select-Object -First 1).DisplayName + "），只清依赖") }
     }
-    elseif ($edgeCandidates) {
-        Ok ("检测到 Edge，跳过 Chrome 下载 (" + $edgeCandidates[0] + ")")
-        Warn "worker 会用 Edge 驱动。Edge 与 Chrome 同为 Chromium 内核，通常可用；"
-        Warn "若滑块始终不过，再装 Chrome 重试（Edge 的 UA/指纹可能被数美判得更严）"
+    else { Info "注册表里没有 python.org 安装记录" }
+
+    # 残留目录（只删非 3.9 的）
+    foreach ($base in @("$env:ProgramFiles", ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs\Python")) {
+        if (-not $base -or -not (Test-Path $base)) { continue }
+        Get-ChildItem -Path $base -Directory -Filter "Python3*" -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Name -notmatch '^Python39$') { Remove-DirSafe $_.FullName }
+        }
     }
-    else {
-        Warn "未检测到 Chrome，也未检测到 Edge —— 过滑块会失败"
-        Info "国内不要用 winget 装 Chrome（Google CDN 常被墙，会像 Git 那样卡死）"
-        Info "请手动安装其一后重跑本脚本："
-        Info "  Chrome: https://www.google.cn/chrome/"
-        Info "  Edge  : 系统自带的 Microsoft Edge 即可，无需下载"
+    Remove-DirSafe (Join-Path $env:APPDATA "Python")
+    Remove-DirSafe (Join-Path $env:LOCALAPPDATA "pip\cache")
+
+    # 旧 venv
+    $oldVenv = Join-Path (Join-Path $TargetDir "mcd_project") ".venv"
+    if (Test-Path $oldVenv) {
+        Remove-DirSafe $oldVenv
+        Ok "已删除旧虚拟环境 $oldVenv"
     }
 }
 
 # ========================================================
-Step 2 "SSH key：存在则展示，不存在则生成"
+Step 3 "准备 Python $TargetPyShort"
+
+$py = Get-Python39
+if ($py) {
+    Ok ("复用已有 Python " + $py.Ver + " (" + $py.Exe + ")")
+    if ($py.Ver -ne $TargetPyFull) {
+        Warn ("本机是 " + $py.Ver + "，Mac 是 " + $TargetPyFull + "；同为 cp39，wheel 通用，可继续")
+    }
+}
+else {
+    $py = Install-Python3913
+    if (-not $py) {
+        Fail "缺少可用的 Python $TargetPyShort"
+        Info "手动安装后重跑：https://mirrors.huaweicloud.com/python/$TargetPyFull/"
+        Info "安装时务必勾选 Add python.exe to PATH"
+        Die "中止"
+    }
+}
+$pyExe = $py.Exe
+$pyVer = $py.Ver
+
+if (-not $NoPurge) {
+    Info "清空该解释器里的旧依赖 ..."
+    Clear-SitePackages $pyExe
+}
+
+# ========================================================
+Step 4 "SSH key：存在则展示，不存在则生成"
 
 $sshDir = Join-Path $env:USERPROFILE ".ssh"
 if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
@@ -401,7 +496,7 @@ try { Set-Clipboard -Value $pubText; Ok "已自动复制到剪贴板" }
 catch { Warn "复制到剪贴板失败，请手动选中上面那一行" }
 
 # ========================================================
-Step 3 "把公钥加进 GitHub Deploy keys（需要你手动做一次）"
+Step 5 "把公钥加进 GitHub Deploy keys（需要你手动做一次）"
 
 Write-Host ""
 Write-Host "  1) 打开  https://github.com/HLFYY/claude_code/settings/keys" -ForegroundColor White
@@ -424,7 +519,7 @@ else {
 }
 
 # ========================================================
-Step 4 "验证 SSH 连接并拉取代码"
+Step 6 "验证 SSH 连接并拉取代码"
 
 Write-Host "  测试 git@github.com ..."
 $sshOut = (& ssh -i "$keyPath" -o IdentitiesOnly=yes -o BatchMode=yes `
@@ -536,7 +631,7 @@ Ok "已设置仓库级 core.sshCommand（以后 git pull 不用再管 key）"
 $projDir = Join-Path $TargetDir "mcd_project"
 
 # ========================================================
-Step 5 "安装依赖"
+Step 7 "安装依赖（按 requirements-win-py39.txt 精确版本）"
 
 if ($UseVenv) {
     $venvDir = Join-Path $projDir ".venv"
@@ -573,32 +668,90 @@ if (-not $UseVenv -and -not $isAdmin) {
     Warn "非管理员运行，pip 加 --user 装到用户目录"
 }
 
-Info "升级 pip ..."
-& $vpy -m pip install --upgrade pip setuptools wheel @pipArgs 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+Info ("对齐 pip=" + $TargetPipVer + " setuptools=" + $TargetSetuptoolsVer + "（与 Mac 一致）...")
+& $vpy -m pip install --upgrade "pip==$TargetPipVer" "setuptools==$TargetSetuptoolsVer" @pipArgs 2>&1 |
+    Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+$installedPip = (& $vpy -m pip --version 2>$null | Out-String).Trim()
+Ok $installedPip
 
-# 注意：不装 gunicorn（Windows 不支持），只装 worker 实际需要的
-$pkgs = @(
-    "flask==3.0.0",
-    "requests==2.31.0",
-    "redis==5.0.1",
-    "pycryptodome==3.19.0",
-    "schedule==1.2.0",
-    "DrissionPage>=4.0.4,<5",
-    "ddddocr>=1.4.11",
-    "Pillow>=10.0"
-)
-Info ("安装依赖: " + ($pkgs -join ", "))
-& $vpy -m pip install @pipArgs @pkgs 2>&1 | Select-Object -Last 12 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-if ($LASTEXITCODE -ne 0) { Die "依赖安装失败，看上面报错（可换源：-PipIndex https://mirrors.aliyun.com/pypi/simple）" }
+# 锁定清单：优先脚本同目录，其次仓库里的 deploy 目录
+$lockFile = Join-Path $ScriptDir "requirements-win-py39.txt"
+if (-not (Test-Path $lockFile)) { $lockFile = Join-Path $projDir "deploy\requirements-win-py39.txt" }
+if (-not (Test-Path $lockFile)) { Die "找不到依赖清单 requirements-win-py39.txt（应在 deploy\ 下）" }
+Ok ("依赖清单：" + $lockFile)
+
+$lockPkgs = Get-Content $lockFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' } |
+    ForEach-Object { ($_ -split '#')[0].Trim() } | Where-Object { $_ }
+Info ("清单共 " + $lockPkgs.Count + " 个包，全部带 win_amd64/cp39 wheel（无需编译）")
+
+Info "开始安装（首次约 3~6 分钟）..."
+$installLog = Join-Path $env:TEMP "mcd_pip_install.log"
+& $vpy -m pip install --only-binary=:all: @pipArgs -r $lockFile 2>&1 |
+    Tee-Object -FilePath $installLog | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+if ($LASTEXITCODE -ne 0) {
+    Warn "带 --only-binary 安装失败，去掉该限制重试（看 $installLog）"
+    & $vpy -m pip install @pipArgs -r $lockFile 2>&1 |
+        Tee-Object -FilePath $installLog -Append | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -ne 0) { Die "依赖安装失败，日志：$installLog（可换源：-PipIndex https://mirrors.aliyun.com/pypi/simple）" }
+}
 Ok "依赖安装完成"
+
+# ---------------- 逐包校验版本 ----------------
+Info "逐包校验版本 ..."
+$frozenLines = (& $vpy -m pip freeze 2>$null)
+$installed = @{}
+foreach ($l in $frozenLines) {
+    if ($l -match '^([^=]+)==(.+)$') { $installed[$Matches[1].ToLower().Replace('_','-').Replace('.','-')] = $Matches[2].Trim() }
+}
+$bad = @()
+foreach ($p in $lockPkgs) {
+    if ($p -notmatch '^([^=]+)==(.+)$') { continue }
+    $pkgName = $Matches[1]
+    $n = $pkgName.ToLower().Replace('_','-').Replace('.','-')
+    $v = $Matches[2].Trim()
+    if (-not $installed.ContainsKey($n)) { $bad += ("缺失  " + $pkgName + "==" + $v) }
+    elseif ($installed[$n] -ne $v) { $bad += ("版本不符  " + $pkgName + " 期望 " + $v + " 实际 " + $installed[$n]) }
+}
+if ($bad.Count -eq 0) {
+    Ok ("全部 " + $lockPkgs.Count + " 个包版本与锁定清单完全一致")
+}
+else {
+    Fail ("有 " + $bad.Count + " 项不符：")
+    $bad | ForEach-Object { Info $_ }
+}
+
+# 多余包（清单外）只提示，不卸载
+$lockNames = @{}
+foreach ($p in $lockPkgs) { if ($p -match '^([^=]+)==') { $lockNames[$Matches[1].ToLower().Replace('_','-').Replace('.','-')] = 1 } }
+$extra = @()
+foreach ($k in $installed.Keys) {
+    if ($lockNames.ContainsKey($k)) { continue }
+    if ($k -in @('pip','setuptools','wheel')) { continue }
+    $extra += ($k + "==" + $installed[$k])
+}
+if ($extra.Count -gt 0) {
+    Warn ("环境里还有 " + $extra.Count + " 个清单外的包（不影响运行）：" + ($extra -join ", "))
+}
 
 Info "校验关键模块 ..."
 $check = & $vpy -c "import redis,requests,Crypto,PIL,DrissionPage,ddddocr;print('modules-ok')" 2>&1 | Out-String
 if ($check -match "modules-ok") { Ok "模块导入正常" }
-else { Fail "模块导入异常：$($check.Trim())"; Info "常见：ddddocr 的 onnxruntime 与 Python 版本不匹配（换 3.12）" }
+else { Fail "模块导入异常：$($check.Trim())"; Info "看上面的 ImportError；ddddocr 报 onnxruntime 就说明 Python 不是 3.9" }
+
+Info "试导 worker 自身（会连带 config/login_manager/mcd_api 整条链）..."
+Push-Location $projDir
+$chain = & $vpy -c "import login_manager, proxy_pool, mcd_api; print('chain-ok')" 2>&1 | Out-String
+Pop-Location
+if ($chain -match "chain-ok") { Ok "worker 依赖链导入正常" }
+else { Fail "worker 依赖链导入失败：$($chain.Trim())" }
+
+# 依赖版本快照（便于和 Mac 对比）
+$snap = Join-Path $TargetDir "pip_freeze_windows.txt"
+& $vpy -m pip freeze 2>$null | Set-Content -Path $snap -Encoding UTF8
+Ok "已导出本机依赖快照：$snap"
 
 # ========================================================
-Step 6 "验证 Redis 连通（worker 靠它收发任务）"
+Step 8 "验证 Redis 连通（worker 靠它收发任务）"
 
 Push-Location $projDir
 $pyCode = "from config import make_redis; r = make_redis(); print('redis-ok', r.ping()); print('queue', r.llen('mcd:captcha:login_queue'))"
@@ -615,7 +768,37 @@ else {
 }
 
 # ========================================================
-Step 7 "生成启动脚本"
+Step 9 "浏览器检查 / 生成启动脚本"
+
+if (-not $SkipChrome) {
+    $chromeCandidates = @(
+        (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+        (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    $edgeCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe")
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($chromeCandidates) {
+        Ok ("Chrome 已安装 (" + $chromeCandidates[0] + ")")
+        Ok "worker 将使用 Chrome（优先级最高）"
+    }
+    elseif ($edgeCandidates) {
+        Ok ("检测到 Edge，跳过 Chrome 下载 (" + $edgeCandidates[0] + ")")
+        Warn "worker 会用 Edge 驱动。Edge 与 Chrome 同为 Chromium 内核，通常可用；"
+        Warn "若滑块始终不过，再装 Chrome 重试（Edge 的 UA/指纹可能被数美判得更严）"
+    }
+    else {
+        Warn "未检测到 Chrome，也未检测到 Edge —— 过滑块会失败"
+        Info "国内不要用 winget 装 Chrome（Google CDN 常被墙，会像 Git 那样卡死）"
+        Info "请手动安装其一后重跑本脚本："
+        Info "  Chrome: https://www.google.cn/chrome/"
+        Info "  Edge  : 系统自带的 Microsoft Edge 即可，无需下载"
+    }
+}
 
 $batPath = Join-Path $TargetDir "run_worker.bat"
 $bat = @"
@@ -644,8 +827,9 @@ Write-Host "  部署完成" -ForegroundColor Green
 Write-Host ("  " + ("=" * 62)) -ForegroundColor DarkCyan
 Write-Host ""
 Write-Host "  代码目录   $TargetDir" -ForegroundColor White
-Write-Host "  Python     $vpy" -ForegroundColor White
+Write-Host "  Python     $vpy  ($pyVer)" -ForegroundColor White
 Write-Host "  SSH key    $keyPath" -ForegroundColor White
+Write-Host "  依赖快照   $snap" -ForegroundColor White
 Write-Host ""
 Write-Host "  下一步：" -ForegroundColor Yellow
 Write-Host "   1) 前台试跑：  $batPath" -ForegroundColor White

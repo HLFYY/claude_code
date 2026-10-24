@@ -1,0 +1,73 @@
+# ============================================================================
+# mcd_project / captcha_login_worker.py 的 Windows 依赖锁定清单
+#
+# 范围：**只覆盖 captcha_login_worker.py 的实际导入闭包**，不含 mcd_server /
+#       scheduler / demo.py / deploy 工具链的依赖（flask、schedule、paramiko 等一律不装）。
+#
+# 闭包怎么算的：从 captcha_login_worker.py 起，只跟**模块级 import** 递归
+#   → 本地模块：config / login_manager / mcd_api / mcd_shumei_d / proxy_pool /
+#     proxy_failure_handler / account_proxy_binding / ip_location / utils / exceptions
+#   → 第三方顶层只有 6 个：redis、requests、Pillow、DrissionPage、ddddocr、pycryptodome
+#     （frida 不在链上：device_builder 是 device_pool_redis 里函数内的惰性导入）
+#   → 再用 importlib.metadata 按 sys_platform=win32 / py3.9 求值 marker 展开传递依赖
+#
+# 基准：Mac 本机 /Users/houjie/venv/python3-forcrawl（Python 3.9.17）的真实安装版本
+# 目标平台：Windows x64 + CPython 3.9（用 python.org 最后一个 Windows 安装版 3.9.13，
+#           cp39 ABI 与 3.9.17 完全一致，所有 cp39 wheel 通用）
+#
+# 36 个包全部有 win_amd64/cp39 预编译 wheel —— Windows 上不需要 MSVC、不需要编译源码。
+#
+# 与 Mac 环境的偏差只有 2 处：
+#   pycryptodome 3.9.8 → 3.9.9   3.9.8 最高只有 cp38 的 win wheel（Mac 上是源码编译的）
+#   pyreadline3  3.5.4           Mac 上不存在（humanfriendly 的 Windows-only 依赖）
+# 其余 34 个与 Mac 逐版本一致。
+#
+# 未安装：gunicorn（Windows 不支持）、frida（PyPI 只发 .egg，pip 装不了，且不在运行链上）
+#
+# 用法：pip install -r requirements-win-py39.txt
+# ============================================================================
+
+# ---- 业务入口直接依赖 ----
+redis==3.2.1
+requests==2.31.0
+Pillow==9.5.0
+pycryptodome==3.9.9
+
+# ---- 过滑块：DrissionPage 4.0.4.22（与 Mac 一致，勿升 4.1）----
+DrissionPage==4.0.4.22
+lxml==6.0.2
+cssselect==1.2.0
+click==8.1.8
+colorama==0.4.6
+psutil==7.2.2
+websocket-client==1.9.0
+tldextract==5.1.3
+requests-file==1.5.1
+filelock==3.19.1
+six==1.16.0
+DownloadKit==2.0.5
+DataRecorder==3.4.14
+# DataRecorder 用 openpyxl 记录/导出，属必需传递依赖
+openpyxl==3.0.9
+et-xmlfile==1.1.0
+
+# ---- 滑块缺口识别：ddddocr + onnxruntime ----
+ddddocr==1.4.7
+onnxruntime==1.15.1
+numpy==1.24.0
+opencv-python-headless==4.7.0.72
+coloredlogs==15.0.1
+humanfriendly==10.0
+pyreadline3==3.5.4
+flatbuffers==23.5.26
+protobuf==6.33.6
+sympy==1.12
+mpmath==1.3.0
+packaging==20.9
+pyparsing==2.4.7
+
+# ---- requests 传递依赖 ----
+certifi==2024.7.4
+charset-normalizer==3.1.0
+idna==2.8
+urllib3==1.26.16

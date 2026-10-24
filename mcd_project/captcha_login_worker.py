@@ -185,7 +185,9 @@ def _imgs_ready(page):
         return bool(page.run_js(
             'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
             'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
-            'return !!(b&&f&&b.complete&&f.complete&&b.naturalWidth>0&&f.naturalWidth>0);'))
+            'if(!(b&&f&&b.complete&&f.complete&&b.naturalWidth>0&&f.naturalWidth>0))return false;'
+            'var rb=b.getBoundingClientRect(),rf=f.getBoundingClientRect();'      # 还要真正布局出尺寸(>1)，否则 w=0→zoom错/按钮不动
+            'return rb.width>1&&rb.height>1&&rf.width>1;'))
     except Exception:
         return False
 
@@ -217,42 +219,82 @@ def _slide_once(page):
     if not bg_bytes or not fg_bytes:
         log_info(f"[worker][dbg] 取滑块图失败 bg={bool(bg_bytes)} fg={bool(fg_bytes)}")
         return None, None
-    res = _ocr.slide_match(fg_bytes, bg_bytes, simple_target=True)
-    native_w = Image.open(io.BytesIO(bg_bytes)).size[0]   # OCR 结果所在坐标系 = 下载图的原生宽
-    # 一次性量取(都是 CSS 像素，与拖动 Actions.move 同坐标系、与 DPR 无关)：
-    #   bg 显示宽、bg 原生宽(naturalWidth)、拼图块相对 bg 的左偏移。
-    disp_w = dom_native = 0
-    fg_left = 0.0
+    # 不用 simple_target：不同 ddddocr 版本(1.4.7/1.6.1)的 simple 返回基准点不一致(左边缘 vs 中心)，
+    # 统一取完整框 [x1,y1,x2,y2] 的 x1=缺口左边缘，跨版本一致(1.6.1 python3.12 装不了 1.4.7，故用此法对齐)。
+    res = _ocr.slide_match(fg_bytes, bg_bytes)
+    _tgt = res.get('target') or []
+    if len(_tgt) >= 4:
+        gap_x = _tgt[0]                       # x1 = 缺口左边缘
+    elif len(_tgt) >= 1:
+        gap_x = _tgt[0]                       # 兜底(2元素时仍取首值)
+    else:
+        gap_x = res.get('target_x', 0)
+    log_info(f"[worker][dbg] OCR raw target={res.get('target')} -> 缺口左边缘gap_x={gap_x}")
+    # 下载图(OCR 坐标系)的原生尺寸
+    _bgi = Image.open(io.BytesIO(bg_bytes)); _fgi = Image.open(io.BytesIO(fg_bytes))
+    native_w, native_h = _bgi.size
+    dl_fg_w, dl_fg_h = _fgi.size
+    # 一次性量取全部几何(CSS 像素)：每个元素都给 {x,y,w,h}，含 bg图/拼图块/滑块按钮/滑条(父)/外层(祖父)。
+    geo = {}
     try:
-        _m = page.run_js(
-            'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
-            'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
-            'var rb=b.getBoundingClientRect();'
-            'var rf=f?f.getBoundingClientRect():null;'
-            'return [rb.width, b.naturalWidth||0, rf?(rf.left-rb.left):0];')
-        if _m:
-            disp_w = _m[0] or 0
-            dom_native = _m[1] or 0
-            fg_left = _m[2] or 0
-    except Exception:
-        pass
-    if not disp_w or disp_w <= 1:
-        try:
-            disp_w = bg_ele.size[0]      # 兜底(可能含 DPR)
-        except Exception:
-            log_info("[worker][dbg] 取滑块显示宽度失败，本轮跳过"); return None, None
-    # 等比：显示宽/原生宽。优先用 DOM 的 naturalWidth(和下载图同一张，最自洽)，取不到用下载图宽。
-    base_native = dom_native if dom_native > 1 else native_w
-    zoom = disp_w / base_native
-    # 缺口 x(原生) → 显示距离；再减掉拼图块当前左偏移(fg_left)——消除"每次都过一点"
-    raw = res['target'][0] * (base_native / native_w) * zoom      # = target * disp_w/native_w
-    distance = raw - fg_left
+        geo = json.loads(page.run_js(
+            'var q=function(s){return document.querySelector(s);};'
+            'var R=function(e){if(!e)return null;var r=e.getBoundingClientRect();'
+            'return {x:+r.left.toFixed(1),y:+r.top.toFixed(1),w:+r.width.toFixed(1),h:+r.height.toFixed(1)};};'
+            'var N=function(e){return e?{nw:e.naturalWidth||0,nh:e.naturalHeight||0}:null;};'
+            'var bg=q(".shumei_captcha_loaded_img_bg"),fg=q(".shumei_captcha_loaded_img_fg"),'
+            'btn=q(".shumei_captcha_slide_btn");'
+            'var bar=btn?btn.parentElement:null,bar2=bar?bar.parentElement:null;'
+            'return JSON.stringify({dpr:window.devicePixelRatio,win_w:window.innerWidth,'
+            'bg_cnt:document.querySelectorAll(".shumei_captcha_loaded_img_bg").length,'
+            'fg_cnt:document.querySelectorAll(".shumei_captcha_loaded_img_fg").length,'
+            'bg:R(bg),bg_nat:N(bg),fg:R(fg),fg_nat:N(fg),btn:R(btn),bar:R(bar),bar2:R(bar2)});'))
+    except Exception as e:
+        log_info(f"[worker][dbg] 量几何失败: {e}")
+    _bg = geo.get('bg') or {}
+    _fg = geo.get('fg') or {}
+    _btn = geo.get('btn') or {}
+    _bar = geo.get('bar') or {}
+    bg_w = _bg.get('w', 0) or 0
+    fg_w = _fg.get('w', 0) or 0
+    btn_w = _btn.get('w', 0) or 0
+    bar_w = _bar.get('w', 0) or 0
+    # 派生量：拼图块相对 bg 的左偏移、按钮相对滑条的左偏移、轨道实际行程
+    fg_left = round((_fg.get('x', 0) - _bg.get('x', 0)), 1) if (_fg and _bg) else 0
+    btn_left = round((_btn.get('x', 0) - _bar.get('x', 0)), 1) if (_btn and _bar) else 0
+    track = round(bar_w - btn_w, 1) if (bar_w > 1 and btn_w > 0 and bar_w > btn_w) else 0
+    # 正确模型(物理)：
+    #   zoom       = 背景显示宽/原生宽
+    #   piece_move = 缺口在显示图里的 x(相对背景左) = target_x × zoom，也就是拼图块左边缘要移动到的位置
+    #   换算       = 按钮行程(track) / 拼图块行程(bg_w - fg_w)，拼图块比按钮少走一个自身宽度
+    #   distance   = piece_move × track/(bg_w - fg_w)
+    zoom = (bg_w / native_w) if bg_w > 1 else 1.0
+    piece_move = gap_x * zoom - fg_left                   # 缺口左边缘×zoom - 拼图块初始偏移
+    if track > 1 and bg_w > fg_w > 0:
+        distance = piece_move * track / (bg_w - fg_w)
+        how = 'piece->btn'
+    elif bg_w > 1:
+        distance = piece_move                             # 退回按钮与拼图块 1:1
+        how = 'direct'
+    else:
+        distance = gap_x                                   # 最差兜底(用原生像素)
+        how = 'native'
     if distance < 0:
-        distance = raw
-    distance -= random.randint(0, max(1, int(distance * 0.02)))
-    log_info(f"[worker][dbg] slide_match target={res['target']} native_w={native_w} "
-             f"dom_native={dom_native} disp_w={disp_w:.1f} zoom={zoom:.3f} "
-             f"fg_left={fg_left:.1f} raw={raw:.1f} distance={distance:.0f}")
+        distance = 0
+    distance += random.uniform(-2, 2)                     # 轻微抖动(对称，不再系统性少走)
+    # 预测落点(用于核对)：拖完拼图块左边缘应到 ≈ 背景左 + piece_move
+    gap_abs_x = round(_bg.get('x', 0) + piece_move, 1)
+    log_info(
+        f"[worker][dbg] 滑块诊断:\n"
+        f"  OCR: target={res.get('target')} 缺口左边缘gap_x={gap_x}\n"
+        f"  下载图: bg={native_w}x{native_h} fg={dl_fg_w}x{dl_fg_h}\n"
+        f"  bg背景图:  {geo.get('bg')} naturalWH={geo.get('bg_nat')} cnt={geo.get('bg_cnt')}\n"
+        f"  fg拼图块:  {geo.get('fg')} naturalWH={geo.get('fg_nat')} cnt={geo.get('fg_cnt')} 相对bg左偏移={fg_left}\n"
+        f"  滑块按钮:  {geo.get('btn')} 相对滑条左偏移={btn_left}\n"
+        f"  滑条(父):  {geo.get('bar')}  外层(祖父):{geo.get('bar2')}\n"
+        f"  dpr={geo.get('dpr')} win_w={geo.get('win_w')} 轨道行程={track}\n"
+        f"  zoom={zoom:.3f} 拼图块需移动piece_move={piece_move:.1f} 缺口绝对x≈{gap_abs_x}\n"
+        f"  => 用={how} 拖动distance={distance:.0f}")
     tracks = get_tracks(distance)
 
     btn = page.ele('.shumei_captcha_slide_btn')
@@ -267,8 +309,39 @@ def _slide_once(page):
     time.sleep(random.uniform(0.1, 0.25))
     for tr in tracks:
         ac.move(tr, random.randint(-4, 4), duration=0.05)
+    # 闭环校正：仍按住时量拼图块当前落点，与期望(piece_move)的残差补上。
+    #   拼图块位移 = 按钮位移 ×(bg_w-fg_w)/track，所以 按钮要补 = 残差 × track/(bg_w-fg_w)。
+    btn_per_piece = (track / (bg_w - fg_w)) if (track > 1 and bg_w > fg_w > 0) else 1.0
+    _curpos = None
+    try:
+        for _corr in range(3):            # 最多补 3 次
+            _curpos = page.run_js(
+                'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
+                'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
+                'return (f&&b)?(f.getBoundingClientRect().left-b.getBoundingClientRect().left):null;')
+            if _curpos is None:
+                break
+            resid = piece_move - _curpos   # 还差多少(显示px，正=还需右移)
+            if abs(resid) <= 1.5:
+                break
+            step = resid * btn_per_piece   # 换算成按钮要补的像素
+            ac.move(step * 0.6, random.randint(-2, 2), duration=0.08)   # 分两小步补，更自然
+            ac.move(step * 0.4, random.randint(-2, 2), duration=0.08)
+            time.sleep(random.uniform(0.05, 0.12))
+        log_info(f"[worker][dbg] 闭环校正: 补前落点={_curpos} 期望{piece_move:.1f} btn_per_piece={btn_per_piece:.3f}")
+    except Exception as _e:
+        log_info(f"[worker][dbg] 闭环校正异常: {_e}")
     time.sleep(random.uniform(0.1, 0.2))
     ac.release(btn)
+    # 落点核对：拖完拼图块左边缘相对 bg 的位移 vs 期望(piece_move)。误差大=公式/拖拽没到位；误差小还REJECT=行为被判。
+    try:
+        _land = page.run_js(
+            'var b=document.querySelector(".shumei_captcha_loaded_img_bg");'
+            'var f=document.querySelector(".shumei_captcha_loaded_img_fg");'
+            'return (f&&b)?+(f.getBoundingClientRect().left-b.getBoundingClientRect().left).toFixed(1):-999;')
+        log_info(f"[worker][dbg] 拖后拼图块落点(相对bg)={_land} 期望piece_move≈{piece_move:.1f} 误差={(_land - piece_move):.1f}")
+    except Exception as _e:
+        log_info(f"[worker][dbg] 落点测量失败: {_e}")
     pkt = page.listen.wait(timeout=15)  # 15s（短效代理~180s TTL，要在150s内完成5次重试）
     page.listen.stop()
     if not pkt:
