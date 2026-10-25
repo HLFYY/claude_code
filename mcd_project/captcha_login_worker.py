@@ -122,7 +122,7 @@ def cleanup_zombie_freezes():
 
 # ---------- 数美滑块(DrissionPage) ----------
 def get_tracks(distance):
-    """人类化滑动轨迹：ease-out 加速 → 轻微过冲 → 回拉修正，并带手腕弧线 Y 抖动与变速。
+    """【轨迹A｜ease-out】人类化滑动轨迹：ease-out 加速 → 轻微过冲 → 回拉修正，并带手腕弧线 Y 抖动与变速。
     返回 [(dx, dy, dt), ...]：dx/dy=该步相对位移(px)，dt=该步后停顿(s)。"""
     if distance <= 0:
         return []
@@ -144,6 +144,80 @@ def get_tracks(distance):
     for i in range(bn):
         tracks.append((-back / bn + random.uniform(-0.6, 0.6),
                        random.uniform(-0.6, 0.6), random.uniform(0.02, 0.06)))
+    return tracks
+
+
+def get_tracks_bezier(distance):
+    """【轨迹B｜三次贝塞尔】移植自 TwitterSpider/automate/base_login.py 的 get_tracks2()。
+    原实现的致命点在控制点是**绝对坐标** 200~300px：本项目拖动距离常在 60~250px，控制点会远超终点，
+    曲线冲过目标 100+px 再回拉（实测 d=60 时冲到头 187px），必然过不了。这里改成按 peak 比例取控制点。
+    另外原实现 y 控制点 100~200 会拉出上百像素垂直位移（它自己也不用 y），这里改为 ±2px 的手腕抖动。
+    返回 [(dx, dy, dt), ...]，与 get_tracks() 同格式同语义，可直接互换。"""
+    if distance <= 0:
+        return []
+    # 过冲量与距离挂钩：距离很小(如 1px)时不能冲 10px
+    overshoot = min(random.uniform(4.0, 12.0), distance * random.uniform(0.04, 0.12))
+    peak = distance + overshoot
+    steps = int(min(80, max(28, distance / random.uniform(3.5, 5.5))))
+    # 三次贝塞尔：P0=(0,0)、P3=(peak,0)；两个控制点按 peak 的比例摆放（全部 < peak → x 严格单调）
+    p1x = peak * random.uniform(0.28, 0.46)
+    p2x = peak * random.uniform(0.72, 0.90)
+    p1y = random.uniform(-2.0, 2.0)
+    p2y = random.uniform(-2.0, 2.0)
+    tracks = []
+    prev_x = prev_y = 0.0
+    prev_t = 0.0
+    for i in range(1, steps + 1):
+        # 等距采样会让中段速度恒等于 6px/步(太"机器")，这里给参数 t 加抖动 → 每步速度自然起伏；
+        # 末步强制 t=1，累计仍严格落在 peak 上
+        jit = 0.0 if i == steps else random.uniform(-0.25, 0.25)
+        t = (i + jit) / steps
+        if t <= prev_t:                              # 保险：抖动不得让 t 回退(否则出现负位移)
+            t = prev_t + 1e-4
+        prev_t = t
+        mt = 1.0 - t
+        b1 = 3.0 * mt * mt * t
+        b2 = 3.0 * mt * t * t
+        b3 = t ** 3
+        x = b1 * p1x + b2 * p2x + b3 * peak
+        y = b1 * p1y + b2 * p2y          # 曲线自身在末端回到 0，净垂直位移为 0
+        tracks.append((x - prev_x, y - prev_y, random.uniform(0.010, 0.022)))   # 比 ease 版稍慢，拉到人类手感
+        prev_x, prev_y = x, y
+    # 回拉：peak → distance（末步吃掉浮点残差，保证合计严格等于 distance）
+    acc = sum(t[0] for t in tracks)
+    back = peak - distance
+    bn = random.randint(2, 4)
+    for i in range(bn):
+        step = (-back / bn) if i < bn - 1 else (distance - acc)
+        acc += step
+        tracks.append((step, random.uniform(-0.5, 0.5), random.uniform(0.02, 0.05)))
+    return tracks
+
+
+# 轨迹策略：ease(轨迹A) / bezier(轨迹B) / rotate(默认，两次一换)
+# 环境变量 MCD_TRACK_MODE=ease|bezier|rotate 可强制单一策略（排查用）
+_TRACK_MODE = (os.environ.get('MCD_TRACK_MODE') or 'rotate').strip().lower()
+_track_count = 0
+_last_track_mode = ''   # 最近一次实际使用的轨迹(ease/bezier)，供结果行/失败截图标注，失败时一眼看出是哪条轨迹
+
+
+def _next_track_mode():
+    """轮换：第 1 次 ease、第 2 次 bezier、第 3 次 ease ……（worker 单线程，无需加锁）"""
+    global _track_count
+    if _TRACK_MODE in ('ease', 'bezier'):
+        return _TRACK_MODE
+    _track_count += 1
+    return 'bezier' if _track_count % 2 == 0 else 'ease'
+
+
+def get_tracks_auto(distance):
+    """按策略选轨迹A/轨迹B，返回同格式 [(dx,dy,dt),...]。"""
+    global _last_track_mode
+    mode = _next_track_mode()
+    _last_track_mode = mode
+    tracks = get_tracks_bezier(distance) if mode == 'bezier' else get_tracks(distance)
+    total = sum(t[0] for t in tracks)
+    log_info(f"[worker][dbg] 轨迹={mode} 步数={len(tracks)} 合计={total:.1f}px 目标={distance:.1f}px")
     return tracks
 
 
@@ -308,7 +382,7 @@ def _slide_once(page):
         f"  dpr={geo.get('dpr')} win_w={geo.get('win_w')} 轨道行程={track}\n"
         f"  zoom={zoom:.3f} 拼图块需移动piece_move={piece_move:.1f} 缺口绝对x≈{gap_abs_x}\n"
         f"  => 用={how} 拖动distance={distance:.0f}")
-    tracks = get_tracks(distance)
+    tracks = get_tracks_auto(distance)
 
     btn = page.ele('.shumei_captcha_slide_btn')
     btn_x0 = None
@@ -320,7 +394,7 @@ def _slide_once(page):
     ac = Actions(page)
     ac.hold(btn)
     time.sleep(random.uniform(0.12, 0.3))        # 按下后的起手停顿
-    for dx, dy, dt in tracks:                     # 人类化轨迹(ease-out+过冲+回拉+弧线抖动)
+    for dx, dy, dt in tracks:                     # 轨迹A(ease-out)/轨迹B(贝塞尔) 轮换
         ac.move(dx, dy, duration=0)
         time.sleep(dt)
     time.sleep(random.uniform(0.05, 0.12))        # 停稳一下再(必要时)微调
@@ -510,10 +584,10 @@ def get_pass_rid(proxy_parts=None, headless=True, max_try=5, on_beat=None, tag='
                 log_info(f"[worker][dbg] 滑动#{i} 异常: {e}\n{traceback.format_exc()}")
                 _dbg_dump(page, f'{tag}_exc{i}')
                 risk, rid = None, None
-            log_info(f"[worker] 滑动#{i} risk={risk} rid={rid}")
+            log_info(f"[worker] 滑动#{i} 轨迹={_last_track_mode} risk={risk} rid={rid}")
             if risk == 'PASS' and rid:
                 return rid
-            _dbg_dump(page, f'{tag}_fail{i}')  # 失败现场：截图+HTML
+            _dbg_dump(page, f'{tag}_fail{i}_{_last_track_mode}')  # 失败现场：截图+HTML(文件名带轨迹)
             rf = page.ele('.shumei_captcha_img_refresh_btn', timeout=3)
             if rf:
                 rf.click(); time.sleep(3)
