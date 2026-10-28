@@ -566,7 +566,6 @@ def order_flow():
         if not result.get('success'):
             print(f"❌ {result.get('message', '获取商品详情失败')}")
             continue
-
         print(f"✅ {result.get('message', '获取成功')}")
         detail_data = result.get('data', {}).get('product', {})
 
@@ -667,6 +666,30 @@ def order_flow():
         print("\n❌ 购物车为空")
         sys.exit(0)
 
+    # 6.5 询问是否添加早餐卡，确认(y)才添加（复用 add_to_cart，传 card_id 即可；换别的卡改 card_id）
+    add_card = input("\n是否添加早餐卡到购物车? (y/n): ").strip().lower()
+    if add_card == 'y':
+        print(f"正在添加早餐卡到购物车...")
+        result = api_call('/api/mcd/add_to_cart', method='POST', data={
+            'phone': phone,
+            'store_code': store_code,
+            'store_name': store_name,
+            'be_code': be_code,
+            'card_id': 'CRD9311B796110E942234F726EF4B4FE994',  # 早餐卡ID（固定）
+            'card_type': 2,
+            'product_type': '0',
+            'quantity': 1,
+            'order_type': 1,
+        })
+        if result.get('success'):
+            card_cart = result.get('data', {})
+            card_products = card_cart.get('cartDetail', {}).get('products', [])
+            print(f"✅ {result.get('message', '早餐卡添加成功')}, 购物车中商品数: {len(card_products)}")
+        else:
+            print(f"⚠️  早餐卡添加失败: {result.get('message')} (继续流程)")
+    else:
+        print("跳过添加早餐卡")
+
     # 7. 获取订单验证信息
     print(f"\n正在获取订单验证信息...")
     result = api_call('/api/mcd/get_order_validation_info', params={
@@ -700,9 +723,23 @@ def order_flow():
     eat_type_options = store_pickup_info.get('eatTypeOptions', [])
 
     print("\n就餐方式:")
-    for option in eat_type_options:
+    for idx, option in enumerate(eat_type_options, 1):
         sub_text = option.get('subText', '')
-        print(f"  - {sub_text}")
+        text = option.get('text', '')
+        flag = ' (默认)' if option.get('selected') else ''
+        print(f"  {idx}. {text} - {sub_text}{flag}")
+
+    # 人工选择就餐方式，取选中项的 code 作为 eatTypeCode
+    eat_type_code = 'eat-in'
+    if eat_type_options:
+        default_idx = next((i for i, o in enumerate(eat_type_options, 1) if o.get('selected')), 1)
+        eat_idx = input(f"\n请选择就餐方式 (1-{len(eat_type_options)}, 回车默认 {default_idx}): ").strip() or str(default_idx)
+        if eat_idx.isdigit() and 1 <= int(eat_idx) <= len(eat_type_options):
+            eat_type_code = eat_type_options[int(eat_idx) - 1].get('code', 'eat-in')
+        else:
+            eat_type_code = eat_type_options[default_idx - 1].get('code', 'eat-in')
+            print(f"⚠️  无效选择，使用默认")
+        print(f"已选就餐方式: {eat_type_code}")
 
     # 展示总价
     product_price_info = confirm_info.get('productPriceInfo', {})
@@ -785,7 +822,7 @@ def order_flow():
         'menuCardList': menu_card_list,
         'beType': '1',
         'orderType': '1',
-        'eatTypeCode': 'eat-in',
+        'eatTypeCode': eat_type_code,
         'tablewareCode': 'no',
         'pinId': '',
         'latitude': latitude,
@@ -1038,6 +1075,7 @@ def payment_flow(arg2=''):
         print(f"   商品数: {len(cart_items)}")
         print(f"   会员卡数: {len(menu_card_list)}")
         print(f"   订单总金额: ¥{real_total_amount}")
+        print(f"   就餐方式: {eat_type_code}")
 
         # 提交订单
         print(f"\n[步骤 1] 正在提交订单...")
