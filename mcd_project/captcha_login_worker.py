@@ -698,7 +698,11 @@ def set_mcgold_status(phone, status, msg='', **extra):
 
 _VIP_CODE_VALID = '420'        # 要求过滑块：账号没被拦，只是要人机验证
 _VIP_CODE_INVALID = '6000232'  # 系统检测您的账号环境存在异常，暂时无法下单
-_VIP_MSG_INVALID = '异常'      # 服务端明确说异常 → 账号/设备侧不能开
+_VIP_MSG_INVALID = '环境存在异常'  # 服务端业务原文；不能用裸「异常」否则会吞掉「请求异常」等网络错误文案
+# 代理/网络等"没测出来"的错误特征：code=-1(make_request/ectrade 异常哨兵) 或 message 命中这些 → error
+_VIP_ERR_CODE = '-1'
+_VIP_ERR_MARKERS = ('请求异常', '请求超时', '代理连接失败', '网络连接失败',
+                    'ProxyError', 'ConnectionError', 'Max retries', 'timed out', 'Cannot connect to proxy')
 
 
 def _vip_verdict(r):
@@ -706,23 +710,26 @@ def _vip_verdict(r):
 
     口径要严格：**只有拿到一手证据才下结论**，其余一律 error，留给下一轮重测。
 
-    - 'valid'   ← r.success（真开出来了）
-                 或 code == 420（要求过滑块，说明账号本身没被拦）
-    - 'invalid' ← code == 6000232（「系统检测您的账号环境存在异常，暂时无法下单」）
-                 或 message 里含「异常」（服务端明确拒绝）
-    - 'error'   ← 其余全部：代理异常、网络超时、连接重置、未知错误码……
-                  这类结果是"没测出来"，不能当作账号资质写进凭证。
+    - 'error'   ← 先判：代理/网络异常(code=-1 或网络错误文案)——"没测出来"，绝不能当 invalid
+    - 'valid'   ← r.success（真开出来了）或 code == 420（要求过滑块，账号本身没被拦）
+    - 'invalid' ← code == 6000232 或 message 含「环境存在异常」（服务端明确拒绝账号/设备）
+    - 'error'   ← 其余未知错误码，同样不下结论
     """
     if not isinstance(r, dict):
         return 'error'
     if r.get('success'):
         return 'valid'
     code = str(r.get('code') if r.get('code') is not None else '').strip()
+    msg = str(r.get('message') or '')
+    # 1) 先排除代理/网络异常 → error（否则下面的关键字会把「请求异常」误判成 invalid）
+    if code == _VIP_ERR_CODE or any(m in msg for m in _VIP_ERR_MARKERS):
+        return 'error'
+    # 2) 一手证据
     if code == _VIP_CODE_VALID:
         return 'valid'
-    msg = str(r.get('message') or '')
     if code == _VIP_CODE_INVALID or _VIP_MSG_INVALID in msg:
         return 'invalid'
+    # 3) 其余未知错误码 → error，留给下一轮重测
     return 'error'
 
 
