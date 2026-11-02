@@ -1,0 +1,44 @@
+{
+ "a1": "all",
+ "a4": "1",
+ "a6": "android",
+ "a9": 1793374797564,
+ "a10": "11",
+ "a7": "3.17.0",
+ "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+ "a18": {
+  "gsm.sim.state": "READY"
+ },
+ "a24": "0d787a3a7513861e",
+ "a60": "u0_a776",
+ "a46": {
+  "model": "SM-J510FN",
+  "serial": "",
+  "brand": "samsung",
+  "manufacturer": "samsung",
+  "fingerprint": "samsung/j5xnltexx/j5xnlte:7.1.1/NMF26X/J510FNXXU2BRL1:user/release-keys"
+ },
+ "a38": "7.0.41.0",
+ "a44": "WIFI",
+ "a39": "com.mcdonalds.gma.cn",
+ "a40": 1774343065663,
+ "a135": 0,
+ "a136": "build1",
+ "a133": 670,
+ "a85": [
+  "bootId",
+  "tel",
+  "sensor",
+  "gps"
+ ],
+ "a167": 0,
+ "a168": 0,
+ "a121": 0,
+ "a125": {
+  "fit": 1793373815876,
+  "lut": 1793373815876
+ },
+ "a127": 95,
+ "a96": "qvdTr7A9k1DIU04ha4eP",
+ "a155": 1
+}

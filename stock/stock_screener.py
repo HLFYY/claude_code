@@ -54,13 +54,13 @@ CFG = {
     # todo 6.4调整
     # 力度周（W1）条件 bp1_vol_ratio：2->1.6   bp1_confirm_warm_max:1.3->1.5
     #     bp1_confirm_gain_max:0.12->0.15   hard_hist_spike_min:0.2->0.1 bp2_confirm_vol_max:1.3->1.5
-    "bp1_vol_ratio":         1.6,   # 成交额 ≥ 上周×2（倍量）
+    "bp1_vol_ratio":         2,   # 成交额 ≥ 上周×2（倍量）
     "bp1_gain_min":          0.05,  # 周涨幅 ≥ 5%
     # 确认周（W2）条件
     "bp1_confirm_shrink":    0.8,   # 缩量：成交额 ≤ W1×0.8 → 优先做
-    "bp1_confirm_warm_max":  1.5,   # 温和放量上限：≤ W1×1.3 → 可做排后
+    "bp1_confirm_warm_max":  1.8,   # 温和放量上限：≤ W1×1.3 → 可做排后
                                     # > W1×1.3 明显放量 → 不做
-    "bp1_confirm_gain_max":  0.15,  # W2 涨幅 < 12%
+    "bp1_confirm_gain_max":  0.20,  # W2 涨幅 < 12%
     "bp1_max_entry_age":     2,     # W1 最多2周前（W2最优/W3次优/W4+不做）
 
     # ── 买点2：回踩反包型 ──
@@ -71,7 +71,7 @@ CFG = {
 
     # ── 硬过滤（一票否决）──
     "hard_gain_max":         0.30,  # 本周涨幅 ≥ 30% 过热
-    "hard_consec_green_max": 7,     # 连红 ≥ 7 周
+    "hard_consec_green_max": 10,     # 连红 ≥ 7 周
     "hard_hist_spike_min":   0.15,  # 历史须有单周涨幅 ≥ 20%（辨识度验证）
 
     # ── 通用过滤 ──

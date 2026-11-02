@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #    详见 ../mcd/docs/踩坑与结论日志.md(a2/a97、706070 批量封号根源)。
 TEMPLATE_DIR = os.path.join(HERE, 'device_templates')
 ACTIVE_TEMPLATE = 'shortbox_STK-AL00_20261022.json'  # 当前干净模板(MOA-AL00 已烧)
+# ACTIVE_TEMPLATE = 'shortbox_J510FN-dalao_20261030.json'
 TEMPLATE = json.load(open(os.path.join(TEMPLATE_DIR, ACTIVE_TEMPLATE), encoding='utf-8'))
 
 REGISTER_URL = "https://fp-it.fengkongcloud.com/deviceprofile/v4"
@@ -52,7 +53,6 @@ def gen_shortbox():
     if 'a103' in box:
         box['a103'] = str(uuid.uuid4())                  # 每安装唯一 uuid(云模板带, 逐台刷新)
     # 跨设备实测会变的字段也逐台伪造,让每台更独立(减少被归为一组的概率)。取值按两台干净机观测范围。
-    # ⚠️ a2/a97 是数美现签 token、随机会 706070,无法伪造;这是本地造的天花板(复用同一 a2 会碰撞连坐)。
     if 'a4' in box:   box['a4'] = str(random.randint(1, 9))                 # SDK 调用计数之类
     if 'a60' in box:  box['a60'] = 'u0_a' + str(random.randint(100, 250))  # app 的 Linux UID(每安装不同)
     if 'a127' in box: box['a127'] = random.randint(100, 2000)
@@ -67,7 +67,6 @@ def gen_shortbox():
 def new_short_proxy(tries=3):
     """提一个神龙短效代理(随机支持城市,每次新)。返回 (proxies_dict, 'city/ip:port') 或 (None, None)。"""
     for _ in range(tries):
-        city = random.choice(list(utils.config.SHENLONG_SUPPORTED))
         city = '上海'
         ips = utils.extract_short_proxy_by_city(city, count=1)
         if ips:
@@ -92,7 +91,8 @@ def register_local(use_proxy=True, proxies=None, pinfo=None, proxy_retries=5, ti
     box, m = gen_shortbox()
     body = _box_json(make_box(
         json.dumps(box, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')))
-
+    print(box)
+    print(body)
     fixed = proxies is not None                          # 外部固定代理模式(与发码同IP)
     attempts = 1 if (fixed or not use_proxy) else proxy_retries
     for _ in range(attempts):
@@ -117,6 +117,7 @@ def register_local(use_proxy=True, proxies=None, pinfo=None, proxy_retries=5, ti
         except Exception:
             print(f"[local] 响应非JSON code={r.status_code}: {r.text[:80]}", flush=True)
             return None
+        print(j)
         code = j.get('code')
         did = (j.get('detail') or {}).get('deviceId')
         if code == 1100 and did:

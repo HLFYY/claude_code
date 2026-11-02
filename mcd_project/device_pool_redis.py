@@ -31,7 +31,8 @@ import json
 import time
 import uuid
 
-from config import make_redis, DEVICE_POOL_CONFIG as C, CODE_DIR
+import utils
+from config import make_redis, DEVICE_POOL_CONFIG as C, CODE_DIR, MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, IS_LOCAL
 
 _r = None
 
@@ -165,13 +166,22 @@ def test_sendcode(phone):
     import mcd_api
     print("[test] 本地造 B 设备 + 发码验证 phone=%s" % phone, flush=True)
 
-    proxies, pinfo = new_short_proxy()                  # 注册+发码共用这一个出口IP
+    if IS_LOCAL:
+        proxies, pinfo = new_short_proxy()
+        proxy_source = 'shenlong'# 注册+发码共用这一个出口IP
+    else:
+        proxy_source = PROXY_SOURCE_DEFAULT
+        try:
+            utils.ensure_egress_whitelisted(MERCHANT_ID_DEFAULT)
+        except Exception as _e:
+            print(f'⚠️  自动加白名单跳过: {_e}', flush=True)
+        proxies = utils.get_short_proxy('上海', province='上海', source=proxy_source,
+                              merchant_id=MERCHANT_ID_DEFAULT, as_dict=True, force_new=True)
     if not proxies:
         print("[test] ✗ 短效代理提取失败,重跑 test"); return
-    print("[test] 本次代理(注册+发码共用): %s" % pinfo, flush=True)
+    print("[test] 本次%s代理(注册+发码共用): %s" % (proxy_source, proxies), flush=True)
 
-    res = register_local(proxies=proxies, pinfo=pinfo)  # 注册用该代理
-    print(res)
+    res = register_local(proxies=proxies)  # 注册用该代理
     if not res:
         print("[test] ✗ 造设备失败(该代理可能不可用,重跑 test)"); return
     print("[test] ✓ 造出设备 model=%s\n       d=%s" % (res['model'], res['d']), flush=True)

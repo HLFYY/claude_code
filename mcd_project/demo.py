@@ -26,7 +26,7 @@ MAJOR_CITIES = [
 # 单次 invalid 不代表账号废了（可能是城市/代理/设备当时的组合问题），要连吃够
 # VIP_INVALID_CLEAR_AT 次才认为"当前 token + 省市这套组合"确实走不通，那时才清空重来。
 VIP_INVALID_COUNT_KEY_TMPL = 'mkt:prod:{merchant_id}:vip_invalid'
-VIP_INVALID_CLEAR_AT = 3
+VIP_INVALID_CLEAR_AT = 8
 
 
 def _redis_conn(env):

@@ -26,8 +26,8 @@ print(f'请求接口地址:{API_BASE}')
 DEFAULT_PHONE = '18019701277'
 DEFAULT_PROVINCE = '上海'
 DEFAULT_CITY = '上海'
-DEFAULT_LATITUDE = 31.026543
-DEFAULT_LONGITUDE = 121.379931
+DEFAULT_LATITUDE = 31.153849
+DEFAULT_LONGITUDE = 121.555123
 STORE_FILE = os.path.join(DATA_DIR, 'save_selected_store.json')
 ORDER_GOODS_FILE = os.path.join(DATA_DIR, 'save_order_data.json')
 PAY_INFO_FILE = os.path.join(DATA_DIR, 'save_payment_info.json')
@@ -986,7 +986,6 @@ def payment_flow(arg2=''):
                 'cursor': '',
                 'page_size': 10
             })
-
             if not result.get('success'):
                 print(f"❌ {result.get('message', '获取订单列表失败')}")
                 sys.exit(1)

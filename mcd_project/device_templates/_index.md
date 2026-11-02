@@ -15,6 +15,8 @@ hook 云手机/真机得到的数美设备 box 明文，本地造设备（`local
 | `shortbox_MOA-AL00_20261022.json` | 同机 day2（工厂重置后重抓）。与 day1 对比证实 **a2/a97 每次注册都变**（见踩坑日志） |
 | `fullbox_MOA-AL00_20261021.json` | day1 完整 box（82字段，参考） |
 | `shortbox_legacy-dirty-pixel_20261020.json` | 最早的 Pixel 脏模板（a18=ABSENT/adb、缺a2/a97）→ 本地造发码 706070，仅留档对比 |
+| `shortbox_J510FN-dalao_20261030.json` | **大佬手机 hook，SM-J510FN**。★**a4="1" 未注册态，无 a2/a97/a103**（首次注册请求体，token 由服务器现场分配）。与我们全部 a4="2" 模板不同 |
+| `fullbox_J510FN-dalao_20261030.json` | 同机完整 box（79字段）。⚠️大佬机本身是伪装机：a46=SM-J510FN(三星J5/2G) 但 a18.hardware=hi3660 + board=STF(华为Honor9) + a48=6G；**a84(Widevine)="___" 空**；a64 开着 autojs 无障碍 |
 
 ## 切换/新增
 换新云手机 hook 到新模板后：
