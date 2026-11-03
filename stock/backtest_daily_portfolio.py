@@ -17,7 +17,7 @@ SIG_FILE = bw.SIG_DIR / "_daily_breakout_signals.pkl"
 
 
 def signals_for_stock(args):
-    code, name = args
+    code, name, min_consec, max_consec = (*args, 1, 2)[:4] if len(args) == 2 else args
     _, d = bw.load_stock(code)
     if d is None or len(d) < _NEW_HIGH_DAYS + 8:
         return []
@@ -29,7 +29,7 @@ def signals_for_stock(args):
     for i in range(_NEW_HIGH_DAYS + 6, len(df)):
         if np.isnan(prior_max[i]) or c[i] < prior_max[i] or is_st[i]:
             continue
-        r = _check_breakout_sina(code, name, df.iloc[i - _NEW_HIGH_DAYS - 10:i + 1], {})
+        r = _check_breakout_sina(code, name, df.iloc[i - _NEW_HIGH_DAYS - 10:i + 1], {}, min_consec, max_consec)
         if not r or np.isnan(r["14日ATR"]) or r["14日ATR"] <= 0:
             continue
         out.append({
@@ -41,9 +41,13 @@ def signals_for_stock(args):
     return out
 
 
-def extract_signals(codes):
-    if SIG_FILE.exists():
-        return pickle.load(open(SIG_FILE, "rb"))
+def extract_signals(codes, min_consec=1, max_consec=2):
+    """连续新高天数默认 1~2（同实盘），其他参数的信号缓存单独存文件"""
+    f = SIG_FILE if (min_consec, max_consec) == (1, 2) else \
+        SIG_FILE.with_name(f"_daily_breakout_signals_c{min_consec}-{max_consec or 'inf'}.pkl")
+    if f.exists():
+        return pickle.load(open(f, "rb"))
+    codes = [(c, n, min_consec, max_consec) for c, n in codes]
     rows = []
     with Pool(8) as pool:
         for k, r in enumerate(pool.imap_unordered(signals_for_stock, codes, chunksize=20)):
@@ -51,5 +55,5 @@ def extract_signals(codes):
             if k % 1000 == 0:
                 print(f"日线选股 {k}/{len(codes)} 信号 {len(rows)}", file=sys.stderr, flush=True)
     sig = pd.DataFrame(rows)
-    pickle.dump(sig, open(SIG_FILE, "wb"))
+    pickle.dump(sig, open(f, "wb"))
     return sig

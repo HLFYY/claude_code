@@ -14,6 +14,7 @@ A股选股程序：周线倍量突破逻辑
 """
 
 import os
+import socket
 import sys
 import time
 import pickle
@@ -117,9 +118,27 @@ _market_gains: dict = {}
 _market_gains_lock = threading.Lock()
 
 
+# baostock 代理开关：本地 IP 已被 baostock 拉黑（多进程并发导致），本地走 proxy_bs.py 的 SOCKS5 代理；服务器直连
+BS_USE_PROXY = "houjie-" in socket.gethostname()
+
+
+def _use_bs_proxy():
+    """只替换 baostock 内部建连接用的 socket（其他请求如新浪不受影响）"""
+    import types
+    import socks
+    import baostock.util.socketutil as bs_sock
+    from proxy_bs import PROXIES
+    px = PROXIES[0]
+    socks.set_default_proxy(socks.SOCKS5, px["host"], px["port"], username=px["user"], password=px["pwd"])
+    bs_sock.socket = types.SimpleNamespace(socket=socks.socksocket, AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM)
+    print(f"baostock 走代理 {px['host']}:{px['port']}")
+
+
 def _ensure_login():
     global _bs_logged
     if not _bs_logged:
+        if BS_USE_PROXY:
+            _use_bs_proxy()
         _bs_global.login()
         _bs_logged = True
 
@@ -960,6 +979,7 @@ def process_one(row: tuple) -> Optional[dict]:
         daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30))
     result["atr_pct"] = _calc_atr(daily, 14) if daily is not None else float("nan")
     result["atr_limit"] = round(result["atr_pct"] * 1.2, 2)
+    result["data_date"] = df["date"].iloc[-1].strftime("%Y-%m-%d")   # 信号周（最后一根周线的日期）
 
     # ── RPS120 和 10日涨幅排名在 main() 中统一计算，这里预置占位 ──
     result["rps120"]     = float("nan")
@@ -1044,6 +1064,7 @@ _CN_COLUMNS = {
     "high_date":      "100日新高日期",   # 新增
     "high_price":     "新高收盘价",       # 新增
     "chg_pct":        "较新高涨跌幅",  # 新增
+    "data_date":      "信号周",
 }
 
 def _calc_level(row, require_signal_type: bool = True) -> int:
@@ -1071,6 +1092,26 @@ def _calc_level(row, require_signal_type: bool = True) -> int:
             return level_num
 
     return 5
+
+WEEKLY_SIGNALS_FILE = "stock_result/weekly_signals.csv"
+WEEKLY_POOL_SIGNALS = ("买点1-W2", "买点1-W3", "买点2")   # 进入合并股票池的周线信号（不含买点1-W1/买点3）
+
+
+def save_weekly_signals(results: list):
+    """周线信号追加到历史文件（按 信号周+代码 去重），供每日合并股票池 / 前向跟踪读取"""
+    rows = [{
+        "信号周": r["data_date"], "代码": r["code"].replace(".", ""), "名称": r["name"], "信号类型": r["signal"],
+        "突破价": r["breakout_price"], "ATR%": r.get("atr_pct"), "网格步长%": r.get("atr_limit"),
+    } for r in results if r.get("data_date")]
+    if not rows:
+        return
+    new = pd.DataFrame(rows)
+    if os.path.exists(WEEKLY_SIGNALS_FILE):
+        old = pd.read_csv(WEEKLY_SIGNALS_FILE, encoding="utf-8-sig", dtype={"代码": str})
+        new = pd.concat([old[~old["信号周"].isin(new["信号周"].unique())], new], ignore_index=True)
+    new.sort_values(["信号周", "代码"]).to_csv(WEEKLY_SIGNALS_FILE, index=False, encoding="utf-8-sig")
+    print(f"周线信号已写入 {WEEKLY_SIGNALS_FILE}（信号周 {sorted(set(r['信号周'] for r in rows))}）")
+
 
 def save_results(results: list, total_stocks: int, fname_prefix: str = "result", require_signal_type: bool = True):
     if not results:
@@ -1208,6 +1249,7 @@ def main():
 
     print_results(results)
     save_results(results, total)
+    save_weekly_signals(results)
 
 
 

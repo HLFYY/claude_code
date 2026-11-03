@@ -12,7 +12,12 @@ import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from stock_screener import fetch_daily_recent, _calc_atr
+from stock_screener import fetch_daily_recent, _calc_atr, WEEKLY_SIGNALS_FILE, WEEKLY_POOL_SIGNALS
+
+
+def _log(msg: str):
+    """流程日志：前面带时间（服务器定时任务排查用）"""
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
 def get_weekly_kdata(code: str):
@@ -236,7 +241,7 @@ def _print_result(code, reason):
 #  100日新高 + 倍量突破 选股（新浪数据源）
 # ─────────────────────────────────────────────
 #  选股条件：
-#   1. 日线收盘新高（近100交易日，不含当日），且最多连续2日新高（昨日+前日都新高的剔除），且近2日涨幅 < 20%
+#   1. 日线收盘新高（近100交易日，不含当日），且连续≥2日新高（今天、昨天都新高），且近2日涨幅 < 20%
 #   2. 日线收红（收盘价 > 开盘价 * 1.01），且剔除 收绿/涨幅≤1%/收在中位以下/上影≥实体
 #   3. 突破日成交额 > 前一日往前推5天成交额均值 * 1.5
 #
@@ -256,43 +261,69 @@ _GAIN_RANK_DAYS = 10
 _NEW_HIGH_DAYS = 130
 
 
+_SINA_MIN_STOCKS = 4000   # A股约5500只，少于这个数视为列表没拉全
+
+
 def _sina_get_stock_list():
-    """获取全部A股列表（新浪财经），缓存1天"""
+    """获取全部A股列表（新浪财经），缓存1天；某页失败会重试，拉不全不写缓存（退回旧缓存或报错）"""
     cache_file = _SINA_CACHE_DIR / "stock_list_sina.pkl"
+    old = None
     if cache_file.exists():
-        cache_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-        if datetime.now() - cache_time < timedelta(days=1):
-            with open(cache_file, "rb") as f:
-                return pickle.load(f)
+        with open(cache_file, "rb") as f:
+            old = pickle.load(f)
+        if old is None or len(old) < _SINA_MIN_STOCKS:
+            old = None   # 之前缓存过不完整的列表，作废
+        elif datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime) < timedelta(days=1):
+            return old
 
-    print("正在获取股票列表...")
-    all_stocks = []
-    url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    page = 1
-    while True:
-        params = {
-            "page": page, "num": 80, "sort": "symbol", "asc": 1,
-            "node": "hs_a", "symbol": "", "_s_r_a": "page",
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code != 200:
-                break
-            data = json.loads(resp.text)
-            if not data:
-                break
-            all_stocks.extend(data)
-            if len(data) < 80:
-                break
-            page += 1
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"获取股票列表出错: {e}")
+    _log("正在获取股票列表...")
+    base = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    num = 100
+    # 先取总数算页数：新浪偶尔会对中间页返回空/不足一页，不能以"不足一页"判断结束
+    try:
+        total = int(json.loads(requests.get(base + "Market_Center.getHQNodeStockCount",
+                                            params={"node": "hs_a"}, timeout=15).text))
+    except Exception as e:
+        total = 0
+        _log(f"获取股票总数失败：{type(e).__name__}: {e}")
+    pages = -(-total // num) if total else 80
+    by_symbol = {}
+    for page in range(1, pages + 1):
+        expect = min(num, total - (page - 1) * num) if total else num
+        params = {"page": page, "num": num, "sort": "symbol", "asc": 1,
+                  "node": "hs_a", "symbol": "", "_s_r_a": "page"}
+        data, err = None, ""
+        for attempt in range(5):
+            try:
+                resp = requests.get(base + "Market_Center.getHQNodeData", params=params, timeout=15)
+                if resp.status_code == 200:
+                    data = json.loads(resp.text) or []
+                    if len(data) >= expect:
+                        break
+                    err = f"只返回{len(data)}只（应{expect}只）"
+                else:
+                    err = f"HTTP {resp.status_code}"
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+            time.sleep(2 * (attempt + 1))
+        if not data or len(data) < expect:
+            _log(f"股票列表第{page}/{pages}页不完整（重试5次）：{err}")
+        for s in data or []:
+            by_symbol[s["symbol"]] = s
+        if not total and not data:
             break
+        time.sleep(1)
+    all_stocks = list(by_symbol.values())
 
+    _log(f"共获取 {len(all_stocks)} 只股票" + (f"（总数 {total}）" if total else ""))
+    need = int(max(_SINA_MIN_STOCKS, total * 0.98))
+    if len(all_stocks) < need:
+        if old is not None:
+            _log(f"⚠ 股票列表不完整（{len(all_stocks)}只），沿用上次缓存（{len(old)}只）")
+            return old
+        raise RuntimeError(f"股票列表获取不完整，仅{len(all_stocks)}只（至少需{need}只），未写缓存")
     with open(cache_file, "wb") as f:
         pickle.dump(all_stocks, f)
-    print(f"共获取 {len(all_stocks)} 只股票")
     return all_stocks
 
 
@@ -335,7 +366,7 @@ def _sina_get_kline(symbol: str, latest_date, datalen: int = 250):
                 pickle.dump(df, f)
         return df
     except Exception as e:
-        print(f"[ERROR] {symbol}: {type(e).__name__}: {e}")
+        _log(f"[ERROR] {symbol}: {type(e).__name__}: {e}")
         return None
 
 
@@ -353,9 +384,56 @@ def _to_sina_symbol(code: str) -> str:
     return f"sz{code}"
 
 
+def _sina_qfq_factors(symbol: str, refresh: bool = True):
+    """
+    新浪前复权因子（finance.sina.com.cn/realstock/company/{symbol}/qfq.js），返回按日期升序的 DataFrame[d, f]；
+    前复权价 = 不复权价 / f，f 从 d 当天起生效到下一个 d（已用 baostock 前复权核对，误差<0.01）。
+    缓存 cache_sina/qfq_{symbol}.pkl：refresh=True 时当天只拉一次；refresh=False 有缓存就用（老区间不受新除权影响）。
+    拉取失败返回旧缓存或 None（None 表示不复权）
+    """
+    cache_file = _SINA_CACHE_DIR / f"qfq_{symbol}.pkl"
+    cached = None
+    if cache_file.exists():
+        with open(cache_file, "rb") as f:
+            cached = pickle.load(f)
+        fresh = datetime.fromtimestamp(cache_file.stat().st_mtime).date() == datetime.now().date()
+        if not refresh or fresh:
+            return cached
+    try:
+        resp = requests.get(f"https://finance.sina.com.cn/realstock/company/{symbol}/qfq.js",
+                            headers={"Referer": "https://finance.sina.com.cn"}, timeout=10)
+        text = resp.text
+        data = json.loads(text[text.index("{"):text.rindex("}") + 1])["data"]
+        fac = pd.DataFrame(data)
+        if fac.empty:
+            fac = pd.DataFrame({"d": [pd.Timestamp("1990-01-01")], "f": [1.0]})
+        else:
+            fac["d"] = pd.to_datetime(fac["d"])
+            fac["f"] = fac["f"].astype(float)
+        fac = fac.sort_values("d").reset_index(drop=True)
+    except Exception as e:
+        _log(f"[复权因子] {symbol} 获取失败：{type(e).__name__}: {e}")
+        return cached
+    with open(cache_file, "wb") as f:
+        pickle.dump(fac, f)
+    return fac
+
+
+def _sina_qfq_adjust(df: pd.DataFrame, fac) -> pd.DataFrame:
+    """新浪不复权日K → 前复权（open/high/low/close ÷ 因子），fac 为 None 时原样返回"""
+    if fac is None or fac.empty:
+        return df
+    f = pd.merge_asof(df[["day"]].sort_values("day"), fac.rename(columns={"d": "day"}),
+                      on="day", direction="backward")["f"].fillna(fac["f"].iloc[0]).values
+    out = df.sort_values("day").reset_index(drop=True).copy()
+    for col in ("open", "high", "low", "close"):
+        out[col] = out[col] / f
+    return out
+
+
 def calc_buy_price_sina(code: str, date, datalen: int = 250) -> float:
     """
-    计算指定股票在指定日期的买入参考价：max(该日MA5 * 0.99, 该日最低价 * 0.99)
+    计算指定股票在指定日期的买入参考价 / 次日盘中清仓价：max(该日MA5 * 0.99, 该日最低价 * 0.99)，按前复权价计算
     code: 股票代码，裸代码('600000')或带前缀('sh600000')均可
     date: 目标日期，字符串('2025-07-01')或 date/datetime
     """
@@ -366,7 +444,7 @@ def calc_buy_price_sina(code: str, date, datalen: int = 250) -> float:
     if df is None or df.empty:
         raise ValueError(f"未获取到 {symbol} 的K线数据")
 
-    df = df.sort_values("day").reset_index(drop=True)
+    df = _sina_qfq_adjust(df.sort_values("day").reset_index(drop=True), _sina_qfq_factors(symbol))
     idx = df.index[df["day"].dt.date == target_date]
     if len(idx) == 0:
         raise ValueError(f"{symbol} 在 {target_date} 没有K线数据（非交易日或超出数据范围）")
@@ -433,8 +511,12 @@ def _calc_rps_and_rank_sina(code: str, market_gains: dict) -> tuple:
     return rps120, gain10_rank
 
 
-def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: dict) -> dict:
-    """检查单只股票是否满足 100日新高+收红+倍量 条件，满足则返回结果字典，否则 None"""
+def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: dict,
+                         min_consec: int = 1, max_consec=2) -> dict:
+    """
+    检查单只股票是否满足 100日新高+收红+倍量 条件，满足则返回结果字典，否则 None
+    min_consec / max_consec：连续新高天数（含当日）的下限 / 上限（None=不限），默认 1~2 即"首日突破或突破第二日"
+    """
     if df is None or len(df) < _NEW_HIGH_DAYS + 7:
         return None
 
@@ -451,13 +533,17 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
     if latest_close < prior_100_high:
         return None
 
-    # 条件1.1：最多连续2日新高（只要首日突破/突破第二日），昨日和前日都新高说明已连续上涨，剔除
+    # 条件1.1：连续新高天数在 [min_consec, max_consec] 内（默认最多2日：只要首日突破/突破第二日）
     def _is_new_high(i):
         return df["close"].iloc[i] >= df["high"].iloc[i - 100:i].max()
 
     n = len(df)
     yesterday_new_high = _is_new_high(n - 2)
-    if yesterday_new_high and _is_new_high(n - 3):
+    look = max(min_consec, max_consec + 1) if max_consec is not None else 30   # 不设上限时数出实际天数（最多30）
+    consec = 1
+    while consec < look and n - 1 - consec - 100 >= 0 and _is_new_high(n - 1 - consec):
+        consec += 1
+    if consec < min_consec or (max_consec is not None and consec > max_consec):
         return None
 
     # 条件1.2：近2日涨幅 < 20%（含当日，对比3个交易日前收盘），过滤已大幅拉升的
@@ -505,6 +591,7 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
         "突破日涨幅(%)": round(pct_change, 2),
         "近2日涨幅(%)": round(gain_2d, 2),
         "昨日是否新高": "是" if yesterday_new_high else "否",
+        "连续新高天数": consec if consec < look else f"≥{look}",
         "突破日成交额倍量比": round(amount_ratio, 2),
         "14日ATR": atr_pct,
         "网格步长": grid_step,
@@ -513,12 +600,32 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
     }
 
 
-def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_MAX_WORKERS) -> pd.DataFrame:
+def _sina_load_market(datalen: int = 250, max_workers: int = _SINA_MAX_WORKERS):
+    """加载全市场新浪日K（走 cache_sina 缓存），返回 (最新交易日, 股票列表, {symbol: df})"""
+    latest_date = _sina_get_latest_trading_date()
+    stock_list = _sina_get_stock_list()
+    _log(f"最新交易日: {latest_date}，共 {len(stock_list)} 只股票，开始拉取日线...")
+    df_all = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futs = {executor.submit(_sina_get_kline, s["symbol"], latest_date, datalen): s for s in stock_list}
+        for fut in as_completed(futs):
+            try:
+                df_all[futs[fut]["symbol"]] = fut.result(timeout=30)
+            except Exception:
+                df_all[futs[fut]["symbol"]] = None
+    miss = [k for k, v in df_all.items() if v is None or v.empty]
+    _log(f"日线获取成功 {len(df_all) - len(miss)} 只，失败/无数据 {len(miss)} 只"
+         + ("（失败过多，可能被新浪限流，选股可能不完整）" if len(miss) > len(df_all) * 0.05 else ""))
+    return latest_date, stock_list, df_all
+
+
+def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_MAX_WORKERS,
+                                  min_consec: int = 2, max_consec=None, market=None) -> pd.DataFrame:
     """
     选股：100日新高 + 倍量突破，以最新交易日为突破日，全部满足才入选
     筛选条件：
       1. 新高：收盘价 >= 前100个交易日（不含当日）最高价
-      2. 新高天数：最多连续2日新高（只要首日突破/突破第二日），昨日和前日都新高的剔除
+      2. 新高天数：连续新高天数在 [min_consec, max_consec] 内，默认至少连续2日（T+1回测下只突破1日的拖后腿）
       3. 近2日涨幅 < 20%：当日收盘对比3个交易日前收盘，>=20%剔除（过滤连板/已大幅拉升）
       4. 收红：收盘价 > 开盘价 * 1.01
       5. K线形态，满足任一剔除：
@@ -530,27 +637,13 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
     参数：
       datalen: 每只股票拉取的日K线条数，需 >= 137（100日新高+ATR等计算余量）
       max_workers: 拉取K线的并发线程数
+      market: 已加载的 _sina_load_market() 结果，传入则不重复加载
     数据源：新浪财经（hq.sinajs.cn 实时 / money.finance.sina.com.cn 日K线），与 stock_check_xinlang 同源
     字段计算：14日ATR / 网格步长 / RPS120 / 10日涨幅排名，公式对齐 stock_screener.py
-    输出：stock_result/result_sina_{时间戳}.csv（中文列名，utf-8-sig），按10日涨幅排名强→弱（即买入优先级，从上往下买）
-      额外字段：突破日涨幅(%) / 近2日涨幅(%) / 昨日是否新高
+    输出：stock_result/result_sina_{时间戳}.csv（中文列名，utf-8-sig），按RPS120高→低；这是日线信号，实际买入看 build_buy_pool 的合并股票池
+      额外字段：突破日涨幅(%) / 近2日涨幅(%) / 昨日是否新高 / 连续新高天数
     """
-    latest_date = _sina_get_latest_trading_date()
-    stock_list = _sina_get_stock_list()
-    print(f"最新交易日: {latest_date}，共 {len(stock_list)} 只股票，开始拉取日线...")
-
-    df_all = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futs = {
-            executor.submit(_sina_get_kline, s["symbol"], latest_date, datalen): s
-            for s in stock_list
-        }
-        for fut in as_completed(futs):
-            s = futs[fut]
-            try:
-                df_all[s["symbol"]] = fut.result(timeout=30)
-            except Exception:
-                df_all[s["symbol"]] = None
+    latest_date, stock_list, df_all = market or _sina_load_market(datalen, max_workers)
 
     market_gains = _collect_market_gains_sina(df_all)
 
@@ -558,26 +651,171 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
     for s in stock_list:
         code = s["symbol"]
         name = s.get("name", "")
-        r = _check_breakout_sina(code, name, df_all.get(code), market_gains)
+        r = _check_breakout_sina(code, name, df_all.get(code), market_gains, min_consec, max_consec)
         if r:
             results.append(r)
 
     if not results:
-        print("无符合条件股票")
+        _log("无符合条件股票")
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-    # 买入优先级：10日涨幅排名强→弱（长周期回测最优，见 docs/日线突破策略.md）
-    df = df.sort_values("10日涨幅排名", ascending=True, na_position="last").reset_index(drop=True)
-    df.insert(0, "买入顺序", range(1, len(df) + 1))
+    df = df.sort_values("RPS120(百分位)", ascending=False, na_position="last").reset_index(drop=True)
 
     os.makedirs("stock_result", exist_ok=True)
     fname = f"stock_result/result_sina_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
         df.to_csv(f, index=False)
-    print(f"结果已保存: {fname}（共 {len(df)} 只）")
+    _log(f"结果已保存: {fname}（共 {len(df)} 只）")
     df.attrs["fname"] = fname
     return df
+
+
+# ─────────────────────────────────────────────
+#  合并股票池：本周有效的周线信号 + 当日日线信号，按 RPS120 高→低，次日集合竞价买入
+# ─────────────────────────────────────────────
+OPEN_GAP_MAX = 0.07          # 开盘涨幅 > 7% 不买：集合竞价挂单价 = 前收 × 1.07（不超过涨停价）
+POOL_CAPITAL = 800_000       # 没有模拟账户信息时，按此本金算 1 层参考股数
+
+
+def _next_trading_day(d):
+    import chinese_calendar as cc
+    d = pd.Timestamp(d).date() + timedelta(days=1)
+    while d.weekday() >= 5 or not cc.is_workday(d):
+        d += timedelta(days=1)
+    return d
+
+
+def _limit_pct_sina(code: str) -> float:
+    return 0.2 if code[2:5] in ("300", "301", "688", "689") else 0.1
+
+
+def _rps120_qfq(code: str, df: pd.DataFrame, all_g120: np.ndarray) -> float:
+    """候选股按前复权算120日涨幅，在全市场（不复权）分布里取百分位；与回测/前向跟踪口径一致"""
+    adj = _sina_qfq_adjust(df, _sina_qfq_factors(code))
+    c = adj["close"].values
+    if len(c) < _RPS_DAYS + 1 or not len(all_g120):
+        return float("nan")
+    g = c[-1] / c[-(_RPS_DAYS + 1)] - 1
+    return round((all_g120 < g).mean() * 100, 1)
+
+
+def load_weekly_signals() -> pd.DataFrame:
+    """stock_screener 写入的周线信号历史（只留进股票池的类型）"""
+    if not os.path.exists(WEEKLY_SIGNALS_FILE):
+        return pd.DataFrame(columns=["信号周", "代码", "名称", "信号类型", "突破价", "ATR%", "网格步长%"])
+    w = pd.read_csv(WEEKLY_SIGNALS_FILE, encoding="utf-8-sig", dtype={"代码": str})
+    w["信号周"] = pd.to_datetime(w["信号周"])
+    return w[w["信号类型"].str.startswith(WEEKLY_POOL_SIGNALS)].reset_index(drop=True)
+
+
+def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.DataFrame:
+    """
+    生成下一交易日的合并股票池 stock_result/pool_{日期}.csv：
+      - 周线：上一周的买点1-W2/W3/买点2（下一交易日为周一~周四时有效），前收 < 突破价 的剔除
+      - 日线：当日 screen_new_high_breakout_sina 的信号（连续≥2日新高），只在下一交易日有效
+      - 统一按 RPS120（前复权）高→低给买入顺序；开盘买入价上限 = 前收×1.07（不超过涨停价）
+      - sim（forward_track 结果）：标注模拟持仓中/本周已买卖，并给出 1 层参考股数与可新开只数
+    """
+    latest_date, stock_list, df_all = market
+    names = {s["symbol"]: s.get("name", "") for s in stock_list}
+    next_day = _next_trading_day(latest_date)
+    nd = pd.Timestamp(next_day)
+
+    cands = []
+    wk = load_weekly_signals()
+    wk = wk[wk["信号周"].dt.to_period("W-FRI") == nd.to_period("W-FRI") - 1]
+    for r in wk.to_dict("records"):
+        cands.append({"代码": r["代码"], "来源": "周线", "信号": r["信号类型"], "信号日": r["信号周"].strftime("%Y-%m-%d"),
+                      "突破价": r["突破价"], "网格步长%": r["网格步长%"]})
+    if daily_sig is not None and not daily_sig.empty:
+        for r in daily_sig.to_dict("records"):
+            cands.append({"代码": r["股票代码"], "来源": "日线", "信号": f"连续{r['连续新高天数']}日新高",
+                          "信号日": r["突破日期"], "突破价": r["突破价"], "网格步长%": r["网格步长"]})
+
+    gains = _collect_market_gains_sina(df_all)
+    all_g120 = np.array([v["gain120"] for v in gains.values() if not np.isnan(v["gain120"])])
+    all_g10 = np.array([v["gain10"] for v in gains.values() if not np.isnan(v["gain10"])])
+    layer_amt = (sim or {}).get("equity", POOL_CAPITAL) * 0.1
+    held, traded = set((sim or {}).get("held", [])), set((sim or {}).get("traded_week", []))
+    rows = []
+    for c in cands:
+        code, df = c["代码"], df_all.get(c["代码"])
+        if df is None or df.empty or "ST" in names.get(code, "").upper():
+            continue
+        if pd.Timestamp(df["day"].iloc[-1]).date() != latest_date:
+            continue                                         # 当日停牌
+        prev = float(df["close"].iloc[-1])
+        if c["来源"] == "周线" and prev < float(c["突破价"]):
+            continue                                         # 周中走坏，跌破突破价
+        cap = min(round(prev * (1 + OPEN_GAP_MAX), 2), round(prev * (1 + _limit_pct_sina(code)), 2))
+        sh = layer_amt / cap
+        sh = (int(sh) if sh >= 200 else 0) if code[2:5] in ("688", "689") else int(sh // 100 * 100)
+        note = ("模拟持仓中，不买" if code in held else "本周已买卖，不买" if code in traded
+                else "1层买不起一手" if sh == 0 else "")
+        g10 = gains.get(code, {}).get("gain10", np.nan)
+        rows.append({**c, "名称": names.get(code, ""), "RPS120": _rps120_qfq(code, df, all_g120),
+                     "10日涨幅排名": int((all_g10 > g10).sum() + 1) if not np.isnan(g10) else np.nan,
+                     "前收": round(prev, 2), "开盘买入价上限": cap, "1层参考股数": sh, "备注": note})
+    pool = pd.DataFrame(rows, columns=["代码", "名称", "来源", "信号", "信号日", "RPS120", "10日涨幅排名", "前收",
+                                       "开盘买入价上限", "突破价", "网格步长%", "1层参考股数", "备注"])
+    if not pool.empty:
+        pool = pool.sort_values("RPS120", ascending=False, na_position="last")
+        src = pool.groupby("代码")["来源"].agg(lambda x: "+".join(sorted(set(x), reverse=True)))
+        pool = pool.drop_duplicates("代码", keep="first").assign(来源=lambda d: d["代码"].map(src)).reset_index(drop=True)
+    pool.insert(0, "买入顺序", range(1, len(pool) + 1))
+
+    fname = f"stock_result/pool_{next_day.strftime('%Y%m%d')}.csv"
+    pool.to_csv(fname, index=False, encoding="utf-8-sig")
+    can_buy = pool[pool["备注"] == ""]
+    _log(f"股票池已保存: {fname}（{next_day} 开盘候选 {len(can_buy)} 只：周线 {can_buy['来源'].str.contains('周线').sum()} / "
+         f"日线 {can_buy['来源'].str.contains('日线').sum()}）")
+    summary = [f"▶ {next_day} 开盘股票池 {len(can_buy)} 只（附件 {os.path.basename(fname)}）：按「买入顺序」集合竞价，"
+               f"挂「开盘买入价上限」(前收×1.07)，开盘涨幅>7%买不到即跳过；每只1层（参考股数见附件）"]
+    if next_day.weekday() == 4:
+        summary.append("▶ 下一交易日是周五：不开新仓")
+    elif sim and sim.get("next_level") is not None:
+        free = max(0, int(round(sim["next_level"] * 10 - sim.get("held_layers", 0))))
+        summary.append(f"▶ 明日大盘目标仓位 {int(sim['next_level'] * 100)}%，模拟持仓约 {sim.get('held_layers', 0):.1f} 层"
+                       f" → 最多新开 {free} 只（止损/走弱资金冻结到下周一，以实际可用资金为准）")
+    pool.attrs["fname"], pool.attrs["summary"] = fname, summary
+    return pool
+
+
+def _weekly_signals_ready(latest_date) -> bool:
+    """本周（latest_date 所在周）的周线信号是否已生成"""
+    w = load_weekly_signals() if os.path.exists(WEEKLY_SIGNALS_FILE) else None
+    if w is None or w.empty:
+        return False
+    return (w["信号周"].dt.to_period("W-FRI") == pd.Timestamp(latest_date).to_period("W-FRI")).any()
+
+
+def run_weekly_screener_if_needed(latest_date) -> list:
+    """
+    周线选股每周只跑一次：下一交易日的股票池要用"上一周"的周线信号，缺了才跑 stock_screener（本地走代理/服务器直连）。
+      - 正常：周五 19:00 那次运行时跑（baostock 17:30 后才有本周周线），周一~四 15:30 直接复用 weekly_signals.csv
+      - 周五休市等：周四 15:30 跑时 baostock 还没本周数据 → 提示并跳过，下一次运行（下周一）再补跑上周的
+    """
+    nxt = pd.Timestamp(_next_trading_day(latest_date))
+    if nxt.weekday() == 4:
+        return []                                            # 下一交易日是周五，不开新仓，不需要周线池
+    need_week = nxt.to_period("W-FRI") - 1                   # 需要的信号周
+    if _weekly_signals_ready(need_week.end_time.date()):
+        return []
+    now = datetime.now()
+    if need_week == pd.Timestamp(latest_date).to_period("W-FRI") and latest_date == now.date() \
+            and (now.hour < 17 or (now.hour == 17 and now.minute < 30)):
+        msg = "⚠ 本周周线信号还没生成：baostock 17:30 后才有本周周线，请 17:30 后再运行（否则下周股票池缺周线信号，下次运行会补跑）"
+        _log(msg)
+        return [msg]
+    _log(f"开始跑周线选股 stock_screener（信号周 {need_week}）...")
+    import stock_screener
+    stock_screener.main()
+    if not _weekly_signals_ready(need_week.end_time.date()):
+        msg = f"⚠ 周线选股已运行，但没有得到 {need_week} 的周线信号（baostock 数据可能未更新）"
+        _log(msg)
+        return [msg]
+    return []
 
 
 # ─────────────────────────────────────────────
@@ -743,8 +981,10 @@ def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
     pd.set_option("display.width", 250)
     pd.set_option("display.max_colwidth", 80)
     pd.set_option("display.unicode.east_asian_width", True)
-    print(f"\n{'=' * 72}\n  深证成指 10日线 + 分型 仓位操作（截至 {states['日期'].iloc[-1]} 收盘）\n{'=' * 72}")
-    print(states.tail(show_days).to_string(index=False))
+    _log(f"深证成指数据截至 {states['日期'].iloc[-1]} 收盘")
+    print(f"{'=' * 72}\n  深证成指 10日线 + 分型 仓位操作（截至 {states['日期'].iloc[-1]} 收盘）\n{'=' * 72}")
+    # 表格不放"下一日收盘关注"（太宽终端会折行错乱），只在下面最新一日的汇总里给出
+    print(states.drop(columns="下一日收盘关注").tail(show_days).to_string(index=False))
     last = states.iloc[-1]
     summary = [
         f"▶ {last['日期']} 收盘 {last['收盘']}（MA10 {last['MA10']}，{last['位置']}）{('，' + last['分型']) if last['分型'] else ''}",
@@ -779,21 +1019,56 @@ def send_mail_advice(summary: list, file_dirs: list):
     content = "\n".join(summary)
     yag = yagmail.SMTP(user='dailyfreshhlfyy@yeah.net', password='315128abc', host='smtp.yeah.net', port=465)
     res = yag.send(to=receivers, subject=title, contents=content, attachments=file_dirs)
-    print(f"邮件已发送：{receivers}  附件：{file_dirs or '无'}  {res or ''}")
+    _log(f"邮件已发送：{receivers}  附件：{file_dirs or '无'}  {res or ''}")
 
 def main():
-    # 深证成指 10日线+底/顶分型 仓位操作（收盘后跑看次日操作，盘中跑附带按实时价预估）；只是仓位建议，出错也不影响下面选股
+    """
+    每日流程（收盘后运行；每周最后一个交易日请在 17:30 后运行，会自动跑周线选股）：
+      大盘仓位建议 → [周末]周线选股 → 日线选股(连续≥2日新高) → 前向跟踪(模拟持仓/清仓价) → 合并股票池 → 发邮件
+    """
+    _log(f"开始运行（主机 {socket.gethostname()}）")
+    # 深证成指 10日线+底/顶分型 仓位操作；只是仓位建议，出错也不影响下面选股
     try:
         summary = sz_market_action().attrs["summary"]
     except Exception as e:
         summary = [f"[大盘仓位] 获取失败：{type(e).__name__}: {e}"]
-        print(summary[0])
-    # 100日线新高
-    pool = screen_new_high_breakout_sina()
+        _log(summary[0])
+    market, daily_sig = None, None
+    try:
+        market = _sina_load_market()
+        summary += run_weekly_screener_if_needed(market[0])
+        daily_sig = screen_new_high_breakout_sina(market=market)
+    except Exception as e:
+        err = f"[选股] 失败：{type(e).__name__}: {e}"
+        _log(err)
+        summary = summary + ["", err]
+    # 策略前向跟踪：模拟持仓 + 下一日盘中清仓价（复用上面加载的行情）
+    hold_file, sim = None, None
+    try:
+        import forward_track
+        ft = forward_track.main(market=market)
+        hold_file, sim = ft["holdings_file"], ft.get("sim")
+        summary = summary + [""] + ft["summary"]
+    except Exception as e:
+        err = f"[前向跟踪] 失败：{type(e).__name__}: {e}"
+        _log(err)
+        summary = summary + ["", err]
+    # 合并股票池（下一交易日开盘买入）
+    pool_file = None
+    if market is not None:
+        try:
+            pool = build_buy_pool(market, daily_sig, sim)
+            pool_file = pool.attrs["fname"]
+            summary = summary + [""] + pool.attrs["summary"]
+        except Exception as e:
+            err = f"[股票池] 失败：{type(e).__name__}: {e}"
+            _log(err)
+            summary = summary + ["", err]
     # 服务器定时任务跑时发邮件（本地不发）
     if "houjie-" not in socket.gethostname():
-        fname = pool.attrs.get("fname")
-        send_mail_advice(summary, [fname] if fname else [])
+        send_mail_advice(summary, [f for f in (pool_file, hold_file) if f])
+    _log("运行结束")
+
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == 'main':

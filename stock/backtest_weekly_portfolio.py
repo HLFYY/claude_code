@@ -34,7 +34,8 @@ LONG_DIR = Path("cache_bs_long")
 SIG_DIR = LONG_DIR                    # 选股信号缓存（删掉即重新提取）
 SIG_FILE = SIG_DIR / "_weekly_signals.pkl"
 INDEX_CODE = "sz.399001"
-WANT_SIGNALS = ("买点1-W2", "买点1-W3", "买点2")
+WANT_SIGNALS = ("买点1-W2", "买点1-W3", "买点2", "买点3")
+BP3_VOL_RATIO = 3.0                   # 买点3：买点1-W1 中突破周成交额 ≥ 上周 × 3（手动分组规则），下周一~四可买
 LAYER = 0.10
 GRID_MULT, GRID_PARTS = 1.2, 4
 BUY_FEE, SELL_FEE = 0.0003, 0.0008   # 佣金万2.5 + 卖出印花税万5（2023-08 前为千1，这里统一取近年值）
@@ -108,6 +109,8 @@ def signals_for_stock(args):
         r = ss.check_buy_point_1(wd)
         if r is None:
             r = ss.check_buy_point_2(wd)
+        if r is not None and r["signal"].startswith("买点1-W1") and r["vol_ratio"] >= BP3_VOL_RATIO:
+            r = {**r, "signal": "买点3"}
         if r is None or not r["signal"].startswith(WANT_SIGNALS):
             continue
         hist = d[d["date"] <= sig_day]
@@ -321,7 +324,7 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off") -> 
 # ─────────────────────────── 组合模拟 ───────────────────────────
 
 class Pos:
-    __slots__ = ("code", "sig", "buy_i", "buy_px", "shares0", "left", "levels", "sold", "cost")
+    __slots__ = ("code", "sig", "buy_i", "buy_px", "shares0", "left", "levels", "sold", "cost", "pending", "alloc")
 
 
 PRIORITIES = {
@@ -351,19 +354,73 @@ def add_rank_fields(sig: pd.DataFrame, daily: dict) -> pd.DataFrame:
     return sig
 
 
+# 实盘约束模式默认参数：本金、单边滑点、佣金(含过户费，按财通证券对账单实测买卖都约万1.35、无最低5元)、
+# 开盘最大涨幅（None=只跳过开盘涨停；0.06=开盘涨幅>6%就不买）
+# 滑点按成交方式分开：集合竞价（开盘买、开盘卖）和网格限价单按挂单价成交不加；盘中止损条件单 slip_stop；尾盘走弱 slip_close
+REAL_DEFAULT = {"capital": 800_000, "slip_auction": 0.0, "slip_stop": 0.002, "slip_close": 0.001,
+                "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None}
+
+
+def _limit_pct(code: str) -> float:
+    return 0.2 if code[3:6] in ("300", "301", "688", "689") else 0.1
+
+
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
-                  pool_mode="weekly"):
-    """pool_mode: weekly=上周五信号本周一~四可买；daily=前一交易日信号仅当日开盘可买"""
+                  pool_mode="weekly", t1=True, real=None):
+    """
+    pool_mode: weekly=上周五信号本周一~四可买；daily=前一交易日信号仅当日开盘可买；
+               mixed=sig 带 pool 列（"weekly"/"daily"），两类按各自有效期合成当天候选池，统一按优先级排序（同一只只算一次）
+    real: None=理想成交；dict（见 REAL_DEFAULT）=实盘约束：
+      - 按本金整手买入（100股，科创板≥200股），买不起一手跳过；网格每份按整手卖，最后一份卖剩余
+      - 开盘即涨停（不只一字）买不到，跳过；一字跌停卖不出，顺延到下一交易日开盘
+      - 滑点（买入价上浮、卖出价下浮）：集合竞价 slip_auction、盘中止损 slip_stop、尾盘 slip_close，网格限价不加；佣金 fee_rate（最低 min_fee 元）；印花税 2023-08-28 前千1、之后万5
+      - max_open_gap：开盘涨幅超过该值不买（None 时只跳过开盘涨停）
+    """
     dates = list(mkt["date"])
     level = mkt["level"].values
     clear = mkt["clear"].values
     week_id = pd.Series(dates).dt.to_period("W-FRI").values
+    if real is not None:
+        real = {**REAL_DEFAULT, **real}
+        cap = float(real["capital"])
+        slip_auc, slip_stop, slip_close = real["slip_auction"], real["slip_stop"], real["slip_close"]
+        fee_rate, min_fee, max_gap = real["fee_rate"], real["min_fee"] / cap, real["max_open_gap"]
+        stamp_cut = np.datetime64("2023-08-28")
+
+    def buy_fee(amt):
+        return max(min_fee, amt * fee_rate) if real else amt * BUY_FEE
+
+    def sell_net(amt, i):
+        if not real:
+            return amt * (1 - SELL_FEE)
+        stamp = 0.001 if np.datetime64(dates[i]) < stamp_cut else 0.0005
+        return amt - max(min_fee, amt * fee_rate) - amt * stamp
+
+    def locked_down(code, j):
+        """一字跌停：全天卖不出"""
+        dd = daily[code]
+        return real is not None and dd["h"][j] == dd["l"][j] and dd["c"][j] <= dd["c"][j - 1] * (1 - _limit_pct(code)) + 0.011
 
     # 选股池：信号周 → 下一周可用，按优先级排序（缺值排最后）
     sig = sig.copy()
-    sig["wk"] = sig["sig_date"].dt.to_period("W-FRI") if pool_mode == "weekly" else sig["sig_date"]
     by, asc = PRIORITIES[priority]
-    pools = {wk: g.sort_values(by, ascending=asc, na_position="last") for wk, g in sig.groupby("wk")}
+    if pool_mode == "mixed":
+        is_wk = sig["pool"] == "weekly"
+        wk_pools = {k: g for k, g in sig[is_wk].groupby(sig.loc[is_wk, "sig_date"].dt.to_period("W-FRI"))}
+        dy_pools = {k: g for k, g in sig[~is_wk].groupby("sig_date")}
+
+        def get_pool(i):
+            parts = [x for x in (wk_pools.get(week_id[i] - 1), dy_pools.get(dates[i - 1])) if x is not None]
+            if not parts:
+                return None
+            return (pd.concat(parts).sort_values(by, ascending=asc, na_position="last")
+                    .drop_duplicates("code", keep="first"))
+    else:
+        sig["wk"] = sig["sig_date"].dt.to_period("W-FRI") if pool_mode == "weekly" else sig["sig_date"]
+        pools = {wk: g.sort_values(by, ascending=asc, na_position="last") for wk, g in sig.groupby("wk")}
+
+        def get_pool(i):
+            return pools.get(week_id[i] - 1 if pool_mode == "weekly" else dates[i - 1])
 
     cash = 1.0
     pending_grid = 0.0                  # 次日可用
@@ -379,15 +436,11 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         j = dd["pos"].get(dates[i])
         return None if j is None else dd[field][j]
 
-    def prev_row(code, i):
-        """该股在 i 日之前最近一个交易日的行号"""
-        dd = daily[code]
-        j = dd["pos"].get(dates[i])
-        return (j - 1) if j is not None else None
-
-    def close_pos(p, i, price, reason, bucket):
+    def close_pos(p, i, price, reason, bucket, slip=0.0):
         nonlocal cash, frozen, pending_grid
-        val = p.left * p.shares0 * price * (1 - SELL_FEE)
+        if real:
+            price *= 1 - slip
+        val = sell_net(p.left * p.shares0 * price, i) if p.left > 1e-12 else 0.0
         p.cost += val
         if bucket == "frozen":
             frozen += val
@@ -397,15 +450,21 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             cash += val
         trades.append({"code": p.code, "signal": p.sig["signal"], "sig_date": p.sig["sig_date"],
                        "buy_date": dates[p.buy_i], "exit_date": dates[i], "reason": reason,
-                       "ret": p.cost / (p.shares0 * p.buy_px * (1 + BUY_FEE)) - 1, "grid_sold": p.sold,
-                       "daily_ok": p.sig["daily_ok"], "alloc": p.shares0 * p.buy_px * (1 + BUY_FEE),
-                       "buy_px": p.buy_px})
+                       "ret": p.cost / p.alloc - 1, "grid_sold": p.sold,
+                       "daily_ok": p.sig["daily_ok"], "alloc": p.alloc, "buy_px": p.buy_px})
         p.left = 0
 
-    def grid_sell(p, price):
+    def grid_sell(p, price, i, slip=0.0):
         nonlocal pending_grid
-        q = 1.0 / GRID_PARTS
-        val = q * p.shares0 * price * (1 - SELL_FEE)
+        if real:
+            price *= 1 - slip
+            total = round(p.shares0 * cap)
+            left_sh = round(p.left * total)
+            q_sh = left_sh if p.sold == GRID_PARTS - 1 else min(left_sh, max(100, total // GRID_PARTS // 100 * 100))
+            q = q_sh / total
+        else:
+            q = 1.0 / GRID_PARTS
+        val = sell_net(q * p.shares0 * price, i)
         p.cost += val
         pending_grid += val
         p.left -= q
@@ -428,15 +487,19 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         if use_freeze is False:
             cash += frozen; frozen = 0.0
 
-        # 1. 大盘铁律清仓
+        # 1. 大盘铁律清仓（实盘约束下：停牌/一字跌停卖不出，顺延到下一交易日开盘）
         if clear[i]:
             for p in positions:
+                j = daily[p.code]["pos"].get(day)
+                if real and (j is None or locked_down(p.code, j)):
+                    p.pending = p.pending or "大盘清仓(顺延)"
+                    continue
                 o = px(p.code, i, "o")
                 if o is None:  # 停牌：按最近收盘清（近似）
                     dd = daily[p.code]; j = np.searchsorted(dd["dates"], np.datetime64(day)) - 1
                     o = dd["c"][j]
-                close_pos(p, i, o, "大盘清仓", "cash")
-            positions = []
+                close_pos(p, i, o, "大盘清仓", "cash", slip_auc if real else 0)
+            positions = [p for p in positions if p.left > 1e-9]
 
         # 2. 持仓开盘处理
         for p in positions:
@@ -444,11 +507,18 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             if j is None:
                 continue
             dd = daily[p.code]
+            if p.pending:                  # T+1 / 顺延：该卖未卖的，今天开盘卖
+                if locked_down(p.code, j):
+                    continue
+                close_pos(p, i, dd["o"][j], p.pending, "cash" if p.pending.startswith("大盘") else "frozen",
+                          slip_auc if real else 0); continue
             stop = max(dd["ma5"][j - 1] * 0.99, dd["l"][j - 1] * 0.99)
             if dd["o"][j] <= stop:
-                close_pos(p, i, dd["o"][j], "止损(开盘)", "frozen"); continue
+                if locked_down(p.code, j):
+                    p.pending = "止损(跌停顺延)"; continue
+                close_pos(p, i, dd["o"][j], "止损(开盘)", "frozen", slip_auc if real else 0); continue
             while p.sold < GRID_PARTS and dd["o"][j] >= p.levels[p.sold]:
-                grid_sell(p, dd["o"][j])
+                grid_sell(p, dd["o"][j], i, slip_auc if real else 0)
             if p.left <= 1e-9:
                 close_pos(p, i, 0, "网格卖完", "cash")
         positions = [p for p in positions if p.left > 1e-9]
@@ -456,14 +526,14 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         # 3. 开新仓
         wd = pd.Timestamp(day).weekday()
         if level[i] > 0 and not clear[i] and wd != 4:
-            pool = pools.get(week_id[i] - 1 if pool_mode == "weekly" else dates[i - 1])
+            pool = get_pool(i)
             eq_prev = equity_curve[-1]
             layer_amt = LAYER * eq_prev
             held = {p.code for p in positions}
             used_layers = sum(p.left * p.shares0 * p.buy_px for p in positions) / layer_amt if positions else 0
             if pool is not None:
                 for _, s in pool.iterrows():
-                    if used_layers + 1 > level[i] * 10 + 1e-6 or cash < layer_amt * (1 - 1e-6):
+                    if used_layers + 1 > level[i] * 10 + 1e-6 or cash < layer_amt * (1 - 1e-6) * (0.9 if real else 1):
                         break
                     code = s["code"]
                     if code in held or code in traded_this_pool or code not in daily:
@@ -474,16 +544,32 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                         continue
                     if dd["c"][j - 1] < s["breakout_price"]:   # 周中走坏，不符合条件
                         continue
-                    lim = 0.2 if code[3:6] in ("300", "301", "688", "689") else 0.1
-                    if dd["h"][j] == dd["l"][j] and dd["o"][j] >= dd["c"][j - 1] * (1 + lim) - 0.011:
+                    lim_up = dd["c"][j - 1] * (1 + _limit_pct(code)) - 0.011
+                    if real:
+                        if dd["o"][j] >= lim_up:                 # 开盘即涨停，集合竞价买不到
+                            continue
+                        if max_gap is not None and dd["o"][j] > dd["c"][j - 1] * (1 + max_gap):
+                            continue                             # 开盘涨幅过大不追
+                    elif dd["h"][j] == dd["l"][j] and dd["o"][j] >= lim_up:
                         continue
+                    buy_px = dd["o"][j] * (1 + slip_auc) if real else dd["o"][j]
+                    if real:
+                        budget = min(layer_amt, cash) * cap
+                        sh = budget / (buy_px * (1 + fee_rate))
+                        sh = (int(sh) if sh >= 200 else 0) if code[3:6] in ("688", "689") else int(sh // 100 * 100)
+                        if sh == 0:                              # 买不起一手
+                            continue
+                        shares0 = sh / cap
+                    else:
+                        shares0 = layer_amt / (buy_px * (1 + BUY_FEE))
                     p = Pos()
-                    p.code, p.sig, p.buy_i, p.buy_px = code, s, i, dd["o"][j]
-                    p.shares0 = layer_amt / (p.buy_px * (1 + BUY_FEE))
-                    p.left, p.sold, p.cost = 1.0, 0, 0.0
+                    p.code, p.sig, p.buy_i, p.buy_px = code, s, i, buy_px
+                    p.shares0 = shares0
+                    p.alloc = shares0 * buy_px + buy_fee(shares0 * buy_px)
+                    p.left, p.sold, p.cost, p.pending = 1.0, 0, 0.0, None
                     step = s["atr"] * GRID_MULT / 100
-                    p.levels = [p.buy_px * (1 + k * step) for k in range(1, GRID_PARTS + 1)]
-                    cash -= layer_amt
+                    p.levels = [buy_px * (1 + k * step) for k in range(1, GRID_PARTS + 1)]
+                    cash -= p.alloc
                     positions.append(p)
                     held.add(code); traded_this_pool.add(code)
                     used_layers += 1
@@ -492,18 +578,28 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         for p in positions:
             dd = daily[p.code]
             j = dd["pos"].get(day)
-            if j is None:
+            if j is None or p.pending:
                 continue
             stop = max(dd["ma5"][j - 1] * 0.99, dd["l"][j - 1] * 0.99)
+            if t1 and i == p.buy_i:        # T+1：买入当天不卖，触及止损/走弱则次日开盘卖，网格不成交
+                if dd["l"][j] <= stop:
+                    p.pending = "买入日止损→次日开盘"
+                elif not (dd["h"][j] > dd["h"][j - 1] and dd["c"][j] > dd["c"][j - 1]):
+                    p.pending = "买入日走弱→次日开盘"
+                continue
             if dd["l"][j] <= stop:
-                close_pos(p, i, min(stop, dd["o"][j]), "止损", "frozen"); continue
+                if locked_down(p.code, j):
+                    p.pending = "止损(跌停顺延)"; continue
+                close_pos(p, i, min(stop, dd["o"][j]), "止损", "frozen", slip_stop if real else 0); continue
             while p.sold < GRID_PARTS and dd["h"][j] >= p.levels[p.sold]:
-                grid_sell(p, p.levels[p.sold])
+                grid_sell(p, p.levels[p.sold], i)
             if p.left <= 1e-9:
                 close_pos(p, i, 0, "网格卖完", "cash"); continue
             held_days = sum(1 for k in range(p.buy_i, i + 1) if dd["pos"].get(dates[k]) is not None)
             if held_days <= 2 and not (dd["h"][j] > dd["h"][j - 1] and dd["c"][j] > dd["c"][j - 1]):
-                close_pos(p, i, dd["c"][j], "走弱尾盘", "frozen")
+                if locked_down(p.code, j):
+                    p.pending = "走弱(跌停顺延)"; continue
+                close_pos(p, i, dd["c"][j], "走弱尾盘", "frozen", slip_close if real else 0)
         positions = [p for p in positions if p.left > 1e-9]
 
         # 5. 估值
@@ -519,7 +615,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     eq.attrs["open_positions"] = [{
         "code": p.code, "signal": p.sig["signal"], "sig_date": p.sig["sig_date"], "buy_date": dates[p.buy_i],
         "buy_px": p.buy_px, "left": p.left, "grid_sold": p.sold, "levels": p.levels,
-        "alloc": p.shares0 * p.buy_px * (1 + BUY_FEE),
+        "alloc": p.alloc, "pending": p.pending, "shares0": p.shares0,
         "last_close": daily[p.code]["c"][np.searchsorted(daily[p.code]["dates"], np.datetime64(dates[-1]), side="right") - 1],
     } for p in positions]
     return eq, pd.DataFrame(trades)
