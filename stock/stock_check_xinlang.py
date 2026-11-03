@@ -1,6 +1,8 @@
 import json
 import os
 import pickle
+import socket
+import sys
 import time
 from pathlib import Path
 
@@ -234,8 +236,8 @@ def _print_result(code, reason):
 #  100日新高 + 倍量突破 选股（新浪数据源）
 # ─────────────────────────────────────────────
 #  选股条件：
-#   1. 日线收盘新高（近100交易日，不含当日）
-#   2. 日线收红（收盘价 > 开盘价 * 1.01）
+#   1. 日线收盘新高（近100交易日，不含当日），且最多连续2日新高（昨日+前日都新高的剔除），且近2日涨幅 < 20%
+#   2. 日线收红（收盘价 > 开盘价 * 1.01），且剔除 收绿/涨幅≤1%/收在中位以下/上影≥实体
 #   3. 突破日成交额 > 前一日往前推5天成交额均值 * 1.5
 #
 #  字段计算全部对齐 stock_screener.py：
@@ -441,14 +443,45 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
     latest_close = float(latest["close"])
     latest_amount = float(latest["amount"])
     latest_day = latest["day"]
+    prev_close = float(df["close"].iloc[-2])
+    pct_change = (latest_close - prev_close) / prev_close * 100 if prev_close > 0 else float("nan")
 
     # 条件1：近100交易日新高（不含当日）
     prior_100_high = df["high"].iloc[-101:-1].max()
     if latest_close < prior_100_high:
         return None
 
+    # 条件1.1：最多连续2日新高（只要首日突破/突破第二日），昨日和前日都新高说明已连续上涨，剔除
+    def _is_new_high(i):
+        return df["close"].iloc[i] >= df["high"].iloc[i - 100:i].max()
+
+    n = len(df)
+    yesterday_new_high = _is_new_high(n - 2)
+    if yesterday_new_high and _is_new_high(n - 3):
+        return None
+
+    # 条件1.2：近2日涨幅 < 20%（含当日，对比3个交易日前收盘），过滤已大幅拉升的
+    close_2d_ago = float(df["close"].iloc[-3])
+    if close_2d_ago <= 0:
+        return None
+    gain_2d = (latest_close - close_2d_ago) / close_2d_ago * 100
+    if gain_2d >= 20:
+        return None
+
     # 条件2：收红
     if latest_close <= latest_open * 1.01:
+        return None
+
+    # 条件2.1：K线形态淘汰（同 get_reason 放量4条），满足任一剔除
+    latest_high = float(latest["high"])
+    latest_low = float(latest["low"])
+    if latest_close < latest_open:  # 收绿
+        return None
+    if not pct_change > 1:  # 滞涨（涨幅≤1%）
+        return None
+    if latest_close < (latest_high + latest_low) / 2:  # 冲高回落（收在中位以下）
+        return None
+    if latest_high - latest_close >= abs(latest_close - latest_open):  # 长上影（上影≥实体）
         return None
 
     # 条件3：成交额 > 前一日往前推5天均值 * 1.5（即前5个交易日：索引 -6 到 -2）
@@ -469,6 +502,9 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
         "突破日期": pd.to_datetime(latest_day).strftime("%Y-%m-%d"),
         "突破价": round(latest_close, 2),
         "当前价": round(latest_close, 2),
+        "突破日涨幅(%)": round(pct_change, 2),
+        "近2日涨幅(%)": round(gain_2d, 2),
+        "昨日是否新高": "是" if yesterday_new_high else "否",
         "突破日成交额倍量比": round(amount_ratio, 2),
         "14日ATR": atr_pct,
         "网格步长": grid_step,
@@ -479,10 +515,25 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
 
 def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_MAX_WORKERS) -> pd.DataFrame:
     """
-    选股：日线收盘新高(近100交易日) + 日线收红(收盘>开盘*1.01) + 成交额>前5日均值*1.5倍
+    选股：100日新高 + 倍量突破，以最新交易日为突破日，全部满足才入选
+    筛选条件：
+      1. 新高：收盘价 >= 前100个交易日（不含当日）最高价
+      2. 新高天数：最多连续2日新高（只要首日突破/突破第二日），昨日和前日都新高的剔除
+      3. 近2日涨幅 < 20%：当日收盘对比3个交易日前收盘，>=20%剔除（过滤连板/已大幅拉升）
+      4. 收红：收盘价 > 开盘价 * 1.01
+      5. K线形态，满足任一剔除：
+         - 收绿（收盘 < 开盘）
+         - 滞涨（涨幅 <= 1%，相对昨日收盘）
+         - 冲高回落（收盘 < (最高+最低)/2）
+         - 长上影（上影 最高-收盘 >= 实体 |收盘-开盘|）
+      6. 倍量：当日成交额 >= 前5个交易日成交额均值 * 1.5（成交额=收盘价*成交量估算）
+    参数：
+      datalen: 每只股票拉取的日K线条数，需 >= 137（100日新高+ATR等计算余量）
+      max_workers: 拉取K线的并发线程数
     数据源：新浪财经（hq.sinajs.cn 实时 / money.finance.sina.com.cn 日K线），与 stock_check_xinlang 同源
     字段计算：14日ATR / 网格步长 / RPS120 / 10日涨幅排名，公式对齐 stock_screener.py
-    输出：stock_result/result_sina_{时间戳}.csv（中文列名，utf-8-sig）
+    输出：stock_result/result_sina_{时间戳}.csv（中文列名，utf-8-sig），按10日涨幅排名强→弱（即买入优先级，从上往下买）
+      额外字段：突破日涨幅(%) / 近2日涨幅(%) / 昨日是否新高
     """
     latest_date = _sina_get_latest_trading_date()
     stock_list = _sina_get_stock_list()
@@ -516,44 +567,265 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-    df = df.sort_values("突破日成交额倍量比", ascending=False).reset_index(drop=True)
+    # 买入优先级：10日涨幅排名强→弱（长周期回测最优，见 docs/日线突破策略.md）
+    df = df.sort_values("10日涨幅排名", ascending=True, na_position="last").reset_index(drop=True)
+    df.insert(0, "买入顺序", range(1, len(df) + 1))
 
     os.makedirs("stock_result", exist_ok=True)
     fname = f"stock_result/result_sina_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
         df.to_csv(f, index=False)
     print(f"结果已保存: {fname}（共 {len(df)} 只）")
+    df.attrs["fname"] = fname
     return df
 
 
-if __name__ == "__main__":
-    # 新浪的数据成交额是计算的，有偏差；东方财富的是直接取的，准确些
-    # check_stock("sh603256")
-    # 260430
-    # for code in ['sh600791', 'sh603256', 'sz300438', 'sz002240', 'sz002730', 'sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz002810', 'sz002947']:
-    # 2605
-    # for code in ['sh600234', 'sh600330', 'sh603268', 'sh688661', 'sh600510', 'sz002859', 'sz301196', 'sh600791', 'sz002240', 'sz002730', 'sh600773']:
-    # for code in ['sz300769', 'sh600105', 'sz301176', 'sz300861', 'sz002785', 'sz300201', 'sz300668', 'sh600330', 'sh603268', 'sh688661', 'sh600791', 'sz002730']:
-    # for code in ['sz002730', 'sh688268', 'sz300161', 'sz300502', 'sz002832', 'sz003018', 'sz300821', 'sh603520', 'sh688390', 'sh688548', 'sh603268', 'sh600791']:
-    # for code in ['sz002273', 'sh688328', 'sh688383', 'sh603269', 'sh688700', 'sz300001', 'sz300776', 'sh688300', 'sz003018', 'sh688390', 'sh600791']:
-    # 2606
-    # for code in ['sz300679', 'sz002281', 'sz300757', 'sh601016', 'sz300825', 'sz300502', 'sh600869', 'sh688328', 'sh688300']:
-    # for code in 'sh600869,sz300825,sz300700,sz301568,sz300234,sz300398,sh603663,sh600226,sz300706,sh688096,sh688432,sh688126,sh688757,sz301188'.split(','):
-    # codes = 'sz300825,sz300700,sz300234,sh603663,sh600226,sz301188,sh603256,sz301389,sz002125,sh688379,sz300835,sz300567,sz300398,sz000608,sz301128'.split(','):
-    # codes = 'sz301188,sh603256,sz300835,sz300398,sz301369,sz300236,sz301045,sz301182,sh688045,sz300689,sz300985,sh688172,sh688551,sh688362'
-    # 2607
-    # codes = 'sz301369,sz300236,sz300985,sh688362,sz002056,sz300666,sz300234,sz300041,sz300263,sh603738'
-    # 260814
-    # codes = 'sz002821,sz300759,sh600521,sz301376,sz300985,sz301045,sz301188,sz300398,sz300567,sh603663'
-    # codes = 'sz300759,sz300985,sz301045,sz300398,sz300567,sh603663,sz002768,sz301568,sz300706,sh688757,sz301196'
-    # codes = 'sz300985,sz301045,sh603663,sz002768,sz301196,sh600226,sh603256,sz002388,sz300684,sh603151,sh603979,sz301188'
-    # for code in codes.split(',')[::-1]:
-    #     check_stock(code)
-    # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
-    # print(reason)
+# ─────────────────────────────────────────────
+#  深证成指 10日线 + 底/顶分型 仓位操作（只看收盘，不看盘中）
+# ─────────────────────────────────────────────
+#  分型：相邻3根K线，不做包含处理，第3根收盘确认。底分型=中间K最高、最低都低于左右；顶分型=反之
+#  10日线：收盘站上 → 次日开盘4层；次日收盘仍在线上 → 第三日开盘满仓
+#          收盘跌破 → 当天停止新开/加仓/补仓，次交易日集合竞价清空，转为空仓
+#  底分型：第3根收盘在10日线下才按底分型处理；第3根收盘价为弱势线，收盘低于它算跌破
+#          第二日收盘未跌破 → 第三日开盘4层；第三日收盘未跌破 → 第四日开盘满仓；第二日就跌破 → 作废
+#          持仓期间在10日线下：不受10日线清仓约束，收盘跌破弱势线 → 次日开盘清仓；收盘站上10日线后按10日线规则
+#  顶分型：有持仓时出现即处理；第3根收盘价为参考，收盘高于它算顶分失效
+#          第二日收盘失效 → 不处理；未失效 → 第三日开盘清仓
+#          清仓后：收盘突破分型顶点(中间K最高) → 按10日线规则重新进场；先跌破10日线 → 空仓，等站上10日线或新底分型
+#  只给大盘仓位建议，不影响选股输出
+#  回测见 backtest_weekly_portfolio.market_levels_v2(bottom_confirm=True, top_mode="confirm")
+
+def _pct(lv: float) -> str:
+    return f"{int(round(lv * 100))}%"
+
+
+def _pos_op(cur: float, nxt: float) -> str:
+    """当前仓位 → 下一日开盘仓位 的直白操作（每只1层=10%）"""
+    if nxt == cur:
+        return "空仓不动" if cur == 0 else f"持有{_pct(cur)}不动"
+    if nxt == 0:
+        return f"集合竞价全部清仓（{_pct(cur)}→0%）"
+    if cur == 0:
+        return f"开盘买入{int(round(nxt * 10))}只，建到{_pct(nxt)}"
+    return f"开盘加仓{int(round((nxt - cur) * 10))}只，{_pct(cur)}→{_pct(nxt)}"
+
+
+def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now) -> str:
+    """下一交易日收盘要看的条件，决定再下一日的操作"""
+    if top_pending is not None:
+        ref, _ = top_pending
+        return f"收盘≤{ref:.2f}→后天开盘清仓；>{ref:.2f}→顶分型失效继续持有"
+    if block is not None:
+        return f"收盘>{block:.2f}(顶点)且在10日线上→后天开盘建40%；否则继续空仓"
+    if pending is not None:
+        return f"收盘≥{pending:.2f}→后天开盘建40%；<{pending:.2f}→底分型作废"
+    if frac_mode and lv > 0:
+        if lv < 1:
+            return f"收盘≥{k3_close:.2f}→后天加满100%；<{k3_close:.2f}→后天开盘清仓"
+        return f"收盘<{k3_close:.2f}→后天开盘清仓；站上10日线(今≈{ma10_now:.2f})→转10日线规则"
+    if lv > 0:
+        if lv < 1:
+            return f"收盘仍在10日线上(今≈{ma10_now:.2f})→后天加满100%；跌破→后天开盘清仓"
+        return f"收盘跌破10日线(今≈{ma10_now:.2f})→后天开盘清仓；否则满仓持有"
+    return f"收盘站上10日线(今≈{ma10_now:.2f})→后天开盘建40%；10日线下出底分型→等次日确认"
+
+
+def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
+    """逐日推演仓位状态，df 需含 day/open/high/low/close（只含已收盘K线），逻辑与 market_levels_v2 一致"""
+    c, h, l = df["close"].values, df["high"].values, df["low"].values
+    ma10 = pd.Series(c).rolling(10).mean().values
+    rows = []
+    lv, frac_mode, k3_close = 0.0, False, 0.0
+    pending = None          # 底分型待确认的弱势线
+    top_pending = None      # 顶分型待确认 (第3根收盘, 顶点)
+    block = None            # 顶分型清仓后需突破的顶点
+    for t in range(len(df)):
+        bottom = t >= 2 and l[t - 1] < l[t - 2] and l[t - 1] < l[t] and h[t - 1] < h[t - 2] and h[t - 1] < h[t]
+        top = t >= 2 and h[t - 1] > h[t - 2] and h[t - 1] > h[t] and l[t - 1] > l[t - 2] and l[t - 1] > l[t]
+        prev_lv, notes, action = lv, [], ""
+        if np.isnan(ma10[t]):
+            action = "—"
+        else:
+            above = c[t] >= ma10[t]
+            done = False
+            if top_pending is not None:
+                ref, hi = top_pending
+                top_pending = None
+                if c[t] <= ref and lv > 0:
+                    lv, frac_mode, pending, block = 0.0, False, None, hi
+                    action = f"次日集合竞价清仓（顶分型确认：收盘≤第3根收盘{ref:.2f}），收盘突破顶点{hi:.2f}才重新进场"
+                    done = True
+                elif c[t] > ref and lv > 0:
+                    notes.append(f"顶分型失效（收盘>{ref:.2f}），不处理")
+            if not done and top and (lv > 0 or pending is not None):
+                if pending is not None:
+                    notes.append(f"顶分型出现，待确认的底分型(弱势线{pending:.2f})作废")
+                pending = None
+                if lv > 0:
+                    top_pending = (c[t], h[t - 1])
+                    notes.append(f"顶分型出现：次日收盘≤{c[t]:.2f}则第三日开盘清仓")
+            if not done and block is not None:
+                if not above:
+                    block = None
+                elif c[t] > block:
+                    notes.append(f"收盘突破顶点{block:.2f}，顶分型失效")
+                    block = None
+                else:
+                    action = f"空仓等待（未突破顶分型顶点{block:.2f}）"
+                    done = True
+            if not done:
+                if pending is not None and lv == 0:
+                    if c[t] >= pending:
+                        lv, frac_mode, k3_close = 0.4, True, pending
+                        action = f"底分型确认（收盘≥弱势线{pending:.2f}），次日开盘建40%"
+                    else:
+                        action = f"底分型作废（收盘<弱势线{pending:.2f}），空仓"
+                    pending = None
+                    if bottom and not above and lv == 0:
+                        pending = c[t]
+                        action += f"；新底分型，弱势线{c[t]:.2f}，待次日确认"
+                elif above and not frac_mode:
+                    if lv == 0:
+                        lv, action = 0.4, "次日开盘建40%（收盘站上10日线）"
+                    elif lv == 0.4:
+                        lv, action = 1.0, "次日开盘加满100%（仍在10日线上）"
+                    else:
+                        action = "满仓持有（10日线上）"
+                elif above and frac_mode:
+                    frac_mode = False
+                    lv, action = (0.4, "次日开盘建40%（站上10日线）") if lv == 0 else (1.0, "站上10日线，改按10日线规则，次日加满100%")
+                elif frac_mode and lv > 0:
+                    if c[t] < k3_close:
+                        lv, frac_mode = 0.0, False
+                        action = f"次日集合竞价清仓（底分型跌破：收盘<弱势线{k3_close:.2f}）"
+                    elif lv == 0.4:
+                        lv, action = 1.0, f"次日开盘加满100%（底分型未跌破弱势线{k3_close:.2f}）"
+                    else:
+                        action = f"满仓持有（底分型持仓，弱势线{k3_close:.2f}）"
+                    if bottom and frac_mode:
+                        k3_close = c[t]
+                        action += f"；新底分型，弱势线更新为{k3_close:.2f}"
+                elif bottom and not above:
+                    pre = "当天停止新开/加仓/补仓，次日集合竞价清仓（跌破10日线）；" if lv > 0 else ""
+                    lv, frac_mode, pending = 0.0, False, c[t]
+                    action = pre + f"10日线下底分型（弱势线{c[t]:.2f}），次日收盘不跌破则第三日开盘建40%"
+                elif not above:
+                    action = "当天停止新开/加仓/补仓，次日集合竞价清仓（收盘跌破10日线）" if lv > 0 else "空仓观望（10日线下）"
+                    lv, frac_mode = 0.0, False
+        rows.append({
+            "日期": pd.to_datetime(df["day"].iloc[t]).strftime("%Y-%m-%d"),
+            "收盘": round(c[t], 2), "MA10": round(ma10[t], 2) if not np.isnan(ma10[t]) else np.nan,
+            "位置": "" if np.isnan(ma10[t]) else ("线上" if c[t] >= ma10[t] else "线下"),
+            "分型": "底分型" if bottom else ("顶分型" if top else ""),
+            "当前仓位": _pct(prev_lv), "下一日仓位": _pct(lv), "下一日操作": _pos_op(prev_lv, lv),
+            "原因": "；".join(notes + [action]) if notes else action,
+            "下一日收盘关注": _watch(lv, frac_mode, k3_close, pending, top_pending, block,
+                              ma10[t] if not np.isnan(ma10[t]) else c[t]),
+        })
+    return pd.DataFrame(rows)
+
+
+def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
+    """输出深证成指近 show_days 日的分型与仓位操作；盘中运行时当日未收盘K线不参与判定，单独按实时价预估"""
+    url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    resp = requests.get(url, params={"symbol": "sz399001", "scale": 240, "ma": "no", "datalen": datalen}, timeout=15)
+    df = pd.DataFrame(json.loads(resp.text))
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    now = datetime.now()
+    closed = now.hour > 15 or (now.hour == 15 and now.minute >= 5)
+    today = now.strftime("%Y-%m-%d")
+    if df["day"].iloc[-1] == today and not closed:
+        df = df.iloc[:-1]   # 当日未收盘，不参与判定
+
+    states = _sz_market_states(df.reset_index(drop=True))
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_colwidth", 80)
+    pd.set_option("display.unicode.east_asian_width", True)
+    print(f"\n{'=' * 72}\n  深证成指 10日线 + 分型 仓位操作（截至 {states['日期'].iloc[-1]} 收盘）\n{'=' * 72}")
+    print(states.tail(show_days).to_string(index=False))
+    last = states.iloc[-1]
+    summary = [
+        f"▶ {last['日期']} 收盘 {last['收盘']}（MA10 {last['MA10']}，{last['位置']}）{('，' + last['分型']) if last['分型'] else ''}",
+        f"▶ 当前仓位：{last['当前仓位']}",
+        f"▶ 下一交易日开盘：{last['下一日操作']}  →  仓位 {last['下一日仓位']}",
+        f"▶ 原因：{last['原因']}",
+        f"▶ 下一交易日收盘关注：{last['下一日收盘关注']}",
+    ]
+    print("\n" + "\n".join("  " + x for x in summary))
+    states.attrs["summary"] = summary
+
+    # 盘中：按实时价当作收盘预估今天收盘后的操作
+    if not closed and df["day"].iloc[-1] != today:
+        fields = requests.get("https://hq.sinajs.cn/list=sz399001",
+                              headers={"Referer": "https://finance.sina.com.cn"}, timeout=5).text.split('"')[1].split(",")
+        if fields[30] == today:
+            rt = pd.DataFrame([{"day": today, "open": float(fields[1]), "high": float(fields[4]),
+                                "low": float(fields[5]), "close": float(fields[3])}])
+            est = _sz_market_states(pd.concat([df, rt], ignore_index=True)).iloc[-1]
+            print(f"\n  ◇ 盘中预估（{fields[31]}，若今天按当前价 {est['收盘']} 收盘，MA10 {est['MA10']}，{est['位置']}{('，' + est['分型']) if est['分型'] else ''}）")
+            print(f"    明天开盘：{est['下一日操作']} → 仓位 {est['下一日仓位']}；原因：{est['原因']}")
+            states.attrs["summary"] += [
+                f"◇ 盘中预估（{fields[31]}，若今天按当前价 {est['收盘']} 收盘）：明天开盘 {est['下一日操作']} → 仓位 {est['下一日仓位']}"]
+    return states
+
+
+def send_mail_advice(summary: list, file_dirs: list):
+    """发送操作建议邮件：标题=操作建议，正文=大盘下一日建议，附件=股票池csv"""
+    import yagmail
+    receivers = ["1558109546@qq.com"]
+    title = "操作建议"
+    content = "\n".join(summary)
+    yag = yagmail.SMTP(user='dailyfreshhlfyy@yeah.net', password='315128abc', host='smtp.yeah.net', port=465)
+    res = yag.send(to=receivers, subject=title, contents=content, attachments=file_dirs)
+    print(f"邮件已发送：{receivers}  附件：{file_dirs or '无'}  {res or ''}")
+
+def main():
+    # 深证成指 10日线+底/顶分型 仓位操作（收盘后跑看次日操作，盘中跑附带按实时价预估）；只是仓位建议，出错也不影响下面选股
+    try:
+        summary = sz_market_action().attrs["summary"]
+    except Exception as e:
+        summary = [f"[大盘仓位] 获取失败：{type(e).__name__}: {e}"]
+        print(summary[0])
     # 100日线新高
-    screen_new_high_breakout_sina()
-    # 计算指定日期价格-max(MA5×0.99, 最低价×0.99),每天计算一次持仓个股
-    for code in []:
-        res = calc_buy_price_sina(code, date=time.strftime("%Y-%m-%d"))
-        print(code, res)
+    pool = screen_new_high_breakout_sina()
+    # 服务器定时任务跑时发邮件（本地不发）
+    if "houjie-" not in socket.gethostname():
+        fname = pool.attrs.get("fname")
+        send_mail_advice(summary, [fname] if fname else [])
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == 'main':
+        main()
+    else:
+        main()
+        # 计算指定日期价格-max(MA5×0.99, 最低价×0.99),每天计算一次持仓个股
+        # for code in ['']:
+        #     res = calc_buy_price_sina(code, date=time.strftime("%Y-%m-%d"))
+        #     print(code, res)
+
+        # 新浪的数据成交额是计算的，有偏差；东方财富的是直接取的，准确些
+        # check_stock("sh603256")
+        # 260430
+        # for code in ['sh600791', 'sh603256', 'sz300438', 'sz002240', 'sz002730', 'sz300657', 'sz002436', 'sh600773', 'sh688667', 'sh688081', 'sz002810', 'sz002947']:
+        # 2605
+        # for code in ['sh600234', 'sh600330', 'sh603268', 'sh688661', 'sh600510', 'sz002859', 'sz301196', 'sh600791', 'sz002240', 'sz002730', 'sh600773']:
+        # for code in ['sz300769', 'sh600105', 'sz301176', 'sz300861', 'sz002785', 'sz300201', 'sz300668', 'sh600330', 'sh603268', 'sh688661', 'sh600791', 'sz002730']:
+        # for code in ['sz002730', 'sh688268', 'sz300161', 'sz300502', 'sz002832', 'sz003018', 'sz300821', 'sh603520', 'sh688390', 'sh688548', 'sh603268', 'sh600791']:
+        # for code in ['sz002273', 'sh688328', 'sh688383', 'sh603269', 'sh688700', 'sz300001', 'sz300776', 'sh688300', 'sz003018', 'sh688390', 'sh600791']:
+        # 2606
+        # for code in ['sz300679', 'sz002281', 'sz300757', 'sh601016', 'sz300825', 'sz300502', 'sh600869', 'sh688328', 'sh688300']:
+        # for code in 'sh600869,sz300825,sz300700,sz301568,sz300234,sz300398,sh603663,sh600226,sz300706,sh688096,sh688432,sh688126,sh688757,sz301188'.split(','):
+        # codes = 'sz300825,sz300700,sz300234,sh603663,sh600226,sz301188,sh603256,sz301389,sz002125,sh688379,sz300835,sz300567,sz300398,sz000608,sz301128'.split(','):
+        # codes = 'sz301188,sh603256,sz300835,sz300398,sz301369,sz300236,sz301045,sz301182,sh688045,sz300689,sz300985,sh688172,sh688551,sh688362'
+        # 2607
+        # codes = 'sz301369,sz300236,sz300985,sh688362,sz002056,sz300666,sz300234,sz300041,sz300263,sh603738'
+        # 260814
+        # codes = 'sz002821,sz300759,sh600521,sz301376,sz300985,sz301045,sz301188,sz300398,sz300567,sh603663'
+        # codes = 'sz300759,sz300985,sz301045,sz300398,sz300567,sh603663,sz002768,sz301568,sz300706,sh688757,sz301196'
+        # codes = 'sz300985,sz301045,sh603663,sz002768,sz301196,sh600226,sh603256,sz002388,sz300684,sh603151,sh603979,sz301188'
+        # for code in codes.split(',')[::-1]:
+        #     check_stock(code)
+        # reason = get_reason(34.77, 37.55, 40.45, 34.32, 34.91, 2345310250.4, 2031046330.03, 31.178)
+        # print(reason)

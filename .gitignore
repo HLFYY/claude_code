@@ -48,3 +48,19 @@ mcd/resources/so/
 mcd/resources/apk/
 # 大体积抓包/二进制落盘目录（保留 logs 里的文本证据）
 mcd/resources/*.bin
+
+# ---- stock：拉取的行情数据（本地保留，不提交）----
+stock/cache/
+stock/cache_sina/
+stock/cache_sina_long/
+stock/cache_bs_long/
+# baostock 代理账密
+stock/proxy_bs.py
+# 回测输出（本地保留，不提交）
+stock/stock_result/backtest_*.csv
+stock/stock_result/long_*.csv
+stock/stock_result/report_*.csv
+stock/stock_result/result_sina_*.csv
+# 前向跟踪输出与实际账户资产（本地保留，不提交）
+stock/stock_result/forward_*.csv
+stock/stock_result/actual_account.csv

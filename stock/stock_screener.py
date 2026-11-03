@@ -54,13 +54,13 @@ CFG = {
     # todo 6.4调整
     # 力度周（W1）条件 bp1_vol_ratio：2->1.6   bp1_confirm_warm_max:1.3->1.5
     #     bp1_confirm_gain_max:0.12->0.15   hard_hist_spike_min:0.2->0.1 bp2_confirm_vol_max:1.3->1.5
-    "bp1_vol_ratio":         2,   # 成交额 ≥ 上周×2（倍量）
+    "bp1_vol_ratio":         1.6,   # 成交额 ≥ 上周×2（倍量）
     "bp1_gain_min":          0.05,  # 周涨幅 ≥ 5%
     # 确认周（W2）条件
     "bp1_confirm_shrink":    0.8,   # 缩量：成交额 ≤ W1×0.8 → 优先做
-    "bp1_confirm_warm_max":  1.8,   # 温和放量上限：≤ W1×1.3 → 可做排后
+    "bp1_confirm_warm_max":  1.5,   # 温和放量上限：≤ W1×1.3 → 可做排后
                                     # > W1×1.3 明显放量 → 不做
-    "bp1_confirm_gain_max":  0.20,  # W2 涨幅 < 12%
+    "bp1_confirm_gain_max":  0.15,  # W2 涨幅 < 12%
     "bp1_max_entry_age":     2,     # W1 最多2周前（W2最优/W3次优/W4+不做）
 
     # ── 买点2：回踩反包型 ──
@@ -1290,7 +1290,7 @@ if __name__ == "__main__":
     # check_recent_100d_high(day=2)
     # 当日5点半后更新日线
     # for code in 'sz.300985,sz.301045,sh.603663,sz.002768,sz.301196,sh.600226,sh.603256,sz.002388,sz.300684,sh.603679,sh.603151,sh.603979'.split(','):
-    # for code in 'sh.603980,sh.688758'.split(','):
+    # for code in 'sh.601169'.split(','):
     #     daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)
     #     print(f'数据最新日期:{daily["date"].values[-1]}')
     #     atr_pct = _calc_atr(daily, 14) if daily is not None else float("nan")
