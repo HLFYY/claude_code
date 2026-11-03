@@ -49,7 +49,7 @@
 - 凭证安全：登录失败/失效**只更新 checked_at/check_status、绝不删凭证或清空 token/sid**
 - zdtps 白名单：server/worker 启动自动"先查再加"本机出口 IP；短效代理失败自愈再加一次（换网不重启也能恢复）
 
-> 详细接口见 `麦当劳API接口文档.md`、踩坑见 `../mcd/docs/踩坑与结论日志.md`（八、麦金卡；九、凭证/白名单）。迁移旧凭证：`python -c "import utils; utils.migrate_credentials('100001')"`（只同步有 sid 的，按 city 补 province）。
+> 详细接口见 `docs/麦当劳API接口文档.md`、踩坑见 `../mcd/docs/踩坑与结论日志.md`（八、麦金卡；九、凭证/白名单）。迁移旧凭证：`python -c "import utils; utils.migrate_credentials('100001')"`（只同步有 sid 的，按 city 补 province）。
 
 ## 项目结构
 
@@ -84,10 +84,28 @@ mcd_project/
 │   └── demo.py                    # 代理池初始化脚本
 └── 【文档 / 依赖】
     ├── requirements.txt           # 项目依赖包
-    ├── README.md                  # 项目使用文档（本文件）
-    ├── CHANGELOG.md               # 更新日志
-    └── 麦当劳API接口文档.md        # 接口抓包 / 参数文档
+    ├── README.md                  # 项目使用文档（本文件，含下方「文档索引」）
+    └── docs/                      # 全部细分文档（见「文档索引」）
+        ├── 麦当劳API接口文档.md
+        ├── CHANGELOG.md
+        ├── PROGRESS_数美设备伪造.md
+        ├── 数美box字段含义.md
+        └── 逆向需求_a2a97.md
 ```
+
+## 文档索引
+
+细分文档都在 `docs/` 下，各自职责：
+
+| 文档 | 作用 |
+|---|---|
+| [docs/麦当劳API接口文档.md](docs/麦当劳API接口文档.md) | 麦当劳 App 接口抓包与参数文档：v4 签名、AES、各业务接口的请求/响应字段。 |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本更新日志（v2.0 代理池 → v4.0 设备池的演进）。 |
+| [docs/PROGRESS_数美设备伪造.md](docs/PROGRESS_数美设备伪造.md) | 数美设备伪造进度与结论总纲：706070=服务端信誉分、a2/a97 线关闭、下一步「干净基线 diff」等最新结论（**先看顶部**）。 |
+| [docs/数美box字段含义.md](docs/数美box字段含义.md) | 数美 box 全字段字典（jadx 实证）：shortbox 35 字段 + fullbox 硬件根字段的含义/来源/真机正常值/`gen_shortbox` 处理方式。 |
+| [docs/逆向需求_a2a97.md](docs/逆向需求_a2a97.md) | a2/a97 逆向需求（**已作废**，留档）：逐字段校验实验证明 a2/a97=服务器签发的 smid，客户端造不出。 |
+
+> 另有两份就地文档不在 `docs/`：`../mcd/docs/踩坑与结论日志.md`（跨项目测试日志，开工前先查其「快速索引」）、`device_templates/_index.md`（设备模板清单，与模板同目录）。
 
 > 说明：补池(`device_builder`/`device_pool_redis` 的 refill/serve)与过滑块(`captcha_login_worker`)须跑在接真机的本机；领用(`claim`)和业务请求任意机只连 Redis 即可。
 
@@ -703,7 +721,7 @@ PROXY_POOL_CONFIG = {
 
 ## 更新日志
 
-详见 [CHANGELOG.md](CHANGELOG.md)
+详见 [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ---
 

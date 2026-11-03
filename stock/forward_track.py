@@ -3,7 +3,7 @@
   候选池（与 stock_check_xinlang.build_buy_pool 一致）：
     - 周线：stock_screener 写入的 weekly_signals.csv（买点1-W2/W3/买点2），信号周的下一周周一~四可买，前收<突破价不买
     - 日线：_check_breakout_sina 连续≥2日新高，信号日次日开盘可买
-  优先级：RPS120 高→低（候选股前复权）；大盘：market_levels_v2(底分型确认, 顶分型confirm)，与 sz_market_action 一致
+  优先级：RPS120 高→低（候选股前复权）；大盘：深证综指 market_levels_v2(底分型确认, 顶分型confirm)，与 sz_market_action 一致
   个股/资金规则同 backtest_weekly_portfolio.run_portfolio，按实盘约束（real）：本金 CAPITAL 整手、开盘涨幅>7%不买、
     T+1、止损/走弱资金冻结到下周一、实测费率、盘中止损/尾盘滑点
 数据：新浪（同实盘选股，复用 cache_sina 缓存；收盘 15:10 后跑数据才完整）；候选股用新浪前复权因子修正
@@ -24,7 +24,7 @@ import requests
 import backtest_weekly_portfolio as bw
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
                                  _sina_get_stock_list, _sina_qfq_adjust, _sina_qfq_factors, _next_trading_day,
-                                 _sz_market_states, load_weekly_signals, OPEN_GAP_MAX,
+                                 _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, MARKET_INDEX, MARKET_INDEX_NAME,
                                  _NEW_HIGH_DAYS, _SINA_MAX_WORKERS)
 
 START = "2026-11-03"          # 跟踪起始日（当天开盘起按策略操作）
@@ -36,9 +36,9 @@ QFQ_REFRESH_DAYS = 40         # 近N个交易日出现过的候选股，复权�
 SIG_COLS = ["code", "name", "sig_date", "signal", "score", "vol_ratio", "breakout_price", "atr", "daily_ok", "pool"]
 
 
-def load_index(datalen: int = 300) -> pd.DataFrame:
+def load_index(datalen: int = 300, symbol: str = MARKET_INDEX) -> pd.DataFrame:
     url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    resp = requests.get(url, params={"symbol": "sz399001", "scale": 240, "ma": "no", "datalen": datalen}, timeout=15)
+    resp = requests.get(url, params={"symbol": symbol, "scale": 240, "ma": "no", "datalen": datalen}, timeout=15)
     idx = pd.DataFrame(json.loads(resp.text))
     for col in ["open", "high", "low", "close"]:
         idx[col] = pd.to_numeric(idx[col], errors="coerce")
@@ -172,13 +172,18 @@ def main(market=None) -> dict:
     eq, tr = bw.run_portfolio(sig, daily, mkt, use_freeze=True, priority=PRIORITY, pool_mode="mixed", real=REAL)
 
     bench = idx.set_index("date")["close"].loc[days[0]:]
+    try:   # 对照：深证成指
+        b2 = load_index(60, "sz399001").set_index("date")["close"].reindex(bench.index).ffill()
+    except Exception:
+        b2 = pd.Series(np.nan, index=bench.index)
     out = pd.DataFrame({
         "日期": [d.strftime("%Y-%m-%d") for d in days],
         "大盘目标仓位": [f"{int(v * 100)}%" for v in mkt["level"]],
         "策略总资产": (eq.values * CAPITAL).round(0),
         "策略当日%": (eq.pct_change().fillna(0).values * 100).round(2),
         "策略累计%": ((eq.values - 1) * 100).round(2),
-        "深证成指累计%": ((bench.values / bench.values[0] - 1) * 100).round(2),
+        f"{MARKET_INDEX_NAME}累计%": ((bench.values / bench.values[0] - 1) * 100).round(2),
+        "深证成指累计%": ((b2.values / b2.values[0] - 1) * 100).round(2),
     }).iloc[1:]
 
     if ACTUAL_FILE.exists():
@@ -195,7 +200,8 @@ def main(market=None) -> dict:
     print(f"\n{'=' * 72}\n  策略前向跟踪（{START} 起，模拟本金 {CAPITAL:,}）\n{'=' * 72}")
     print(out.to_string(index=False))
     last = out.iloc[-1]
-    print(f"\n  ▶ 截至 {last['日期']}：策略累计 {last['策略累计%']:+.2f}%，深证成指 {last['深证成指累计%']:+.2f}%"
+    print(f"\n  ▶ 截至 {last['日期']}：策略累计 {last['策略累计%']:+.2f}%，{MARKET_INDEX_NAME} {last[f'{MARKET_INDEX_NAME}累计%']:+.2f}%"
+          f"，深证成指 {last['深证成指累计%']:+.2f}%"
           + (f"，实际 {last['实际累计%']:+.2f}%" if "实际累计%" in out and pd.notna(last.get("实际累计%")) else ""))
 
     # 当前持仓：下一日盘中清仓价 = max(今MA5×0.99, 今最低×0.99)，每天更新；网格按买入时步长设好不改
@@ -222,7 +228,8 @@ def main(market=None) -> dict:
     if not hold.empty:
         print(hold.to_string(index=False))
 
-    summary = [f"▶ 策略前向跟踪（{START} 起）：累计 {last['策略累计%']:+.2f}%，深证成指 {last['深证成指累计%']:+.2f}%"
+    summary = [f"▶ 策略前向跟踪（{START} 起）：累计 {last['策略累计%']:+.2f}%，{MARKET_INDEX_NAME} {last[f'{MARKET_INDEX_NAME}累计%']:+.2f}%"
+               f"，深证成指 {last['深证成指累计%']:+.2f}%"
                + (f"，实际 {last['实际累计%']:+.2f}%" if "实际累计%" in out and pd.notna(last.get("实际累计%")) else ""),
                f"▶ 模拟持仓 {len(hold)} 只：见附件 {Path(hold_file).name}，按「下一日盘中清仓价」更新条件单"]
     sell_open = hold[hold["下一日操作"].str.startswith("开盘卖出")]

@@ -819,7 +819,8 @@ def run_weekly_screener_if_needed(latest_date) -> list:
 
 
 # ─────────────────────────────────────────────
-#  深证成指 10日线 + 底/顶分型 仓位操作（只看收盘，不看盘中）
+#  深证综指(399106) 10日线 + 底/顶分型 仓位操作（只看收盘，不看盘中）
+#  指数选择：深证综指与博主一致，长周期回测（合并池）年化21.6%/夏普1.40，优于深证成指 18.4%/1.24
 # ─────────────────────────────────────────────
 #  分型：相邻3根K线，不做包含处理，第3根收盘确认。底分型=中间K最高、最低都低于左右；顶分型=反之
 #  10日线：收盘站上 → 次日开盘4层；次日收盘仍在线上 → 第三日开盘满仓
@@ -832,6 +833,9 @@ def run_weekly_screener_if_needed(latest_date) -> list:
 #          清仓后：收盘突破分型顶点(中间K最高) → 按10日线规则重新进场；先跌破10日线 → 空仓，等站上10日线或新底分型
 #  只给大盘仓位建议，不影响选股输出
 #  回测见 backtest_weekly_portfolio.market_levels_v2(bottom_confirm=True, top_mode="confirm")
+
+MARKET_INDEX, MARKET_INDEX_NAME = "sz399106", "深证综指"   # 大盘仓位用的指数（新浪代码）
+
 
 def _pct(lv: float) -> str:
     return f"{int(round(lv * 100))}%"
@@ -964,9 +968,9 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
-    """输出深证成指近 show_days 日的分型与仓位操作；盘中运行时当日未收盘K线不参与判定，单独按实时价预估"""
+    """输出大盘指数（MARKET_INDEX，深证综指）近 show_days 日的分型与仓位操作；盘中运行时当日未收盘K线不参与判定，单独按实时价预估"""
     url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    resp = requests.get(url, params={"symbol": "sz399001", "scale": 240, "ma": "no", "datalen": datalen}, timeout=15)
+    resp = requests.get(url, params={"symbol": MARKET_INDEX, "scale": 240, "ma": "no", "datalen": datalen}, timeout=15)
     df = pd.DataFrame(json.loads(resp.text))
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -981,8 +985,8 @@ def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
     pd.set_option("display.width", 250)
     pd.set_option("display.max_colwidth", 80)
     pd.set_option("display.unicode.east_asian_width", True)
-    _log(f"深证成指数据截至 {states['日期'].iloc[-1]} 收盘")
-    print(f"{'=' * 72}\n  深证成指 10日线 + 分型 仓位操作（截至 {states['日期'].iloc[-1]} 收盘）\n{'=' * 72}")
+    _log(f"{MARKET_INDEX_NAME}数据截至 {states['日期'].iloc[-1]} 收盘")
+    print(f"{'=' * 72}\n  {MARKET_INDEX_NAME} 10日线 + 分型 仓位操作（截至 {states['日期'].iloc[-1]} 收盘）\n{'=' * 72}")
     # 表格不放"下一日收盘关注"（太宽终端会折行错乱），只在下面最新一日的汇总里给出
     print(states.drop(columns="下一日收盘关注").tail(show_days).to_string(index=False))
     last = states.iloc[-1]
@@ -998,7 +1002,7 @@ def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
 
     # 盘中：按实时价当作收盘预估今天收盘后的操作
     if not closed and df["day"].iloc[-1] != today:
-        fields = requests.get("https://hq.sinajs.cn/list=sz399001",
+        fields = requests.get(f"https://hq.sinajs.cn/list={MARKET_INDEX}",
                               headers={"Referer": "https://finance.sina.com.cn"}, timeout=5).text.split('"')[1].split(",")
         if fields[30] == today:
             rt = pd.DataFrame([{"day": today, "open": float(fields[1]), "high": float(fields[4]),
@@ -1027,7 +1031,7 @@ def main():
       大盘仓位建议 → [周末]周线选股 → 日线选股(连续≥2日新高) → 前向跟踪(模拟持仓/清仓价) → 合并股票池 → 发邮件
     """
     _log(f"开始运行（主机 {socket.gethostname()}）")
-    # 深证成指 10日线+底/顶分型 仓位操作；只是仓位建议，出错也不影响下面选股
+    # 深证综指 10日线+底/顶分型 仓位操作；只是仓位建议，出错也不影响下面选股
     try:
         summary = sz_market_action().attrs["summary"]
     except Exception as e:

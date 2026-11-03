@@ -1,11 +1,11 @@
 """
 组合回测引擎（库，入口见 backtest_long_run.py）
 数据：cache_bs_long/（fetch_daily_long_bs.py 拉取：baostock 前复权日线，2018起，含退市股、换手率、isST）
-  - 周线由日线合成；深证成指 cache_bs_long/sz_399001.pkl
+  - 周线由日线合成；大盘指数 深证综指 cache_bs_long/sz_399106.pkl（新浪拉取；深证成指 sz_399001.pkl 作对照）
   - 周线选股直接调用 stock_screener 的 check_buy_point_1 / check_buy_point_2 / _check_daily_w1，过滤同 process_one
   - 日线选股（screen_new_high_breakout_sina 的条件）见 backtest_daily_portfolio.py
 
-大盘仓位（深证成指，只看收盘）：
+大盘仓位（深证综指，只看收盘）：
   market_levels_v2(bottom_confirm=True, top_mode="confirm")  ← 实盘采用，与 stock_check_xinlang.sz_market_action 逐日一致
   market_levels(fractal_mode)                                 ← 旧规则，仅作对照
 个股：每只固定1层(10%权益)
@@ -33,7 +33,8 @@ with contextlib.redirect_stdout(io.StringIO()):
 LONG_DIR = Path("cache_bs_long")
 SIG_DIR = LONG_DIR                    # 选股信号缓存（删掉即重新提取）
 SIG_FILE = SIG_DIR / "_weekly_signals.pkl"
-INDEX_CODE = "sz.399001"
+INDEX_CODE = "sz.399106"           # 深证综指；对照用深证成指 "sz.399001"
+INDEX_NAME = "深证综指"
 WANT_SIGNALS = ("买点1-W2", "买点1-W3", "买点2", "买点3")
 BP3_VOL_RATIO = 3.0                   # 买点3：买点1-W1 中突破周成交额 ≥ 上周 × 3（手动分组规则），下周一~四可买
 LAYER = 0.10

@@ -1,0 +1,44 @@
+{
+ "a1": "all",
+ "a4": "3",
+ "a6": "android",
+ "a9": 1793587983670,
+ "a10": "16",
+ "a7": "3.17.0",
+ "a62": "/data/user/0/com.mcdonalds.gma.cn/files",
+ "a18": {
+  "gsm.sim.state": "LOADED"
+ },
+ "a24": "95e9fece6785a0b1",
+ "a60": "u0_a777",
+ "a46": {
+  "model": "SM-A156E",
+  "serial": "",
+  "brand": "samsung",
+  "manufacturer": "samsung",
+  "fingerprint": "samsung/a15xnsdxx/a15x:16/BP2A.250605.031.A3/A156EDXS9DZB3:user/release-keys"
+ },
+ "a38": "7.0.41.0",
+ "a44": "WIFI",
+ "a39": "com.mcdonalds.gma.cn",
+ "a40": 1793150046289,
+ "a135": 0,
+ "a136": "build1",
+ "a133": 329,
+ "a85": [
+  "bootId",
+  "tel",
+  "sensor",
+  "gps"
+ ],
+ "a167": 0,
+ "a168": 0,
+ "a121": 0,
+ "a125": {
+  "fit": 1793587683249,
+  "lut": 1793587683249
+ },
+ "a127": 55,
+ "a96": "qvdTr7A9k1DIU04ha4eP",
+ "a155": 1
+}

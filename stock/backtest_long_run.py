@@ -2,7 +2,8 @@
 长周期回测（cache_bs_long：2018起 baostock 前复权，含退市股）
 实盘方案：合并池（周线 买点1-W2/W3/买点2 + 日线连续≥2日新高）× RPS120高→低 × 开盘涨幅>7%不买 × 实盘约束
 大盘：10日线 + 底分型次日确认 + 顶分型次日确认清仓/突破顶点再进场（market_levels_v2(True, "confirm")）
-对照：理想成交、周线单独、日线单独、不冻结、旧大盘规则、无大盘择时、深证成指持有
+大盘指数：深证综指（bw.INDEX_CODE）
+对照：理想成交、周线单独、日线单独、不冻结、旧大盘规则、无大盘择时、深证成指做大盘、指数持有
 用法：python backtest_long_run.py > stock_result/long_run.log 2>&1
      （选股信号缓存在 cache_bs_long/_weekly_signals.pkl、_daily_breakout_signals_c2-inf.pkl，改了选股条件要删掉重提）
 """
@@ -31,7 +32,9 @@ def main():
     dy = bd.extract_signals(codes, 2, None)
     dy = dy[dy["sig_date"] >= start].reset_index(drop=True)
     idx = pickle.load(open(bw.LONG_DIR / f"{bw.INDEX_CODE.replace('.', '_')}.pkl", "rb"))
-    idx = idx[idx["date"] >= start].reset_index(drop=True)
+    idx_cz = pickle.load(open(bw.LONG_DIR / "sz_399001.pkl", "rb"))          # 深证成指，对照
+    idx = idx[idx["date"].isin(idx_cz["date"]) & (idx["date"] >= start)].reset_index(drop=True)
+    idx_cz = idx_cz[idx_cz["date"].isin(idx["date"])].reset_index(drop=True)
     daily = bw.load_daily([c for c, _ in codes])
     wk = bw.add_rank_fields(wk, daily).assign(pool="weekly")
     dy = bw.add_rank_fields(dy, daily).assign(pool="daily")
@@ -51,6 +54,7 @@ def main():
         ("合并池 不冻结", mix, "mixed", mkt_new, False, REAL),
         ("合并池 旧大盘规则", mix, "mixed", mkt_old, True, REAL),
         ("合并池 无大盘择时", mix, "mixed", mkt_all, True, REAL),
+        ("合并池 深证成指做大盘", mix, "mixed", bw.market_levels_v2(idx_cz, True, "confirm"), True, REAL),
         ("周线单独", wk, "weekly", mkt_new, True, REAL),
         ("日线单独", dy, "daily", mkt_new, True, REAL),
     ]
@@ -68,9 +72,9 @@ def main():
             t.to_csv("stock_result/long_实盘方案_trades.csv", index=False, encoding="utf-8-sig")
     bench = idx.set_index("date")["close"]; bench = bench / bench.iloc[0]
     p = bw.perf(bench, "")
-    rows.append({"方案": "深证成指持有", "总收益%": p["总收益%"], "年化%": p["年化%"], "最大回撤%": p["最大回撤%"], "夏普": p["夏普"]})
-    yrows.append({"方案": "深证成指持有", **yearly(bench)})
-    curves["深证成指"] = bench
+    rows.append({"方案": f"{bw.INDEX_NAME}持有", "总收益%": p["总收益%"], "年化%": p["年化%"], "最大回撤%": p["最大回撤%"], "夏普": p["夏普"]})
+    yrows.append({"方案": f"{bw.INDEX_NAME}持有", **yearly(bench)})
+    curves[bw.INDEX_NAME] = bench
 
     pd.set_option("display.width", 300); pd.set_option("display.max_columns", 40)
     pd.set_option("display.unicode.east_asian_width", True)
