@@ -265,7 +265,12 @@ _SINA_MIN_STOCKS = 4000   # A股约5500只，少于这个数视为列表没拉�
 
 
 def _sina_get_stock_list():
-    """获取全部A股列表（新浪财经），缓存1天；某页失败会重试，拉不全不写缓存（退回旧缓存或报错）"""
+    """沪深A股列表（排除北交所 bj：回测 baostock 和周线选股都不含北交所，涨跌幅/门槛也不同）"""
+    return [s for s in _sina_get_stock_list_all() if not s["symbol"].startswith("bj")]
+
+
+def _sina_get_stock_list_all():
+    """获取全部A股列表（新浪 hs_a 节点，含北交所），缓存1天；某页失败会重试，拉不全不写缓存（退回旧缓存或报错）"""
     cache_file = _SINA_CACHE_DIR / "stock_list_sina.pkl"
     old = None
     if cache_file.exists():
@@ -429,6 +434,121 @@ def _sina_qfq_adjust(df: pd.DataFrame, fac) -> pd.DataFrame:
     for col in ("open", "high", "low", "close"):
         out[col] = out[col] / f
     return out
+
+
+def _qfq_f_at(fac, day) -> float:
+    """day 当天生效的复权因子（前复权价 = 不复权价 / f）"""
+    if fac is None or fac.empty:
+        return 1.0
+    f = fac.loc[fac["d"] <= pd.Timestamp(day), "f"]
+    return float(f.iloc[-1]) if len(f) else float(fac["f"].iloc[0])
+
+
+QFQ_STALE_DAYS = 30        # 周五顺带刷新超过这么多天的复权因子缓存（兜底漏掉的除权）
+QFQ_STALE_MAX = 1500       # 每次兜底刷新上限（新浪 qfq.js 实测 10 并发约 0.55 秒/只）
+QFQ_MISSING_MAX = 800      # 日常运行最多补拉多少只无缓存的；首次请先跑 python stock_check_xinlang.py qfq_init
+QFQ_GAP_MAX = 1500         # 有漏跑的交易日时，每次最多补刷新多少只（本地偶尔跑一次时，分几次补齐）
+QFQ_CHECKED_FILE = _SINA_CACHE_DIR / "qfq_checked.txt"   # 复权因子缓存已覆盖到哪个交易日（含当天除权）
+
+
+def _prev_trading_day(d):
+    import chinese_calendar as cc
+    d = pd.Timestamp(d).date() - timedelta(days=1)
+    while d.weekday() >= 5 or not cc.is_workday(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _sina_ex_rights_today(df_all: dict, latest_date):
+    """
+    当天除权除息的股票：新浪实时行情的"昨收"在除权日是除权后价格，与日K里前一日收盘（不复权）不一致即为除权。
+    一次请求查 500 只，全市场几秒。返回 (除权代码集合, 是否完整检测了 latest_date)：
+    盘中运行时实时行情是今天、日K最新是昨天，对不上，算没检测
+    """
+    codes = [k for k, d in df_all.items()
+             if d is not None and len(d) >= 2 and pd.Timestamp(d["day"].iloc[-1]).date() == latest_date]
+    ex, ok, n_match = set(), True, 0
+    for i in range(0, len(codes), 500):
+        try:
+            resp = requests.get("https://hq.sinajs.cn/list=" + ",".join(codes[i:i + 500]),
+                                headers={"Referer": "https://finance.sina.com.cn"}, timeout=15)
+            resp.encoding = "gbk"
+        except Exception as e:
+            _log(f"[除权检测] 实时行情获取失败：{type(e).__name__}: {e}")
+            ok = False
+            continue
+        for line in resp.text.splitlines():
+            if not line.startswith("var hq_str_") or '"' not in line:
+                continue
+            code, fields = line[11:line.index("=")], line.split('"')[1].split(",")
+            if len(fields) < 31 or fields[30] != str(latest_date) or code not in df_all:
+                continue
+            n_match += 1
+            pre, prev = float(fields[2] or 0), float(df_all[code]["close"].iloc[-2])
+            if pre > 0 and abs(pre - prev) > 0.0051:
+                ex.add(code)
+    return ex, ok and n_match > len(codes) * 0.5
+
+
+def _sina_qfq_market(market, missing_max=QFQ_MISSING_MAX, stale=None):
+    """
+    全市场新浪日K → 前复权（与回测 baostock 前复权口径一致），返回同 _sina_load_market 的 (最新交易日, 股票列表, {symbol: 前复权df})。
+    复权因子只在除权时变：
+      - 当天除权的重拉；无缓存的补拉（最多 missing_max 只）；
+      - 漏跑补齐：QFQ_CHECKED_FILE 记录缓存已覆盖到哪个交易日，若早于前一交易日（中间有没跑的日子，本地偶尔跑时常见），
+        缓存日期早于前一交易日的都重拉（最旧优先，每次最多 QFQ_GAP_MAX 只，补齐前不前移覆盖日）；
+      - stale=True（默认周五）时顺带刷新超过 QFQ_STALE_DAYS 天的缓存（最多 QFQ_STALE_MAX 只），兜底。
+    最新一天因子为 1，前复权后的最新收盘 = 实际收盘
+    """
+    latest_date, stock_list, df_all = market
+    if stale is None:
+        stale = datetime.now().weekday() == 4
+    ex, ex_ok = _sina_ex_rights_today(df_all, latest_date)
+    codes = [k for k, d in df_all.items() if d is not None and not d.empty]
+    now = time.time()
+
+    def mtime(code):
+        f = _SINA_CACHE_DIR / f"qfq_{code}.pkl"
+        return f.stat().st_mtime if f.exists() else None
+
+    mt = {c: mtime(c) for c in codes}
+    missing = [c for c in codes if mt[c] is None]
+    old = sorted([c for c in codes if mt[c] is not None and (now - mt[c]) / 86400 > QFQ_STALE_DAYS], key=lambda c: mt[c])
+    # 漏跑补齐：缓存覆盖日 < 前一交易日 → 缓存日期早于前一交易日的都要重拉
+    prev_td = _prev_trading_day(latest_date)
+    try:
+        checked = datetime.strptime(QFQ_CHECKED_FILE.read_text().strip(), "%Y-%m-%d").date()
+    except Exception:
+        checked = None
+    gap = [] if checked is not None and checked >= prev_td else sorted(
+        [c for c in codes if mt[c] is not None and datetime.fromtimestamp(mt[c]).date() < prev_td], key=lambda c: mt[c])
+    refresh = (set(ex) | set(missing[:missing_max]) | set(gap[:QFQ_GAP_MAX])
+               | (set(old[:QFQ_STALE_MAX]) if stale else set()))
+    _log(f"[前复权] 当天除权 {len(ex)} 只" + ("" if ex_ok else "（盘中/行情不全，今天未检测）")
+         + f"，无缓存 {len(missing)} 只"
+         + (f"（本次只补拉 {missing_max} 只，请跑 qfq_init 补全）" if len(missing) > missing_max else "")
+         + (f"，上次覆盖到 {checked or '无记录'}，漏跑补刷新 {len(gap)} 只"
+            + (f"（本次 {QFQ_GAP_MAX} 只，下次继续）" if len(gap) > QFQ_GAP_MAX else "") if gap else "")
+         + (f"，超过{QFQ_STALE_DAYS}天的缓存 {len(old)} 只" + ("（本次刷新）" if stale else "") if old else "")
+         + f"，需拉取 {len(refresh)} 只")
+    with ThreadPoolExecutor(max_workers=_SINA_MAX_WORKERS * 2) as ex_:
+        facs = dict(zip(codes, ex_.map(lambda c: _sina_qfq_factors(c, refresh=c in refresh), codes)))
+    df_adj = {k: (_sina_qfq_adjust(d, facs.get(k)) if d is not None and not d.empty else d) for k, d in df_all.items()}
+    # 覆盖日前移：漏跑的都补齐了才前移；今天检测完整则到 latest_date，否则到前一交易日（今天的除权等下次检测）
+    unfixed = [c for c in gap if datetime.fromtimestamp(mtime(c)).date() < prev_td]   # 拉取失败、仍是旧缓存
+    if not unfixed and len(missing) <= missing_max:
+        new_checked = latest_date if ex_ok else prev_td
+        if checked is None or new_checked > checked:
+            QFQ_CHECKED_FILE.write_text(str(new_checked))
+    n_adj = sum(1 for f in facs.values() if f is not None and not (f["f"] == 1).all())
+    _log(f"[前复权] 完成，有复权因子的 {n_adj} 只，无因子按不复权 {sum(1 for f in facs.values() if f is None)} 只")
+    return latest_date, stock_list, df_adj
+
+
+def qfq_init():
+    """首次全量拉取全市场复权因子缓存（约 50 分钟），之后日常只拉当天除权的"""
+    latest_date, stock_list, df_all = _sina_load_market()
+    _sina_qfq_market((latest_date, stock_list, df_all), missing_max=10 ** 6, stale=True)
 
 
 def calc_buy_price_sina(code: str, date, datalen: int = 250) -> float:
@@ -691,9 +811,8 @@ def _limit_pct_sina(code: str) -> float:
 
 
 def _rps120_qfq(code: str, df: pd.DataFrame, all_g120: np.ndarray) -> float:
-    """候选股按前复权算120日涨幅，在全市场（不复权）分布里取百分位；与回测/前向跟踪口径一致"""
-    adj = _sina_qfq_adjust(df, _sina_qfq_factors(code))
-    c = adj["close"].values
+    """候选股（df 已前复权）120日涨幅在全市场（前复权）分布里的百分位；与回测/前向跟踪口径一致"""
+    c = df["close"].values
     if len(c) < _RPS_DAYS + 1 or not len(all_g120):
         return float("nan")
     g = c[-1] / c[-(_RPS_DAYS + 1)] - 1
@@ -714,7 +833,8 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
     生成下一交易日的合并股票池 stock_result/pool_{日期}.csv：
       - 周线：上一周的买点1-W2/W3/买点2（下一交易日为周一~周四时有效），前收 < 突破价 的剔除
       - 日线：当日 screen_new_high_breakout_sina 的信号（连续≥2日新高），只在下一交易日有效
-      - 统一按 RPS120（前复权）高→低给买入顺序；开盘买入价上限 = 前收×1.07（不超过涨停价）
+      - 统一按 RPS120（前复权）高→低给买入顺序，同分 10日涨幅弱→强；开盘买入价上限 = 前收×1.07（不超过涨停价）
+      - RPS120 / 10日涨幅排名的取值日：周线票固定用信号周五收盘（整周不变），日线票用当日收盘；与回测/前向跟踪一致
       - sim（forward_track 结果）：标注模拟持仓中/本周已买卖，并给出 1 层参考股数与可新开只数
     """
     latest_date, stock_list, df_all = market
@@ -733,9 +853,17 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
             cands.append({"代码": r["股票代码"], "来源": "日线", "信号": f"连续{r['连续新高天数']}日新高",
                           "信号日": r["突破日期"], "突破价": r["突破价"], "网格步长%": r["网格步长"]})
 
-    gains = _collect_market_gains_sina(df_all)
-    all_g120 = np.array([v["gain120"] for v in gains.values() if not np.isnan(v["gain120"])])
-    all_g10 = np.array([v["gain10"] for v in gains.values() if not np.isnan(v["gain10"])])
+    snaps = {}
+
+    def snapshot(asof):
+        """asof 日收盘时的全市场涨幅分布（周线票用信号周五）"""
+        if asof not in snaps:
+            sub = df_all if asof == pd.Timestamp(latest_date) else \
+                {k: d[d["day"] <= asof] for k, d in df_all.items() if d is not None}
+            g = _collect_market_gains_sina(sub)
+            snaps[asof] = (sub, g, np.array([v["gain120"] for v in g.values() if not np.isnan(v["gain120"])]),
+                           np.array([v["gain10"] for v in g.values() if not np.isnan(v["gain10"])]))
+        return snaps[asof]
     layer_amt = (sim or {}).get("equity", POOL_CAPITAL) * 0.1
     held, traded = set((sim or {}).get("held", [])), set((sim or {}).get("traded_week", []))
     rows = []
@@ -745,22 +873,28 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
             continue
         if pd.Timestamp(df["day"].iloc[-1]).date() != latest_date:
             continue                                         # 当日停牌
-        prev = float(df["close"].iloc[-1])
-        if c["来源"] == "周线" and prev < float(c["突破价"]):
-            continue                                         # 周中走坏，跌破突破价
+        prev = float(df["close"].iloc[-1])                  # 前复权最新收盘 = 实际收盘
+        if c["来源"] == "周线":
+            # 突破价是信号周五跑 baostock 时的前复权价（≈当时实际价），之后若除权，换算到当前前复权口径再比
+            bp = float(c["突破价"]) / _qfq_f_at(_sina_qfq_factors(code, refresh=False), c["信号日"])
+            if prev < bp:
+                continue                                     # 周中走坏，跌破突破价
         cap = min(round(prev * (1 + OPEN_GAP_MAX), 2), round(prev * (1 + _limit_pct_sina(code)), 2))
         sh = layer_amt / cap
         sh = (int(sh) if sh >= 200 else 0) if code[2:5] in ("688", "689") else int(sh // 100 * 100)
         note = ("模拟持仓中，不买" if code in held else "本周已买卖，不买" if code in traded
                 else "1层买不起一手" if sh == 0 else "")
+        asof = pd.Timestamp(c["信号日"]) if c["来源"] == "周线" else pd.Timestamp(latest_date)
+        sub, gains, all_g120, all_g10 = snapshot(asof)
         g10 = gains.get(code, {}).get("gain10", np.nan)
-        rows.append({**c, "名称": names.get(code, ""), "RPS120": _rps120_qfq(code, df, all_g120),
+        rows.append({**c, "名称": names.get(code, ""), "RPS120": _rps120_qfq(code, sub[code], all_g120),
                      "10日涨幅排名": int((all_g10 > g10).sum() + 1) if not np.isnan(g10) else np.nan,
                      "前收": round(prev, 2), "开盘买入价上限": cap, "1层参考股数": sh, "备注": note})
     pool = pd.DataFrame(rows, columns=["代码", "名称", "来源", "信号", "信号日", "RPS120", "10日涨幅排名", "前收",
                                        "开盘买入价上限", "突破价", "网格步长%", "1层参考股数", "备注"])
     if not pool.empty:
-        pool = pool.sort_values("RPS120", ascending=False, na_position="last")
+        # RPS120 高→低；同分（一位小数）时 10日涨幅弱→强（排名数字大的在前），见 backtest_priority.py
+        pool = pool.sort_values(["RPS120", "10日涨幅排名"], ascending=[False, False], na_position="last")
         src = pool.groupby("代码")["来源"].agg(lambda x: "+".join(sorted(set(x), reverse=True)))
         pool = pool.drop_duplicates("代码", keep="first").assign(来源=lambda d: d["代码"].map(src)).reset_index(drop=True)
     pool.insert(0, "买入顺序", range(1, len(pool) + 1))
@@ -1037,10 +1171,11 @@ def main():
     except Exception as e:
         summary = [f"[大盘仓位] 获取失败：{type(e).__name__}: {e}"]
         _log(summary[0])
-    market, daily_sig = None, None
+    market, market_raw, daily_sig = None, None, None
     try:
-        market = _sina_load_market()
-        summary += run_weekly_screener_if_needed(market[0])
+        market_raw = _sina_load_market()
+        summary += run_weekly_screener_if_needed(market_raw[0])
+        market = _sina_qfq_market(market_raw)            # 日线选股/RPS/10日排名/股票池都用前复权，同回测
         daily_sig = screen_new_high_breakout_sina(market=market)
     except Exception as e:
         err = f"[选股] 失败：{type(e).__name__}: {e}"
@@ -1050,7 +1185,7 @@ def main():
     hold_file, sim = None, None
     try:
         import forward_track
-        ft = forward_track.main(market=market)
+        ft = forward_track.main(market=market_raw, market_qfq=market)
         hold_file, sim = ft["holdings_file"], ft.get("sim")
         summary = summary + [""] + ft["summary"]
     except Exception as e:
@@ -1077,6 +1212,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == 'main':
         main()
+    elif len(sys.argv) == 2 and sys.argv[1] == 'qfq_init':
+        qfq_init()
     else:
         main()
         # 计算指定日期价格-max(MA5×0.99, 最低价×0.99),每天计算一次持仓个股

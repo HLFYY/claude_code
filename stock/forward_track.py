@@ -6,7 +6,7 @@
   优先级：RPS120 高→低（候选股前复权）；大盘：深证综指 market_levels_v2(底分型确认, 顶分型confirm)，与 sz_market_action 一致
   个股/资金规则同 backtest_weekly_portfolio.run_portfolio，按实盘约束（real）：本金 CAPITAL 整手、开盘涨幅>7%不买、
     T+1、止损/走弱资金冻结到下周一、实测费率、盘中止损/尾盘滑点
-数据：新浪（同实盘选股，复用 cache_sina 缓存；收盘 15:10 后跑数据才完整）；候选股用新浪前复权因子修正
+数据：新浪（同实盘选股，复用 cache_sina 缓存；收盘 15:10 后跑数据才完整）；全市场用新浪复权因子做前复权（同回测）
 实际账户：stock_result/actual_account.csv（列：日期,总资产），每天收盘后追加一行，程序自动对比
 持仓操作：stock_result/forward_holdings_{日期}.csv —— 模拟持仓及「下一日盘中清仓价」，每天据此更新券商条件单
          （网格在买入当天按「网格步长」设好后不改）；stock_check_xinlang.main 会把它作为邮件附件
@@ -23,16 +23,15 @@ import requests
 
 import backtest_weekly_portfolio as bw
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
-                                 _sina_get_stock_list, _sina_qfq_adjust, _sina_qfq_factors, _next_trading_day,
+                                 _sina_get_stock_list, _sina_qfq_market, _sina_qfq_factors, _qfq_f_at, _next_trading_day,
                                  _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, MARKET_INDEX, MARKET_INDEX_NAME,
                                  _NEW_HIGH_DAYS, _SINA_MAX_WORKERS)
 
 START = "2026-11-03"          # 跟踪起始日（当天开盘起按策略操作）
 CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率与之无关
-PRIORITY = "RPS120高→低"
+PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
 REAL = {"capital": CAPITAL, "max_open_gap": OPEN_GAP_MAX}   # 实盘约束，其余用 backtest_weekly_portfolio.REAL_DEFAULT
 ACTUAL_FILE = Path("stock_result/actual_account.csv")
-QFQ_REFRESH_DAYS = 40         # 近N个交易日出现过的候选股，复权因子每天刷新；更早的用缓存
 SIG_COLS = ["code", "name", "sig_date", "signal", "score", "vol_ratio", "breakout_price", "atr", "daily_ok", "pool"]
 
 
@@ -77,22 +76,11 @@ def to_daily_dict(dfs: dict) -> dict:
     return daily
 
 
-def apply_qfq(sig: pd.DataFrame, dfs: dict, daily: dict, days: list) -> int:
-    """对候选股做前复权：替换 daily 里的价格，日线信号突破价改为复权后收盘价。返回实际做了修正的只数"""
-    recent = set(sig.loc[sig["sig_date"] >= days[max(0, len(days) - QFQ_REFRESH_DAYS)], "code"])
-    codes = sorted(set(sig["code"]))
-    with ThreadPoolExecutor(max_workers=_SINA_MAX_WORKERS) as ex:
-        facs = dict(zip(codes, ex.map(lambda c: _sina_qfq_factors(c, refresh=c in recent), codes)))
-    n = 0
-    for code, fac in facs.items():
-        if fac is None or (fac["f"] == 1).all():
-            continue
-        adj = _sina_qfq_adjust(dfs[code], fac)
-        daily[code] = to_daily_dict({code: adj})[code]
-        m = (sig["code"] == code) & (sig["pool"] == "daily")   # 周线突破价来自 baostock 前复权，不改
-        sig.loc[m, "breakout_price"] = [daily[code]["c"][daily[code]["pos"][d]] for d in sig.loc[m, "sig_date"]]
-        n += 1
-    return n
+def weekly_bp_to_qfq(sig: pd.DataFrame) -> None:
+    """周线突破价是信号周五 baostock 前复权价（≈当时实际价），换算到当前前复权口径（之后有除权才会变）"""
+    m = sig["pool"] == "weekly"
+    sig.loc[m, "breakout_price"] = [bp / _qfq_f_at(_sina_qfq_factors(c, refresh=False), d)
+                                    for c, d, bp in zip(sig.loc[m, "code"], sig.loc[m, "sig_date"], sig.loc[m, "breakout_price"])]
 
 
 def daily_signals(dfs: dict, names: dict, sig_days) -> pd.DataFrame:
@@ -134,9 +122,10 @@ def _raw_px(raw_daily, code, day, adj_px, daily):
     return adj_px if j is None else adj_px * raw_daily[code]["c"][j] / daily[code]["c"][j]
 
 
-def main(market=None) -> dict:
+def main(market=None, market_qfq=None) -> dict:
     """
-    market：stock_check_xinlang._sina_load_market() 的结果，传入则复用已加载行情
+    market：stock_check_xinlang._sina_load_market() 的结果（不复权），传入则复用已加载行情
+    market_qfq：stock_check_xinlang._sina_qfq_market(market) 的结果（前复权），不传则在这里算
     返回 {"holdings_file": 持仓操作csv或None, "summary": 邮件正文几行,
           "sim": {equity, held, held_layers, traded_week, next_level} 供 build_buy_pool 标注}
     """
@@ -158,16 +147,18 @@ def main(market=None) -> dict:
         names = {s["symbol"]: s.get("name", "") for s in market[1]}
     else:
         dfs, names = load_stocks(latest_date)
-    daily = to_daily_dict(dfs)
-    sig = pd.concat([daily_signals(dfs, names, days[:-1]),   # 最后一天的日线信号要明天才能买
-                     weekly_signals(dfs, days)], ignore_index=True)
+    if market_qfq is None:
+        market_qfq = _sina_qfq_market((latest_date, [], dfs))
+    dfq = {k: v for k, v in market_qfq[2].items() if v is not None and not v.empty}
+    daily = to_daily_dict(dfq)                                 # 全市场前复权：选股/RPS/10日排名/止损同回测
+    sig = pd.concat([daily_signals(dfq, names, days[:-1]),   # 最后一天的日线信号要明天才能买
+                     weekly_signals(dfq, days)], ignore_index=True)
     if not sig.empty:
-        n_adj = apply_qfq(sig, dfs, daily, days)
-        sig = bw.add_rank_fields(sig, daily)                   # RPS：候选股前复权，与实盘股票池一致
-        print(f"候选信号 {len(sig)} 条（周线 {(sig['pool'] == 'weekly').sum()} / 日线 {(sig['pool'] == 'daily').sum()}），"
-              f"前复权修正 {n_adj} 只")
+        weekly_bp_to_qfq(sig)
+        sig = bw.add_rank_fields(sig, daily)
+        print(f"候选信号 {len(sig)} 条（周线 {(sig['pool'] == 'weekly').sum()} / 日线 {(sig['pool'] == 'daily').sum()}）")
     else:
-        sig["rps120"] = pd.Series(dtype=float)
+        sig["rps120_r1"] = sig["gain10_rank"] = pd.Series(dtype=float)
     raw_daily = to_daily_dict({c: dfs[c] for c in set(sig["code"])}) if not sig.empty else {}
     eq, tr = bw.run_portfolio(sig, daily, mkt, use_freeze=True, priority=PRIORITY, pool_mode="mixed", real=REAL)
 

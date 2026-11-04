@@ -56,14 +56,5 @@ stock/cache_sina_long/
 stock/cache_bs_long/
 # baostock 代理账密
 stock/proxy_bs.py
-# 回测输出（本地保留，不提交）
-stock/stock_result/backtest_*.csv
-stock/stock_result/long_*.csv
-stock/stock_result/report_*.csv
-stock/stock_result/result_sina_*.csv
-# 前向跟踪输出与实际账户资产（本地保留，不提交）
-stock/stock_result/forward_*.csv
-stock/stock_result/actual_account.csv
-# 每日合并股票池、周线信号历史（运行生成，本地/服务器各自保留）
-stock/stock_result/pool_*.csv
-stock/stock_result/weekly_signals.csv
+# 选股/回测/前向跟踪/股票池等输出 csv（运行生成，本地/服务器各自保留，不提交）
+stock/stock_result/*.csv

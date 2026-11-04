@@ -132,10 +132,14 @@ def signals_for_stock(args):
     return out
 
 
-def stock_codes():
-    """baostock 全部A股（含退市）及名称"""
+def stock_codes(include_bj=False):
+    """baostock 全部A股（含退市）及名称；include_bj=True 时加上北交所（东方财富，见 fetch_bj_eastmoney.py，仅现存股票）"""
     names = pickle.load(open(LONG_DIR / "_stock_list.pkl", "rb")).set_index("code")["code_name"].to_dict()
-    return [(c, names.get(c, "")) for c in sorted(names)]
+    codes = [(c, names.get(c, "")) for c in sorted(names)]
+    if include_bj and (LONG_DIR / "_stock_list_bj.pkl").exists():
+        bj = pickle.load(open(LONG_DIR / "_stock_list_bj.pkl", "rb"))
+        codes += list(zip(bj["code"], bj["code_name"]))
+    return codes
 
 
 def extract_signals():
@@ -219,7 +223,8 @@ def market_levels(idx: pd.DataFrame, fractal_mode: str = FRACTAL_MODE) -> pd.Dat
                          "fractal": fractal, "below": c < ma10, "in_frac": in_frac})
 
 
-def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off") -> pd.DataFrame:
+def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", confirm_rule="k3c",
+                     weak_line="k3c") -> pd.DataFrame:
     """
     10日线规则 + 分型确认版（分型：3根K线，不做包含；第3根收盘确认）
       底分型（10日线下）：bottom_confirm=True 时，第3根确认后次日收盘 >= 第3根收盘 → 再次日开盘4层；
@@ -233,8 +238,17 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off") -> 
           reclaim_k3   次日开盘清仓，收盘 > 第3根收盘 → 失效，按10日线规则重新开仓
           reclaim_high 次日开盘清仓，收盘 > 分型顶点(中间K最高) → 失效，按10日线规则重新开仓
       顶分型失效前若收盘跌破10日线，按铁律空仓，之后正常按"站上10日线/底分型"重新触发
+      confirm_rule：底分型确认日（第3根之后一日）的开仓条件，弱势线仍为第3根收盘
+          k3c     收盘 >= 第3根收盘
+          maxc    收盘 >= 三根K线最高收盘
+          maxc_h  收盘 >= 三根最高收盘 且 最高价 > 三根最高价
+          k3c_h   收盘 >= 第3根收盘 且 最高价 > 三根最高价
+          k3body  收盘 >= 第3根实体顶部 max(开,收)
+      weak_line：底分型持仓后的弱势线（收盘跌破清仓、收盘站上加满）k3c=第3根收盘；k3body=第3根实体顶部
     """
-    c, h, l = idx["close"].values, idx["high"].values, idx["low"].values
+    c, h, l, o = idx["close"].values, idx["high"].values, idx["low"].values, idx["open"].values
+    body_top = np.maximum(o, c)
+    wl = body_top if weak_line == "k3body" else c          # 弱势线取值
     ma10 = pd.Series(c).rolling(10).mean().values
     n = len(idx)
     level_open, clear_open = np.zeros(n), np.zeros(n, bool)
@@ -289,11 +303,15 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off") -> 
 
         if pending is not None and lv == 0:
             # 底分型确认日：收盘不破第3根收盘 → 次日4层
-            if c[t] >= pending:
-                lv, frac_mode, k3_close, need_cross = 0.4, True, pending, False
+            k3c, mc, mh, kb, kw = pending
+            ok = c[t] >= {"maxc": mc, "maxc_h": mc, "k3body": kb}.get(confirm_rule, k3c)
+            if confirm_rule.endswith("_h"):
+                ok = ok and h[t] > mh
+            if ok:
+                lv, frac_mode, k3_close, need_cross = 0.4, True, kw, False
             pending = None
             if bottom and not above and lv == 0:
-                pending = c[t]
+                pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
         elif above and not need_cross and not frac_mode:
             lv = 0.4 if lv == 0 else 1.0
         elif above and frac_mode:
@@ -305,12 +323,12 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off") -> 
             elif lv == 0.4 and (c[t] >= k3_close if bottom_confirm else c[t] > c[t - 1]):
                 lv = 1.0
             if bottom and frac_mode:
-                k3_close = c[t]           # 新底分型，弱势线更新
+                k3_close = wl[t]          # 新底分型，弱势线更新
         elif bottom and (not above or need_cross):
             if bottom_confirm:
                 if not above:
                     clear_all()           # 线下：先按铁律清（若有仓），等确认再开
-                pending = c[t]
+                pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
             else:                         # 同 market_levels(break_k3c)：不清，直接进入底分型持仓
                 lv = 0.4 if lv == 0 else (1.0 if c[t] > c[t - 1] else lv)
                 frac_mode, k3_close, need_cross = True, c[t], False
@@ -334,40 +352,72 @@ PRIORITIES = {
     "RPS120低→高": (["rps120"], [True]),
     "10日涨幅排名强→弱": (["gain10_rank"], [True]),
     "10日涨幅排名弱→强": (["gain10_rank"], [False]),
+    "辨识度档→RPS120高→低": (["tier", "rps120"], [True, False]),
+    "辨识度档→10日涨幅排名强→弱": (["tier", "gain10_rank"], [True, True]),
+    "min(RPS120名次,10日名次)": (["combo", "combo_src", "combo_other"], [True, True, True]),
+    "RPS120(1位小数)高→低,同分10日强→弱": (["rps120_r1", "gain10_rank"], [False, True]),
+    "RPS120(1位小数)高→低,同分10日弱→强": (["rps120_r1", "gain10_rank"], [False, False]),
+    "辨识度档→RPS120低→高": (["tier", "rps120"], [True, True]),
+    "辨识度档→10日涨幅排名弱→强": (["tier", "gain10_rank"], [True, False]),
+    "周线在前→RPS120高→低": (["pool", "rps120_r1", "gain10_rank"], [False, False, False]),   # "weekly" > "daily"
 }
+TIER_MAX = 20     # 辨识度第k档：RPS120 ≥ 100-5k 或 10日涨幅名次 ≤ 100k，取满足的最小档
 
 
-def add_rank_fields(sig: pd.DataFrame, daily: dict) -> pd.DataFrame:
-    """信号日全市场 RPS120 百分位 / 10日涨幅名次，算法同 stock_screener._calc_rps_and_rank（按个股自身交易日回看）"""
+def rank_tables(daily: dict, dates=None) -> dict:
+    """全市场 RPS120 百分位 / 120日涨幅名次 / 10日涨幅名次（行=日期，列=代码），算法同 stock_screener._calc_rps_and_rank"""
     g120, g10 = {}, {}
     for code, dd in daily.items():
         c = pd.Series(dd["c"], index=pd.to_datetime(dd["dates"]))
         g120[code] = c / c.shift(120) - 1
         g10[code] = c / c.shift(10) - 1
     p120, p10 = pd.DataFrame(g120), pd.DataFrame(g10)   # 停牌日为 NaN，不参与当日排名
-    sd = sorted(sig["sig_date"].unique())
-    p120, p10 = p120.reindex(sd), p10.reindex(sd)
-    rps = p120.rank(axis=1, pct=True, method="min") * 100 - 100 / p120.notna().sum(axis=1).values[:, None]
-    rank10 = p10.rank(axis=1, ascending=False, method="min")
+    if dates is not None:
+        p120, p10 = p120.reindex(dates), p10.reindex(dates)
+    return {"rps120": p120.rank(axis=1, pct=True, method="min") * 100 - 100 / p120.notna().sum(axis=1).values[:, None],
+            "rps120_rank": p120.rank(axis=1, ascending=False, method="min"),
+            "gain10_rank": p10.rank(axis=1, ascending=False, method="min")}
+
+
+def fill_rank_cols(sig: pd.DataFrame, tables: dict, on) -> pd.DataFrame:
+    """按 on（每行的取值日期）从 rank_tables 取排名字段，并派生 rps120_r1 / 辨识度档 / combo"""
     sig = sig.copy()
-    sig["rps120"] = [rps.at[d, c] if c in rps.columns else np.nan for d, c in zip(sig["sig_date"], sig["code"])]
-    sig["gain10_rank"] = [rank10.at[d, c] if c in rank10.columns else np.nan for d, c in zip(sig["sig_date"], sig["code"])]
+    for k, t in tables.items():
+        sig[k] = [t.at[d, c] if c in t.columns and d in t.index else np.nan for d, c in zip(on, sig["code"])]
+    sig["rps120_r1"] = sig["rps120"].round(1)          # 实盘股票池显示/排序口径
+    # 辨识度档位
+    k_rps = np.ceil((100 - sig["rps120"]) / 5 - 1e-9).clip(lower=1)
+    k_r10 = np.ceil(sig["gain10_rank"] / 100).clip(lower=1)
+    sig["tier"] = pd.concat([k_rps, k_r10], axis=1).min(axis=1).clip(upper=TIER_MAX)
+    # min(RPS120名次, 10日名次)：同分时来自 RPS120 的在前（combo_src=0），再按另一个名次
+    r1, r2 = sig["rps120_rank"], sig["gain10_rank"]
+    from_rps = r1.notna() & ((r1 <= r2) | r2.isna())
+    sig["combo"] = np.where(from_rps, r1, r2)
+    sig["combo_src"] = np.where(from_rps, 0, 1)
+    sig["combo_other"] = np.where(from_rps, r2, r1)
     return sig
+
+
+def add_rank_fields(sig: pd.DataFrame, daily: dict) -> pd.DataFrame:
+    """信号日的排名字段"""
+    return fill_rank_cols(sig, rank_tables(daily, sorted(sig["sig_date"].unique())), sig["sig_date"])
 
 
 # 实盘约束模式默认参数：本金、单边滑点、佣金(含过户费，按财通证券对账单实测买卖都约万1.35、无最低5元)、
 # 开盘最大涨幅（None=只跳过开盘涨停；0.06=开盘涨幅>6%就不买）
 # 滑点按成交方式分开：集合竞价（开盘买、开盘卖）和网格限价单按挂单价成交不加；盘中止损条件单 slip_stop；尾盘走弱 slip_close
 REAL_DEFAULT = {"capital": 800_000, "slip_auction": 0.0, "slip_stop": 0.002, "slip_close": 0.001,
-                "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None}
+                "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None, "slip_bj": 0.0}   # slip_bj：北交所买入/非网格卖出额外滑点
 
 
 def _limit_pct(code: str) -> float:
+    if code.startswith("bj"):
+        return 0.3
     return 0.2 if code[3:6] in ("300", "301", "688", "689") else 0.1
 
 
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
-                  pool_mode="weekly", t1=True, real=None):
+                  pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None):
     """
     pool_mode: weekly=上周五信号本周一~四可买；daily=前一交易日信号仅当日开盘可买；
                mixed=sig 带 pool 列（"weekly"/"daily"），两类按各自有效期合成当天候选池，统一按优先级排序（同一只只算一次）
@@ -376,6 +426,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
       - 开盘即涨停（不只一字）买不到，跳过；一字跌停卖不出，顺延到下一交易日开盘
       - 滑点（买入价上浮、卖出价下浮）：集合竞价 slip_auction、盘中止损 slip_stop、尾盘 slip_close，网格限价不加；佣金 fee_rate（最低 min_fee 元）；印花税 2023-08-28 前千1、之后万5
       - max_open_gap：开盘涨幅超过该值不买（None 时只跳过开盘涨停）
+    rank_daily: None=排名字段用信号日的值（周线票整周用上周五的）；rank_tables(daily) 的结果=每天按前一交易日收盘重算（同实盘股票池）
+    hold_rule: 周线票留池条件。last=前一日收盘 ≥ 突破价；all=信号日之后每日收盘都 ≥ 突破价（跌破一次本周剔除）
     """
     dates = list(mkt["date"])
     level = mkt["level"].values
@@ -410,18 +462,23 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         wk_pools = {k: g for k, g in sig[is_wk].groupby(sig.loc[is_wk, "sig_date"].dt.to_period("W-FRI"))}
         dy_pools = {k: g for k, g in sig[~is_wk].groupby("sig_date")}
 
-        def get_pool(i):
+        def raw_pool(i):
             parts = [x for x in (wk_pools.get(week_id[i] - 1), dy_pools.get(dates[i - 1])) if x is not None]
-            if not parts:
-                return None
-            return (pd.concat(parts).sort_values(by, ascending=asc, na_position="last")
-                    .drop_duplicates("code", keep="first"))
+            return pd.concat(parts) if parts else None
     else:
         sig["wk"] = sig["sig_date"].dt.to_period("W-FRI") if pool_mode == "weekly" else sig["sig_date"]
-        pools = {wk: g.sort_values(by, ascending=asc, na_position="last") for wk, g in sig.groupby("wk")}
+        pools = dict(list(sig.groupby("wk")))
 
-        def get_pool(i):
+        def raw_pool(i):
             return pools.get(week_id[i] - 1 if pool_mode == "weekly" else dates[i - 1])
+
+    def get_pool(i):
+        pool = raw_pool(i)
+        if pool is None:
+            return None
+        if rank_daily is not None:
+            pool = fill_rank_cols(pool, rank_daily, [pd.Timestamp(dates[i - 1])] * len(pool))
+        return pool.sort_values(by, ascending=asc, na_position="last").drop_duplicates("code", keep="first")
 
     cash = 1.0
     pending_grid = 0.0                  # 次日可用
@@ -431,6 +488,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     positions: list = []
     trades, equity_curve = [], []
     traded_this_pool = set()
+    expo = []                           # 开仓日：(日期, 开仓后占用层数, 允许层数)
 
     def px(code, i, field):
         dd = daily[code]
@@ -440,7 +498,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     def close_pos(p, i, price, reason, bucket, slip=0.0):
         nonlocal cash, frozen, pending_grid
         if real:
-            price *= 1 - slip
+            price *= 1 - slip - (real["slip_bj"] if p.code.startswith("bj") else 0)
         val = sell_net(p.left * p.shares0 * price, i) if p.left > 1e-12 else 0.0
         p.cost += val
         if bucket == "frozen":
@@ -545,6 +603,10 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                         continue
                     if dd["c"][j - 1] < s["breakout_price"]:   # 周中走坏，不符合条件
                         continue
+                    if hold_rule == "all" and s.get("pool", "weekly") == "weekly":
+                        k = dd["pos"].get(s["sig_date"])
+                        if k is not None and k + 1 < j and dd["c"][k + 1:j].min() < s["breakout_price"]:
+                            continue
                     lim_up = dd["c"][j - 1] * (1 + _limit_pct(code)) - 0.011
                     if real:
                         if dd["o"][j] >= lim_up:                 # 开盘即涨停，集合竞价买不到
@@ -553,11 +615,16 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                             continue                             # 开盘涨幅过大不追
                     elif dd["h"][j] == dd["l"][j] and dd["o"][j] >= lim_up:
                         continue
-                    buy_px = dd["o"][j] * (1 + slip_auc) if real else dd["o"][j]
+                    buy_px = dd["o"][j] * (1 + slip_auc + (real["slip_bj"] if code.startswith("bj") else 0)) if real else dd["o"][j]
                     if real:
                         budget = min(layer_amt, cash) * cap
                         sh = budget / (buy_px * (1 + fee_rate))
-                        sh = (int(sh) if sh >= 200 else 0) if code[3:6] in ("688", "689") else int(sh // 100 * 100)
+                        if code[3:6] in ("688", "689"):
+                            sh = int(sh) if sh >= 200 else 0
+                        elif code.startswith("bj"):                # 北交所：≥100股，之后1股递增
+                            sh = int(sh) if sh >= 100 else 0
+                        else:
+                            sh = int(sh // 100 * 100)
                         if sh == 0:                              # 买不起一手
                             continue
                         shares0 = sh / cap
@@ -574,6 +641,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                     positions.append(p)
                     held.add(code); traded_this_pool.add(code)
                     used_layers += 1
+            expo.append((day, used_layers, level[i] * 10))
 
         # 4. 盘中 + 尾盘
         for p in positions:
@@ -613,6 +681,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
 
     eq = pd.Series(equity_curve, index=pd.to_datetime(dates))
     # 期末未平仓持仓（前向跟踪用）：剩余份额按最新收盘估值
+    eq.attrs["exposure"] = pd.DataFrame(expo, columns=["date", "used", "allowed"])
     eq.attrs["open_positions"] = [{
         "code": p.code, "signal": p.sig["signal"], "sig_date": p.sig["sig_date"], "buy_date": dates[p.buy_i],
         "buy_px": p.buy_px, "left": p.left, "grid_sold": p.sold, "levels": p.levels,
