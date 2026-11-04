@@ -139,7 +139,7 @@ class LoginManager:
         初始化登录管理器
 
         Args:
-            phone: 手机号（11位）
+            phone: 账号标识。有手机号的账号传 11 位手机号；无手机号账号传平台内部编号（acc_ 前缀，如 acc_000120）
             credentials_file: 凭证保存文件路径（默认：当前目录下的 credentials.json）
             use_redis: 是否使用 Redis 存储（默认 True）
             city: 指定城市（可选），如果指定则优先分配该城市的代理
@@ -147,7 +147,9 @@ class LoginManager:
             binding_manager: AccountProxyBinding 实例（可选，不传则自动创建）
             failure_handler: ProxyFailureHandler 实例（可选，不传则自动创建）
         """
-        if len(phone) != 11:
+        # phone 在这里只是凭证 key(Redis field / 代理绑定 key / 设备池 key),不参与真实登录发码。
+        # 平台的无手机号账号用内部编号(如 acc_000120)当 key 传入,不是 11 位手机号 → 放行 acc_ 前缀。
+        if len(phone) != 11 and not phone.startswith('acc_'):
             raise ValueError("手机号必须是11位数字")
 
         self.phone = phone
