@@ -17,7 +17,7 @@ SIG_FILE = bw.SIG_DIR / "_daily_breakout_signals.pkl"
 
 
 def signals_for_stock(args):
-    code, name, min_consec, max_consec = (*args, 1, 2)[:4] if len(args) == 2 else args
+    code, name, min_consec, max_consec, max_gain_2d = (*args, 1, 2, 20)[:5] if len(args) == 2 else (*args, 20)[:5]
     _, d = bw.load_stock(code)
     if d is None or len(d) < _NEW_HIGH_DAYS + 8:
         return []
@@ -29,25 +29,27 @@ def signals_for_stock(args):
     for i in range(_NEW_HIGH_DAYS + 6, len(df)):
         if np.isnan(prior_max[i]) or c[i] < prior_max[i] or is_st[i]:
             continue
-        r = _check_breakout_sina(code, name, df.iloc[i - _NEW_HIGH_DAYS - 10:i + 1], {}, min_consec, max_consec)
+        r = _check_breakout_sina(code, name, df.iloc[i - _NEW_HIGH_DAYS - 10:i + 1], {}, min_consec, max_consec, max_gain_2d)
         if not r or np.isnan(r["14日ATR"]) or r["14日ATR"] <= 0:
             continue
         out.append({
             "code": code, "sig_date": df["day"].iloc[i],
             "signal": "B突破第二日" if r["昨日是否新高"] == "是" else "A首日突破",
             "score": r["突破日成交额倍量比"], "vol_ratio": r["突破日成交额倍量比"],
-            "breakout_price": r["突破价"], "atr": r["14日ATR"], "daily_ok": "是",
+            "breakout_price": r["突破价"], "atr": r["14日ATR"], "daily_ok": "是", "gain_2d": r["近2日涨幅(%)"],
         })
     return out
 
 
-def extract_signals(codes, min_consec=1, max_consec=2):
-    """连续新高天数默认 1~2（同实盘），其他参数的信号缓存单独存文件"""
-    f = SIG_FILE if (min_consec, max_consec) == (1, 2) else \
-        SIG_FILE.with_name(f"_daily_breakout_signals_c{min_consec}-{max_consec or 'inf'}.pkl")
+def extract_signals(codes, min_consec=1, max_consec=2, max_gain_2d=20):
+    """连续新高天数默认 1~2、近2日涨幅<20%（同实盘），其他参数的信号缓存单独存文件；
+    max_gain_2d=None 不限近2日涨幅（信号带 gain_2d 列，可事后按任意阈值过滤）"""
+    f = SIG_FILE if (min_consec, max_consec, max_gain_2d) == (1, 2, 20) else \
+        SIG_FILE.with_name(f"_daily_breakout_signals_c{min_consec}-{max_consec or 'inf'}"
+                           + ("" if max_gain_2d == 20 else f"_g{max_gain_2d or 'inf'}") + ".pkl")
     if f.exists():
         return pickle.load(open(f, "rb"))
-    codes = [(c, n, min_consec, max_consec) for c, n in codes]
+    codes = [(c, n, min_consec, max_consec, max_gain_2d) for c, n in codes]
     rows = []
     with Pool(8) as pool:
         for k, r in enumerate(pool.imap_unordered(signals_for_stock, codes, chunksize=20)):

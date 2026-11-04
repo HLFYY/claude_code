@@ -224,7 +224,7 @@ def market_levels(idx: pd.DataFrame, fractal_mode: str = FRACTAL_MODE) -> pd.Dat
 
 
 def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", confirm_rule="k3c",
-                     weak_line="k3c") -> pd.DataFrame:
+                     weak_line="k3c", first_lv=0.4, strong=None) -> pd.DataFrame:
     """
     10日线规则 + 分型确认版（分型：3根K线，不做包含；第3根收盘确认）
       底分型（10日线下）：bottom_confirm=True 时，第3根确认后次日收盘 >= 第3根收盘 → 再次日开盘4层；
@@ -244,6 +244,8 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
           maxc_h  收盘 >= 三根最高收盘 且 最高价 > 三根最高价
           k3c_h   收盘 >= 第3根收盘 且 最高价 > 三根最高价
           k3body  收盘 >= 第3根实体顶部 max(开,收)
+      first_lv：首日建仓仓位（站上10日线 / 底分型确认的第一天），默认 0.4；满足加仓条件后加满 1.0
+      strong=(涨幅阈值, 仓位)：开仓信号当天指数涨幅 > 阈值时首日改用该仓位，如 (0.03, 0.7)
       weak_line：底分型持仓后的弱势线（收盘跌破清仓、收盘站上加满）k3c=第3根收盘；k3body=第3根实体顶部
     """
     c, h, l, o = idx["close"].values, idx["high"].values, idx["low"].values, idx["open"].values
@@ -258,6 +260,11 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
     top_pending = None      # confirm 模式：等待次日确认的顶分型 (第3根收盘, 顶点)
     block = None            # 顶分型清仓后的失效线：收盘突破才允许重新开仓
     need_cross = False      # cross 模式：等待重新触发
+
+    def entry(t):
+        if strong is not None and t > 0 and c[t] / c[t - 1] - 1 > strong[0]:
+            return strong[1]
+        return first_lv
 
     for t in range(n - 1):
         if np.isnan(ma10[t]):
@@ -308,19 +315,19 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
             if confirm_rule.endswith("_h"):
                 ok = ok and h[t] > mh
             if ok:
-                lv, frac_mode, k3_close, need_cross = 0.4, True, kw, False
+                lv, frac_mode, k3_close, need_cross = entry(t), True, kw, False
             pending = None
             if bottom and not above and lv == 0:
                 pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
         elif above and not need_cross and not frac_mode:
-            lv = 0.4 if lv == 0 else 1.0
+            lv = entry(t) if lv == 0 else 1.0
         elif above and frac_mode:
             frac_mode = False             # 站上10日线，回到10日线规则
-            lv = 0.4 if lv == 0 else 1.0
+            lv = entry(t) if lv == 0 else 1.0
         elif frac_mode and lv > 0:
             if c[t] < k3_close:
                 clear_all()
-            elif lv == 0.4 and (c[t] >= k3_close if bottom_confirm else c[t] > c[t - 1]):
+            elif 0 < lv < 1.0 and (c[t] >= k3_close if bottom_confirm else c[t] > c[t - 1]):
                 lv = 1.0
             if bottom and frac_mode:
                 k3_close = wl[t]          # 新底分型，弱势线更新
@@ -330,7 +337,7 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
                     clear_all()           # 线下：先按铁律清（若有仓），等确认再开
                 pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
             else:                         # 同 market_levels(break_k3c)：不清，直接进入底分型持仓
-                lv = 0.4 if lv == 0 else (1.0 if c[t] > c[t - 1] else lv)
+                lv = entry(t) if lv == 0 else (1.0 if c[t] > c[t - 1] else lv)
                 frac_mode, k3_close, need_cross = True, c[t], False
         elif not above:
             clear_all()

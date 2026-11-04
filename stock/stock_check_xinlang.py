@@ -575,6 +575,7 @@ def calc_buy_price_sina(code: str, date, datalen: int = 250) -> float:
 
     ma5 = df["close"].iloc[i - 4:i + 1].mean()
     low = df["low"].iloc[i]
+    print(low)
     return round(max(ma5 * 0.99, low * 0.99), 2)
 
 
@@ -632,10 +633,11 @@ def _calc_rps_and_rank_sina(code: str, market_gains: dict) -> tuple:
 
 
 def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: dict,
-                         min_consec: int = 1, max_consec=2) -> dict:
+                         min_consec: int = 1, max_consec=2, max_gain_2d=20) -> dict:
     """
     检查单只股票是否满足 100日新高+收红+倍量 条件，满足则返回结果字典，否则 None
     min_consec / max_consec：连续新高天数（含当日）的下限 / 上限（None=不限），默认 1~2 即"首日突破或突破第二日"
+    max_gain_2d：近2日涨幅上限%（>= 剔除），None=不限（回测按阈值对比用）
     """
     if df is None or len(df) < _NEW_HIGH_DAYS + 7:
         return None
@@ -671,7 +673,7 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
     if close_2d_ago <= 0:
         return None
     gain_2d = (latest_close - close_2d_ago) / close_2d_ago * 100
-    if gain_2d >= 20:
+    if max_gain_2d is not None and gain_2d >= max_gain_2d:
         return None
 
     # 条件2：收红
@@ -971,6 +973,10 @@ def run_weekly_screener_if_needed(latest_date) -> list:
 MARKET_INDEX, MARKET_INDEX_NAME = "sz399106", "深证综指"   # 大盘仓位用的指数（新浪代码）
 
 
+FIRST_LV = 0.4                  # 首日建仓仓位（站上10日线 / 底分型确认）
+STRONG_UP_PCT, STRONG_UP_LV = 0.03, 0.7   # 开仓信号当天指数涨幅 > 3% 时首日改建 70%（回测见 backtest_first_level.py strong）
+
+
 def _pct(lv: float) -> str:
     return f"{int(round(lv * 100))}%"
 
@@ -992,9 +998,9 @@ def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now) -> st
         ref, _ = top_pending
         return f"收盘≤{ref:.2f}→后天开盘清仓；>{ref:.2f}→顶分型失效继续持有"
     if block is not None:
-        return f"收盘>{block:.2f}(顶点)且在10日线上→后天开盘建40%；否则继续空仓"
+        return f"收盘>{block:.2f}(顶点)且在10日线上→后天开盘建40%（当天涨>3%则70%）；否则继续空仓"
     if pending is not None:
-        return f"收盘≥{pending:.2f}→后天开盘建40%；<{pending:.2f}→底分型作废"
+        return f"收盘≥{pending:.2f}→后天开盘建40%（当天涨>3%则70%）；<{pending:.2f}→底分型作废"
     if frac_mode and lv > 0:
         if lv < 1:
             return f"收盘≥{k3_close:.2f}→后天加满100%；<{k3_close:.2f}→后天开盘清仓"
@@ -1003,7 +1009,7 @@ def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now) -> st
         if lv < 1:
             return f"收盘仍在10日线上(今≈{ma10_now:.2f})→后天加满100%；跌破→后天开盘清仓"
         return f"收盘跌破10日线(今≈{ma10_now:.2f})→后天开盘清仓；否则满仓持有"
-    return f"收盘站上10日线(今≈{ma10_now:.2f})→后天开盘建40%；10日线下出底分型→等次日确认"
+    return f"收盘站上10日线(今≈{ma10_now:.2f})→后天开盘建40%（当天涨>3%则70%）；10日线下出底分型→等次日确认"
 
 
 def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
@@ -1011,6 +1017,14 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l = df["close"].values, df["high"].values, df["low"].values
     ma10 = pd.Series(c).rolling(10).mean().values
     rows = []
+
+    def entry(t):
+        """首日建仓仓位及说明：当天涨幅 > STRONG_UP_PCT 用 STRONG_UP_LV，否则 FIRST_LV"""
+        g = c[t] / c[t - 1] - 1 if t > 0 else 0
+        if g > STRONG_UP_PCT:
+            return STRONG_UP_LV, f"建{_pct(STRONG_UP_LV)}（当天涨{g:.1%}>{STRONG_UP_PCT:.0%}）"
+        return FIRST_LV, f"建{_pct(FIRST_LV)}"
+
     lv, frac_mode, k3_close = 0.0, False, 0.0
     pending = None          # 底分型待确认的弱势线
     top_pending = None      # 顶分型待确认 (第3根收盘, 顶点)
@@ -1052,8 +1066,8 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
             if not done:
                 if pending is not None and lv == 0:
                     if c[t] >= pending:
-                        lv, frac_mode, k3_close = 0.4, True, pending
-                        action = f"底分型确认（收盘≥弱势线{pending:.2f}），次日开盘建40%"
+                        (lv, txt), frac_mode, k3_close = entry(t), True, pending
+                        action = f"底分型确认（收盘≥弱势线{pending:.2f}），次日开盘{txt}"
                     else:
                         action = f"底分型作废（收盘<弱势线{pending:.2f}），空仓"
                     pending = None
@@ -1062,19 +1076,24 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
                         action += f"；新底分型，弱势线{c[t]:.2f}，待次日确认"
                 elif above and not frac_mode:
                     if lv == 0:
-                        lv, action = 0.4, "次日开盘建40%（收盘站上10日线）"
-                    elif lv == 0.4:
+                        lv, txt = entry(t)
+                        action = f"次日开盘{txt}（收盘站上10日线）"
+                    elif lv < 1:
                         lv, action = 1.0, "次日开盘加满100%（仍在10日线上）"
                     else:
                         action = "满仓持有（10日线上）"
                 elif above and frac_mode:
                     frac_mode = False
-                    lv, action = (0.4, "次日开盘建40%（站上10日线）") if lv == 0 else (1.0, "站上10日线，改按10日线规则，次日加满100%")
+                    if lv == 0:
+                        lv, txt = entry(t)
+                        action = f"次日开盘{txt}（站上10日线）"
+                    else:
+                        lv, action = 1.0, "站上10日线，改按10日线规则，次日加满100%"
                 elif frac_mode and lv > 0:
                     if c[t] < k3_close:
                         lv, frac_mode = 0.0, False
                         action = f"次日集合竞价清仓（底分型跌破：收盘<弱势线{k3_close:.2f}）"
-                    elif lv == 0.4:
+                    elif lv < 1:
                         lv, action = 1.0, f"次日开盘加满100%（底分型未跌破弱势线{k3_close:.2f}）"
                     else:
                         action = f"满仓持有（底分型持仓，弱势线{k3_close:.2f}）"
@@ -1084,7 +1103,7 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
                 elif bottom and not above:
                     pre = "当天停止新开/加仓/补仓，次日集合竞价清仓（跌破10日线）；" if lv > 0 else ""
                     lv, frac_mode, pending = 0.0, False, c[t]
-                    action = pre + f"10日线下底分型（弱势线{c[t]:.2f}），次日收盘不跌破则第三日开盘建40%"
+                    action = pre + f"10日线下底分型（弱势线{c[t]:.2f}），次日收盘不跌破则第三日开盘建40%（确认当天涨>3%则70%）"
                 elif not above:
                     action = "当天停止新开/加仓/补仓，次日集合竞价清仓（收盘跌破10日线）" if lv > 0 else "空仓观望（10日线下）"
                     lv, frac_mode = 0.0, False
@@ -1131,6 +1150,12 @@ def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
         f"▶ 原因：{last['原因']}",
         f"▶ 下一交易日收盘关注：{last['下一日收盘关注']}",
     ]
+    import chinese_calendar as cc
+    if closed and df["day"].iloc[-1] != today and now.weekday() < 5 and cc.is_workday(now.date()):
+        # 已过收盘但新浪日K还没有今天这根：上面是截至昨天的结论，不是今天的收盘信号
+        summary.insert(0, f"⚠ 今天（{today}）的收盘数据新浪还没更新，以下是截至 {last['日期']} 的结论，"
+                          f"不是今天的收盘信号，请 15:15 后再跑")
+        _log(summary[0])
     print("\n" + "\n".join("  " + x for x in summary))
     states.attrs["summary"] = summary
 
@@ -1159,12 +1184,50 @@ def send_mail_advice(summary: list, file_dirs: list):
     res = yag.send(to=receivers, subject=title, contents=content, attachments=file_dirs)
     _log(f"邮件已发送：{receivers}  附件：{file_dirs or '无'}  {res or ''}")
 
+SINA_WAIT_MAX_MIN = 90     # main 开始时等新浪日K出今天这根，最多等这么久（分钟），每 5 分钟查一次
+
+
+def _wait_sina_daily_ready() -> bool:
+    """
+    今天是交易日且已过 15:10 时，等新浪日K（指数 + 两只个股）出现今天这根再往下跑；
+    新浪收盘后更新日K有延迟（实测 15:20 仍未更新），没更新就跑会把昨天的数据当今天用。超时返回 False
+    """
+    import chinese_calendar as cc
+    deadline = time.time() + SINA_WAIT_MAX_MIN * 60
+    while True:
+        latest = _sina_get_latest_trading_date()
+        today = latest.strftime("%Y-%m-%d")
+        if latest != datetime.now().date():
+            return True                          # 收盘前/非交易日：按前一交易日跑，不用等
+        url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        ok = 0
+        for sym in (MARKET_INDEX, "sh600000", "sz000001"):
+            try:
+                data = json.loads(requests.get(url, params={"symbol": sym, "scale": 240, "ma": "no", "datalen": 1},
+                                               timeout=15).text)
+                ok += bool(data) and data[-1]["day"] == today
+            except Exception:
+                pass
+        if ok == 3:
+            return True
+        if time.time() >= deadline:
+            return False
+        _log(f"新浪日K还没有 {today} 的数据（{ok}/3 已更新），5 分钟后再查")
+        time.sleep(300)
+
+
 def main():
     """
     每日流程（收盘后运行；每周最后一个交易日请在 17:30 后运行，会自动跑周线选股）：
       大盘仓位建议 → [周末]周线选股 → 日线选股(连续≥2日新高) → 前向跟踪(模拟持仓/清仓价) → 合并股票池 → 发邮件
     """
     _log(f"开始运行（主机 {socket.gethostname()}）")
+    if not _wait_sina_daily_ready():
+        msg = f"⚠ 等了 {SINA_WAIT_MAX_MIN} 分钟新浪日K仍没有今天的数据，本次不出结果，请稍后手动运行 python stock_check_xinlang.py main"
+        _log(msg)
+        if "houjie-" not in socket.gethostname():
+            send_mail_advice([msg], [])
+        return
     # 深证综指 10日线+底/顶分型 仓位操作；只是仓位建议，出错也不影响下面选股
     try:
         summary = sz_market_action().attrs["summary"]
@@ -1215,11 +1278,11 @@ if __name__ == "__main__":
     elif len(sys.argv) == 2 and sys.argv[1] == 'qfq_init':
         qfq_init()
     else:
-        main()
+        # main()
         # 计算指定日期价格-max(MA5×0.99, 最低价×0.99),每天计算一次持仓个股
-        # for code in ['']:
-        #     res = calc_buy_price_sina(code, date=time.strftime("%Y-%m-%d"))
-        #     print(code, res)
+        for code in ['sz301045']:
+            res = calc_buy_price_sina(code, date=time.strftime("%Y-%m-%d"))
+            print(code, res)
 
         # 新浪的数据成交额是计算的，有偏差；东方财富的是直接取的，准确些
         # check_stock("sh603256")

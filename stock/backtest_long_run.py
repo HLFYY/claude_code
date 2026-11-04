@@ -1,7 +1,7 @@
 """
 长周期回测（cache_bs_long：2018起 baostock 前复权，含退市股）
-实盘方案：合并池（周线 买点1-W2/W3/买点2 + 日线连续≥2日新高）× RPS120高→低 × 开盘涨幅>7%不买 × 实盘约束
-大盘：10日线 + 底分型次日确认 + 顶分型次日确认清仓/突破顶点再进场（market_levels_v2(True, "confirm")）
+实盘方案：合并池（周线 买点1-W2/W3/买点2 + 日线连续≥2日新高）× RPS120(1位小数)高→低,同分10日弱→强 × 开盘涨幅>7%不买 × 实盘约束
+大盘：10日线 + 底分型次日确认 + 顶分型次日确认清仓/突破顶点再进场；首日 40%，开仓当天指数涨>3% 首日 70%（MKT_KW）
 大盘指数：深证综指（bw.INDEX_CODE）
 对照：理想成交、周线单独、日线单独、不冻结、旧大盘规则、无大盘择时、深证成指做大盘、指数持有
 用法：python backtest_long_run.py > stock_result/long_run.log 2>&1
@@ -16,6 +16,8 @@ import backtest_daily_portfolio as bd
 
 REAL = {"max_open_gap": 0.07}            # 其余见 bw.REAL_DEFAULT：本金80万整手、实测费率、止损0.2%/尾盘0.1%滑点
 WEEKLY_TYPES = ("买点1-W2", "买点1-W3", "买点2")
+PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
+MKT_KW = {"first_lv": 0.4, "strong": (0.03, 0.7)}       # 同 stock_check_xinlang FIRST_LV / STRONG_UP_*
 
 
 def yearly(eq):
@@ -42,7 +44,7 @@ def main():
     print(f"区间 {idx['date'].iloc[0].date()} ~ {idx['date'].iloc[-1].date()}（{len(idx)} 交易日），"
           f"周线信号 {len(wk)}，日线(连续≥2日)信号 {len(dy)}，股票 {len(daily)} 只（含退市）")
 
-    mkt_new = bw.market_levels_v2(idx, True, "confirm")
+    mkt_new = bw.market_levels_v2(idx, True, "confirm", **MKT_KW)
     mkt_old = bw.market_levels(idx, "break_k3c")
     mkt_all = mkt_new.copy(); mkt_all["level"] = 1.0; mkt_all["clear"] = False
     print(f"大盘新规则：在场 {(mkt_new['level'] > 0).mean() * 100:.1f}%，满仓 {(mkt_new['level'] == 1).mean() * 100:.1f}%，"
@@ -54,13 +56,13 @@ def main():
         ("合并池 不冻结", mix, "mixed", mkt_new, False, REAL),
         ("合并池 旧大盘规则", mix, "mixed", mkt_old, True, REAL),
         ("合并池 无大盘择时", mix, "mixed", mkt_all, True, REAL),
-        ("合并池 深证成指做大盘", mix, "mixed", bw.market_levels_v2(idx_cz, True, "confirm"), True, REAL),
+        ("合并池 深证成指做大盘", mix, "mixed", bw.market_levels_v2(idx_cz, True, "confirm", **MKT_KW), True, REAL),
         ("周线单独", wk, "weekly", mkt_new, True, REAL),
         ("日线单独", dy, "daily", mkt_new, True, REAL),
     ]
     rows, yrows, curves = [], [], {}
     for name, sig, mode, m, fz, real in cases:
-        e, t = bw.run_portfolio(sig, daily, m, use_freeze=fz, priority="RPS120高→低", pool_mode=mode, real=real)
+        e, t = bw.run_portfolio(sig, daily, m, use_freeze=fz, priority=PRIORITY, pool_mode=mode, real=real)
         e1, e2 = e.loc[:"2024-08-08"], e.loc["2024-08-09":]
         p, p1, p2 = bw.perf(e, ""), bw.perf(e1 / e1.iloc[0], ""), bw.perf(e2 / e2.iloc[0], "")
         rows.append({"方案": name, "总收益%": p["总收益%"], "年化%": p["年化%"], "最大回撤%": p["最大回撤%"], "夏普": p["夏普"],

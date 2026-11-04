@@ -25,7 +25,7 @@ import backtest_weekly_portfolio as bw
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
                                  _sina_get_stock_list, _sina_qfq_market, _sina_qfq_factors, _qfq_f_at, _next_trading_day,
                                  _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, MARKET_INDEX, MARKET_INDEX_NAME,
-                                 _NEW_HIGH_DAYS, _SINA_MAX_WORKERS)
+                                 _NEW_HIGH_DAYS, _SINA_MAX_WORKERS, FIRST_LV, STRONG_UP_PCT, STRONG_UP_LV)
 
 START = "2026-11-03"          # 跟踪起始日（当天开盘起按策略操作）
 CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率与之无关
@@ -131,7 +131,7 @@ def main(market=None, market_qfq=None) -> dict:
     """
     latest_date = market[0] if market else _sina_get_latest_trading_date()
     idx = load_index()
-    mkt_full = bw.market_levels_v2(idx, True, "confirm")
+    mkt_full = bw.market_levels_v2(idx, True, "confirm", first_lv=FIRST_LV, strong=(STRONG_UP_PCT, STRONG_UP_LV))
     start = pd.Timestamp(START)
     if idx["date"].iloc[-1] < start:
         msg = f"最新已收盘交易日 {idx['date'].iloc[-1].date()}，还没到跟踪起始日 {START}，收盘后再跑"
