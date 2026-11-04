@@ -201,17 +201,21 @@ def main(market=None, market_qfq=None) -> dict:
         dd = daily[p["code"]]
         j = np.searchsorted(dd["dates"], np.datetime64(days[-1]), side="right") - 1   # 跟踪截止日那根K线
         shares0 = p["shares0"] * CAPITAL
+        buy_raw = round(_raw_px(raw_daily, p["code"], p["buy_date"], p["buy_px"], daily), 2)
+        step = round((p["levels"][0] / p["buy_px"] - 1) * 100, 2)
+        gap = round(buy_raw * step / 100, 2)                 # 券商网格"按价格"：每格价差 = 买入价 × 步长
         hold.append({"代码": p["code"], "名称": names.get(p["code"], ""),
-                     "买入日": pd.Timestamp(p["buy_date"]).strftime("%Y-%m-%d"), "买入价": round(_raw_px(raw_daily, p["code"], p["buy_date"], p["buy_px"], daily), 2),
+                     "买入日": pd.Timestamp(p["buy_date"]).strftime("%Y-%m-%d"), "买入价": buy_raw,
                      "剩余股数": int(round(p["left"] * shares0)),
-                     "网格步长%": round((p["levels"][0] / p["buy_px"] - 1) * 100, 2),
+                     "网格步长%": step, "网格价差": gap,
                      "已卖网格份数": p["grid_sold"],
+                     "剩余网格卖出价": "/".join(f"{buy_raw + k * gap:.2f}" for k in range(p["grid_sold"] + 1, bw.GRID_PARTS + 1)),
                      "下一日盘中清仓价": round(max(dd["ma5"][j] * 0.99, dd["l"][j] * 0.99), 2),
                      "下一日操作": f"开盘卖出（{p['pending'].split('→')[0]}，T+1今天卖不了）" if p["pending"]
                                    else "按清仓价挂盘中清仓条件单",
                      "最新收盘": round(p["last_close"], 2),
                      "浮盈%": round((p["last_close"] / p["buy_px"] - 1) * 100, 2)})
-    hold = pd.DataFrame(hold, columns=["代码", "名称", "买入日", "买入价", "剩余股数", "网格步长%", "已卖网格份数",
+    hold = pd.DataFrame(hold, columns=["代码", "名称", "买入日", "买入价", "剩余股数", "网格步长%", "网格价差", "已卖网格份数", "剩余网格卖出价",
                                        "下一日盘中清仓价", "下一日操作", "最新收盘", "浮盈%"])
     hold_file = f"stock_result/forward_holdings_{days[-1].strftime('%Y%m%d')}.csv"
     hold.to_csv(hold_file, index=False, encoding="utf-8-sig")

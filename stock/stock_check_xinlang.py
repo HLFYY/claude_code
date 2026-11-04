@@ -524,13 +524,16 @@ def _sina_qfq_market(market, missing_max=QFQ_MISSING_MAX, stale=None):
         [c for c in codes if mt[c] is not None and datetime.fromtimestamp(mt[c]).date() < prev_td], key=lambda c: mt[c])
     refresh = (set(ex) | set(missing[:missing_max]) | set(gap[:QFQ_GAP_MAX])
                | (set(old[:QFQ_STALE_MAX]) if stale else set()))
+    # 今天已拉过的直接用缓存（_sina_qfq_factors 当天只拉一次），日志里单独标出
+    done_today = {c for c in refresh if mt.get(c) and datetime.fromtimestamp(mt[c]).date() == datetime.now().date()}
     _log(f"[前复权] 当天除权 {len(ex)} 只" + ("" if ex_ok else "（盘中/行情不全，今天未检测）")
          + f"，无缓存 {len(missing)} 只"
          + (f"（本次只补拉 {missing_max} 只，请跑 qfq_init 补全）" if len(missing) > missing_max else "")
          + (f"，上次覆盖到 {checked or '无记录'}，漏跑补刷新 {len(gap)} 只"
             + (f"（本次 {QFQ_GAP_MAX} 只，下次继续）" if len(gap) > QFQ_GAP_MAX else "") if gap else "")
          + (f"，超过{QFQ_STALE_DAYS}天的缓存 {len(old)} 只" + ("（本次刷新）" if stale else "") if old else "")
-         + f"，需拉取 {len(refresh)} 只")
+         + f"，需拉取 {len(refresh) - len(done_today)} 只"
+         + (f"（另 {len(done_today)} 只今天已拉过，用缓存）" if done_today else ""))
     with ThreadPoolExecutor(max_workers=_SINA_MAX_WORKERS * 2) as ex_:
         facs = dict(zip(codes, ex_.map(lambda c: _sina_qfq_factors(c, refresh=c in refresh), codes)))
     df_adj = {k: (_sina_qfq_adjust(d, facs.get(k)) if d is not None and not d.empty else d) for k, d in df_all.items()}
@@ -797,6 +800,7 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
 #  合并股票池：本周有效的周线信号 + 当日日线信号，按 RPS120 高→低，次日集合竞价买入
 # ─────────────────────────────────────────────
 OPEN_GAP_MAX = 0.07          # 开盘涨幅 > 7% 不买：集合竞价挂单价 = 前收 × 1.07（不超过涨停价）
+SHARES_GAP = 0.04            # 1层参考股数按 前收 × 1.04 估算（按挂单上限 1.07 算会少买太多；开盘高于 4% 时实际金额略超 1 层）
 POOL_CAPITAL = 800_000       # 没有模拟账户信息时，按此本金算 1 层参考股数
 
 
@@ -882,13 +886,15 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
             if prev < bp:
                 continue                                     # 周中走坏，跌破突破价
         cap = min(round(prev * (1 + OPEN_GAP_MAX), 2), round(prev * (1 + _limit_pct_sina(code)), 2))
-        sh = layer_amt / cap
+        sh = layer_amt / min(round(prev * (1 + SHARES_GAP), 2), cap)
         sh = (int(sh) if sh >= 200 else 0) if code[2:5] in ("688", "689") else int(sh // 100 * 100)
         note = ("模拟持仓中，不买" if code in held else "本周已买卖，不买" if code in traded
                 else "1层买不起一手" if sh == 0 else "")
         asof = pd.Timestamp(c["信号日"]) if c["来源"] == "周线" else pd.Timestamp(latest_date)
         sub, gains, all_g120, all_g10 = snapshot(asof)
         g10 = gains.get(code, {}).get("gain10", np.nan)
+        atr = _calc_atr(df, 14)                              # 网格步长 = 买入前一交易日（最新收盘）ATR14% × 1.2
+        c = {**c, "网格步长%": round(atr * 1.2, 2) if not np.isnan(atr) else c["网格步长%"]}
         rows.append({**c, "名称": names.get(code, ""), "RPS120": _rps120_qfq(code, sub[code], all_g120),
                      "10日涨幅排名": int((all_g10 > g10).sum() + 1) if not np.isnan(g10) else np.nan,
                      "前收": round(prev, 2), "开盘买入价上限": cap, "1层参考股数": sh, "备注": note})

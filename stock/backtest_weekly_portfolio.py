@@ -417,6 +417,15 @@ REAL_DEFAULT = {"capital": 800_000, "slip_auction": 0.0, "slip_stop": 0.002, "sl
                 "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None, "slip_bj": 0.0}   # slip_bj：北交所买入/非网格卖出额外滑点
 
 
+def _atr_pct(dd: dict, j: int, n: int = 14) -> float:
+    """第 j 根收盘时的 ATR(n)%，同 stock_screener._calc_atr（保留 2 位）"""
+    if j < n:
+        return float("nan")
+    h, l, c = dd["h"][j - n + 1:j + 1], dd["l"][j - n + 1:j + 1], dd["c"][j - n:j]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - c), np.abs(l - c)))
+    return round(tr.mean() / dd["c"][j] * 100, 2)
+
+
 def _limit_pct(code: str) -> float:
     if code.startswith("bj"):
         return 0.3
@@ -424,7 +433,8 @@ def _limit_pct(code: str) -> float:
 
 
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
-                  pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None):
+                  pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
+                  grid_atr="prev", grid_geo=False):
     """
     pool_mode: weekly=上周五信号本周一~四可买；daily=前一交易日信号仅当日开盘可买；
                mixed=sig 带 pool 列（"weekly"/"daily"），两类按各自有效期合成当天候选池，统一按优先级排序（同一只只算一次）
@@ -434,6 +444,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
       - 滑点（买入价上浮、卖出价下浮）：集合竞价 slip_auction、盘中止损 slip_stop、尾盘 slip_close，网格限价不加；佣金 fee_rate（最低 min_fee 元）；印花税 2023-08-28 前千1、之后万5
       - max_open_gap：开盘涨幅超过该值不买（None 时只跳过开盘涨停）
     rank_daily: None=排名字段用信号日的值（周线票整周用上周五的）；rank_tables(daily) 的结果=每天按前一交易日收盘重算（同实盘股票池）
+    grid_geo: 网格价位 False=按价格（等差，各格都相对买入价：买入价×(1+k×步长)）；True=按比例（下一格=上一格×(1+步长)，买入价×(1+步长)^k）
+    grid_atr: 网格步长用的 ATR14%：prev=买入前一交易日（同实盘）；signal=信号日（周线票是信号周五）
     hold_rule: 周线票留池条件。last=前一日收盘 ≥ 突破价；all=信号日之后每日收盘都 ≥ 突破价（跌破一次本周剔除）
     """
     dates = list(mkt["date"])
@@ -642,8 +654,11 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                     p.shares0 = shares0
                     p.alloc = shares0 * buy_px + buy_fee(shares0 * buy_px)
                     p.left, p.sold, p.cost, p.pending = 1.0, 0, 0.0, None
-                    step = s["atr"] * GRID_MULT / 100
-                    p.levels = [buy_px * (1 + k * step) for k in range(1, GRID_PARTS + 1)]
+                    atr = _atr_pct(dd, j - 1) if grid_atr == "prev" else s["atr"]
+                    if not atr > 0:
+                        atr = s["atr"]
+                    step = atr * GRID_MULT / 100
+                    p.levels = [buy_px * ((1 + step) ** k if grid_geo else 1 + k * step) for k in range(1, GRID_PARTS + 1)]
                     cash -= p.alloc
                     positions.append(p)
                     held.add(code); traded_this_pool.add(code)
