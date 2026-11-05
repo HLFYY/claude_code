@@ -837,7 +837,7 @@ def load_weekly_signals() -> pd.DataFrame:
 def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.DataFrame:
     """
     生成下一交易日的合并股票池 stock_result/pool_{日期}.csv：
-      - 周线：上一周的买点1-W2/W3/买点2（下一交易日为周一~周四时有效），前收 < 突破价 的剔除
+      - 周线：上一周的买点1-W2/W3/买点2（下一周周一~周五有效），前收 < 突破价 的剔除
       - 日线：当日 screen_new_high_breakout_sina 的信号（连续≥2日新高），只在下一交易日有效
       - 统一按 RPS120（前复权）高→低给买入顺序，同分 10日涨幅弱→强；开盘买入价上限 = 前收×1.07（不超过涨停价）
       - RPS120 / 10日涨幅排名的取值日：周线票固定用信号周五收盘（整周不变），日线票用当日收盘；与回测/前向跟踪一致
@@ -914,9 +914,7 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
          f"日线 {can_buy['来源'].str.contains('日线').sum()}）")
     summary = [f"▶ {next_day} 开盘股票池 {len(can_buy)} 只（附件 {os.path.basename(fname)}）：按「买入顺序」集合竞价，"
                f"挂「开盘买入价上限」(前收×1.07)，开盘涨幅>7%买不到即跳过；每只1层（参考股数见附件）"]
-    if next_day.weekday() == 4:
-        summary.append("▶ 下一交易日是周五：不开新仓")
-    elif sim and sim.get("next_level") is not None:
+    if sim and sim.get("next_level") is not None:
         free = max(0, int(round(sim["next_level"] * 10 - sim.get("held_layers", 0))))
         summary.append(f"▶ 明日大盘目标仓位 {int(sim['next_level'] * 100)}%，模拟持仓约 {sim.get('held_layers', 0):.1f} 层"
                        f" → 最多新开 {free} 只（止损/走弱资金冻结到下周一，以实际可用资金为准）")
@@ -936,11 +934,10 @@ def run_weekly_screener_if_needed(latest_date) -> list:
     """
     周线选股每周只跑一次：下一交易日的股票池要用"上一周"的周线信号，缺了才跑 stock_screener（本地走代理/服务器直连）。
       - 正常：周五 19:00 那次运行时跑（baostock 17:30 后才有本周周线），周一~四 15:30 直接复用 weekly_signals.csv
+      - 周四跑（下一交易日周五）：用的仍是上一周信号，已存在，直接复用
       - 周五休市等：周四 15:30 跑时 baostock 还没本周数据 → 提示并跳过，下一次运行（下周一）再补跑上周的
     """
     nxt = pd.Timestamp(_next_trading_day(latest_date))
-    if nxt.weekday() == 4:
-        return []                                            # 下一交易日是周五，不开新仓，不需要周线池
     need_week = nxt.to_period("W-FRI") - 1                   # 需要的信号周
     if _weekly_signals_ready(need_week.end_time.date()):
         return []

@@ -1,7 +1,7 @@
 """
 前向跟踪：从 START（2026-11-03）起，按实盘规则模拟交易到最新交易日，算策略收益率，和实际账户对比
   候选池（与 stock_check_xinlang.build_buy_pool 一致）：
-    - 周线：stock_screener 写入的 weekly_signals.csv（买点1-W2/W3/买点2），信号周的下一周周一~四可买，前收<突破价不买
+    - 周线：stock_screener 写入的 weekly_signals.csv（买点1-W2/W3/买点2），信号周的下一周周一~五可买，前收<突破价不买
     - 日线：_check_breakout_sina 连续≥2日新高，信号日次日开盘可买
   优先级：RPS120 高→低（候选股前复权）；大盘：深证综指 market_levels_v2(底分型确认, 顶分型confirm)，与 sz_market_action 一致
   个股/资金规则同 backtest_weekly_portfolio.run_portfolio，按实盘约束（real）：本金 CAPITAL 整手、开盘涨幅>7%不买、

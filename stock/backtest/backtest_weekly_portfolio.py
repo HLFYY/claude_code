@@ -451,9 +451,10 @@ def _limit_pct(code: str) -> float:
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
                   pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
                   grid_atr="prev", grid_geo=False, front_sig=None, front_days=None, front_by=(["vol_ratio"], [False]),
-                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None):
+                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all"):
     """
     buy_day_exempt：买入当天涨幅（收盘/昨收-1）> 该值时，当天触发的止损/走弱都不算（不在次日开盘卖）；None=不豁免（实盘）
+    friday：周五开新仓 all=正常开（实盘，2026-11-05 起）/ no=不开（之前的规则）/ daily_only=只开日线票（周线票已是上周五信号的第5天）
     min_step：网格步长%（买入前一日 ATR14% × 1.2）低于该值的票不买（如 4 = 4%）；None 不过滤
     exempt_day2：True 时第2天走弱也用同一涨幅豁免（当天涨幅 > buy_day_exempt 不尾盘卖）
     buy_day_stop：买入当天盘中触及止损价（max(昨MA5,昨低)×0.99）的处理（T+1，都是次日开盘卖）
@@ -651,8 +652,10 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
 
         # 3. 开新仓
         wd = pd.Timestamp(day).weekday()
-        if level[i] > 0 and not clear[i] and wd != 4:
+        if level[i] > 0 and not clear[i] and (wd != 4 or friday != "no"):
             pool = get_pool(i)
+            if wd == 4 and friday == "daily_only" and pool is not None and "pool" in pool:
+                pool = pool[pool["pool"] == "daily"]
             eq_prev = equity_curve[-1]
             layer_amt = LAYER * eq_prev
             held = {p.code for p in positions}
