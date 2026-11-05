@@ -1248,11 +1248,11 @@ def main():
         _log(err)
         summary = summary + ["", err]
     # 策略前向跟踪：模拟持仓 + 下一日盘中清仓价（复用上面加载的行情）
-    hold_file, sim = None, None
+    hold_file, sim, hist_file = None, None, None
     try:
         import forward_track
         ft = forward_track.main(market=market_raw, market_qfq=market)
-        hold_file, sim = ft["holdings_file"], ft.get("sim")
+        hold_file, sim, hist_file = ft["holdings_file"], ft.get("sim"), ft.get("history_file")
         summary = summary + [""] + ft["summary"]
     except Exception as e:
         err = f"[前向跟踪] 失败：{type(e).__name__}: {e}"
@@ -1271,7 +1271,7 @@ def main():
             summary = summary + ["", err]
     # 服务器定时任务跑时发邮件（本地不发）
     if "houjie-" not in socket.gethostname():
-        send_mail_advice(summary, [f for f in (pool_file, hold_file) if f])
+        send_mail_advice(summary, [f for f in (pool_file, hold_file, hist_file) if f])
     _log("运行结束")
 
 

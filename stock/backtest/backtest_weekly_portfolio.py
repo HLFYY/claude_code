@@ -44,6 +44,8 @@ WANT_SIGNALS = ("买点1-W2", "买点1-W3", "买点2", "买点3")
 BP3_VOL_RATIO = 3.0                   # 买点3：买点1-W1 中突破周成交额 ≥ 上周 × 3（手动分组规则），下周一~四可买
 LAYER = 0.10
 GRID_MULT, GRID_PARTS = 1.2, 4
+GRID_ROUND = "floor"   # 网格每份股数取整：floor 2600→600/600/600/800；ceil→700/700/700/500
+WEAK_DAYS = 3        # 走弱判断天数（含买入日）：买入日弱→次日开盘卖，第 2~3 天弱→尾盘卖
 BUY_FEE, SELL_FEE = 0.0003, 0.0008   # 佣金万2.5 + 卖出印花税万5（2023-08 前为千1，这里统一取近年值）
 WEEK_LOOKBACK = 156                   # 同 stock_screener start_date=156周
 
@@ -451,7 +453,7 @@ def _limit_pct(code: str) -> float:
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
                   pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
                   grid_atr="prev", grid_geo=False, front_sig=None, front_days=None, front_by=(["vol_ratio"], [False]),
-                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all"):
+                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS):
     """
     buy_day_exempt：买入当天涨幅（收盘/昨收-1）> 该值时，当天触发的止损/走弱都不算（不在次日开盘卖）；None=不豁免（实盘）
     friday：周五开新仓 all=正常开（实盘，2026-11-05 起）/ no=不开（之前的规则）/ daily_only=只开日线票（周线票已是上周五信号的第5天）
@@ -463,6 +465,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
           open_above  开盘价 ≥ 止损价时才看（开盘就在止损价下方买入的，当天不算止损）
     freeze_mkt：大盘清仓 / 顶分型尾盘降仓卖出的资金也冻结到下周一（默认不冻结）
     mkt 带 tail_level 列（market_levels_v2 的 top_reduce）时：当天尾盘把持仓市值降到 总资产×tail_level，按浮盈低→高整只卖出（当天买的 T+1 不卖）
+    weak_days：走弱判断覆盖持有前几天（含买入日，None=整个持仓期），实盘 3（2026-11-05 由 2 改 3）
     weak_mode：新开票走弱（当日高>昨高 且 收盘>昨收，少一项=走弱）的处理
           open      买入当天走弱→次日开盘卖；第2天走弱→第2天尾盘卖（实盘）
           tail2     买入当天走弱→第2天尾盘卖（不再看第2天）；第2天走弱→第2天尾盘卖
@@ -565,6 +568,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
 
     def close_pos(p, i, price, reason, bucket, slip=0.0):
         nonlocal cash, frozen, pending_grid
+        left0 = p.left                                   # 规则退出（非网格）的剩余份额
         if real:
             price *= 1 - slip - (real["slip_bj"] if p.code.startswith("bj") else 0)
         val = sell_net(p.left * p.shares0 * price, i) if p.left > 1e-12 else 0.0
@@ -578,7 +582,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         trades.append({"code": p.code, "signal": p.sig["signal"], "sig_date": p.sig["sig_date"],
                        "buy_date": dates[p.buy_i], "exit_date": dates[i], "reason": reason,
                        "ret": p.cost / p.alloc - 1, "grid_sold": p.sold,
-                       "daily_ok": p.sig["daily_ok"], "alloc": p.alloc, "buy_px": p.buy_px})
+                       "daily_ok": p.sig["daily_ok"], "alloc": p.alloc, "buy_px": p.buy_px,
+                       "exit_px": price, "left_frac": left0, "shares0": p.shares0, "step": p.levels[0] / p.buy_px - 1,
+                       "pool": p.sig.get("pool"), "rps120_r1": p.sig.get("rps120_r1"), "gain10_rank": p.sig.get("gain10_rank")})
         p.left = 0
 
     def grid_sell(p, price, i, slip=0.0):
@@ -587,7 +593,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             price *= 1 - slip
             total = round(p.shares0 * cap)
             left_sh = round(p.left * total)
-            q_sh = left_sh if p.sold == GRID_PARTS - 1 else min(left_sh, max(100, total // GRID_PARTS // 100 * 100))
+            per = total / GRID_PARTS / 100                 # 每份几手：floor=向下取整（实盘，余数归最后一份）/ ceil=向上 / round=四舍五入
+            per = int({"floor": np.floor, "ceil": np.ceil, "round": np.round}[GRID_ROUND](per)) * 100
+            q_sh = left_sh if p.sold == GRID_PARTS - 1 else min(left_sh, max(100, per))
             q = q_sh / total
         else:
             q = 1.0 / GRID_PARTS
@@ -753,7 +761,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             sell_weak = {"open": weak, "day2only": weak, "tail2": weak or w1, "both": weak and w1, "off": False}[weak_mode]
             if sell_weak and exempt_day2 and buy_day_exempt is not None and dd["c"][j] / dd["c"][j - 1] - 1 > buy_day_exempt:
                 sell_weak = False
-            if held_days <= 2 and sell_weak:
+            if (weak_days is None or held_days <= weak_days) and sell_weak:
                 if locked_down(p.code, j):
                     p.pending = "走弱(跌停顺延)"; continue
                 close_pos(p, i, dd["c"][j], "走弱尾盘", "frozen", slip_close if real else 0)

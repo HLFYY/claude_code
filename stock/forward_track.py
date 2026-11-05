@@ -34,6 +34,7 @@ CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率
 PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
 REAL = {"capital": CAPITAL, "max_open_gap": OPEN_GAP_MAX}   # 实盘约束，其余用 backtest_weekly_portfolio.REAL_DEFAULT
 ACTUAL_FILE = Path("stock_result/actual_account.csv")
+HISTORY_FILE = Path("stock_result/历史清仓个股.xlsx")   # 模拟已清仓个股，每天合并新增（已有行不改）
 SIG_COLS = ["code", "name", "sig_date", "signal", "score", "vol_ratio", "breakout_price", "atr", "daily_ok", "pool"]
 
 
@@ -124,6 +125,44 @@ def _raw_px(raw_daily, code, day, adj_px, daily):
     return adj_px if j is None else adj_px * raw_daily[code]["c"][j] / daily[code]["c"][j]
 
 
+def update_history(tr, names, daily, raw_daily):
+    """已清仓个股写入 HISTORY_FILE：按（代码, 买入日）去重，已有的行保持不动，只追加新清仓的"""
+    cols = ["代码", "名称", "股票池", "信号", "信号日", "RPS120", "10日涨幅排名", "买入日", "买入价", "买入股数",
+            "网格步长%", "网格价差", "网格卖出份数", "网格卖出股数", "规则退出股数", "清仓日", "清仓价", "清仓原因",
+            "持有天数", "期间最高涨幅%", "收益%", "盈亏金额"]
+    rows = []
+    for r in tr.itertuples():
+        dd = daily[r.code]
+        jb, je = dd["pos"].get(r.buy_date), dd["pos"].get(r.exit_date)
+        buy_raw = round(_raw_px(raw_daily, r.code, r.buy_date, r.buy_px, daily), 2)
+        total = int(round(r.shares0 * CAPITAL))
+        rule_sh = int(round(r.left_frac * total))
+        rows.append({"代码": r.code, "名称": names.get(r.code, ""), "股票池": {"weekly": "周线", "daily": "日线"}.get(r.pool, r.pool),
+                     "信号": r.signal, "信号日": pd.Timestamp(r.sig_date).strftime("%Y-%m-%d"),
+                     "RPS120": r.rps120_r1, "10日涨幅排名": None if pd.isna(r.gain10_rank) else int(r.gain10_rank),
+                     "买入日": pd.Timestamp(r.buy_date).strftime("%Y-%m-%d"), "买入价": buy_raw, "买入股数": total,
+                     "网格步长%": round(r.step * 100, 2), "网格价差": round(buy_raw * r.step, 2),
+                     "网格卖出份数": r.grid_sold, "网格卖出股数": total - rule_sh, "规则退出股数": rule_sh,
+                     "清仓日": pd.Timestamp(r.exit_date).strftime("%Y-%m-%d"),
+                     "清仓价": round(_raw_px(raw_daily, r.code, r.exit_date, r.exit_px, daily), 2) if rule_sh else None,
+                     "清仓原因": r.reason,
+                     "持有天数": None if jb is None or je is None else je - jb + 1,
+                     "期间最高涨幅%": None if jb is None or je is None else round((dd["h"][jb:je + 1].max() / r.buy_px - 1) * 100, 2),
+                     "收益%": round(r.ret * 100, 2), "盈亏金额": round(r.alloc * r.ret * CAPITAL)})
+    new = pd.DataFrame(rows, columns=cols)
+    if HISTORY_FILE.exists():
+        old = pd.read_excel(HISTORY_FILE, dtype={"代码": str})
+        key = set(zip(old["代码"], old["买入日"].astype(str)))
+        new = new[[(c, b) not in key for c, b in zip(new["代码"], new["买入日"])]]
+        out = pd.concat([old, new], ignore_index=True)
+    else:
+        out = new
+    out = out.sort_values(["清仓日", "买入日", "代码"], kind="stable").reset_index(drop=True)
+    out.to_excel(HISTORY_FILE, index=False)
+    print(f"  历史清仓个股 {len(out)} 笔（本次新增 {len(new)}）→ {HISTORY_FILE}")
+    return len(new)
+
+
 def main(market=None, market_qfq=None) -> dict:
     """
     market：stock_check_xinlang._sina_load_market() 的结果（不复权），传入则复用已加载行情
@@ -206,6 +245,8 @@ def main(market=None, market_qfq=None) -> dict:
         buy_raw = round(_raw_px(raw_daily, p["code"], p["buy_date"], p["buy_px"], daily), 2)
         step = round((p["levels"][0] / p["buy_px"] - 1) * 100, 2)
         gap = round(buy_raw * step / 100, 2)                 # 券商网格"按价格"：每格价差 = 买入价 × 步长
+        n_held = int(((dd["dates"] >= np.datetime64(p["buy_date"])) & (dd["dates"] <= np.datetime64(days[-1]))).sum())
+        tail_chk = n_held + 1 <= bw.WEAK_DAYS                # 下一交易日仍在走弱判断期（买入后第 2~3 个交易日）
         hold.append({"代码": p["code"], "名称": names.get(p["code"], ""),
                      "买入日": pd.Timestamp(p["buy_date"]).strftime("%Y-%m-%d"), "买入价": buy_raw,
                      "剩余股数": int(round(p["left"] * shares0)),
@@ -214,7 +255,8 @@ def main(market=None, market_qfq=None) -> dict:
                      "剩余网格卖出价": "/".join(f"{buy_raw + k * gap:.2f}" for k in range(p["grid_sold"] + 1, bw.GRID_PARTS + 1)),
                      "下一日盘中清仓价": round(max(dd["ma5"][j] * 0.99, dd["l"][j] * 0.99), 2),
                      "下一日操作": f"开盘卖出（{p['pending'].split('→')[0]}，T+1今天卖不了）" if p["pending"]
-                                   else "按清仓价挂盘中清仓条件单",
+                                   else (f"按清仓价挂盘中清仓条件单 + 14:55 走弱则尾盘卖（持有第{n_held + 1}天）" if tail_chk
+                                         else "按清仓价挂盘中清仓条件单"),
                      "最新收盘": round(p["last_close"], 2),
                      "浮盈%": round((p["last_close"] / p["buy_px"] - 1) * 100, 2)})
     hold = pd.DataFrame(hold, columns=["代码", "名称", "买入日", "买入价", "剩余股数", "网格步长%", "网格价差", "已卖网格份数", "剩余网格卖出价",
@@ -232,6 +274,9 @@ def main(market=None, market_qfq=None) -> dict:
     sell_open = hold[hold["下一日操作"].str.startswith("开盘卖出")]
     if len(sell_open):
         summary.append("▶ 明日开盘卖出（买入当天触发止损/走弱，T+1）：" + "，".join(sell_open["名称"]))
+    tail_watch = hold[hold["下一日操作"].str.contains("尾盘卖")]
+    if len(tail_watch):
+        summary.append("▶ 明日 14:55 看走弱（不创新高或不收涨→尾盘卖）：" + "，".join(tail_watch["名称"]))
     today_exit = tr[pd.to_datetime(tr["exit_date"]) == days[-1]] if not tr.empty else tr
     if len(today_exit):
         summary.append("▶ 今日模拟平仓：" + "，".join(
@@ -248,6 +293,10 @@ def main(market=None, market_qfq=None) -> dict:
         print(f"\n  已平仓 {len(show)} 笔，成功率 {(tr['ret'] > 0).mean() * 100:.1f}%，平均 {tr['ret'].mean() * 100:+.2f}%")
         print(show.to_string(index=False))
         show.to_csv("stock_result/forward_trades.csv", index=False, encoding="utf-8-sig")
+        try:
+            update_history(tr, names, daily, raw_daily)
+        except Exception as e:
+            print(f"  [历史清仓个股] 写入失败：{type(e).__name__}: {e}")
     out.to_csv("stock_result/forward_equity.csv", index=False, encoding="utf-8-sig")
     print(f"\n已保存 stock_result/forward_equity.csv / forward_trades.csv / {Path(hold_file).name}")
 
@@ -262,7 +311,8 @@ def main(market=None, market_qfq=None) -> dict:
     st = _sz_market_states(idx[["day", "open", "high", "low", "close"]].reset_index(drop=True)).iloc[-1]
     sim = {"equity": eq_last * CAPITAL, "held": held, "held_layers": held_layers, "traded_week": traded_week,
            "next_level": int(st["下一日仓位"].rstrip("%")) / 100}
-    return {"holdings_file": hold_file, "summary": summary, "sim": sim}
+    return {"holdings_file": hold_file, "summary": summary, "sim": sim,
+            "history_file": str(HISTORY_FILE) if HISTORY_FILE.exists() else None}
 
 
 if __name__ == "__main__":
