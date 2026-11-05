@@ -116,6 +116,23 @@ def retry_on_network_error(max_attempts=3, base_delay=1.0, backoff=2.0):
     return decorator
 
 
+def proxy_url_to_ip_port(url: str) -> str:
+    """'http://user:pass@host:port' → 'host:port'（解析不出 host+port 时返回 ''）。
+
+    仅供回传响应头 X-Proxy-Used 用。代理必然带端口，故缺端口一律视为无效，避免把脏值写进头里。
+    """
+    if not url:
+        return ''
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url if '://' in url else f'http://{url}')
+        if not parts.hostname or not parts.port:
+            return ''
+        return f"{parts.hostname}:{parts.port}"
+    except Exception:
+        return ''
+
+
 class LoginManager:
     """
     麦当劳登录管理器
@@ -189,6 +206,10 @@ class LoginManager:
         self.device_id: Optional[str] = None  # 设备池中的设备唯一 id(绑定来源,便于失效换设备)
         self.tid: Optional[str] = None          # Token 激活标识(7天有效,ensure_tid 刷新)
         self.tid_expire: Optional[float] = None  # tid 过期时间戳(秒)
+
+        # 本次实际使用的代理：{'proxy': '43.226.63.205:11074', 'city': '北京'}，None=直连/未取
+        # mcd_server 据此给 /api/mcd/* 的响应加 X-Proxy-Used / X-Proxy-City（客户端记录排查用）
+        self.last_proxy_meta: Optional[Dict[str, str]] = None
 
         # ====== 新增：代理管理 ======
         # 使用传入的实例或创建新实例
@@ -321,6 +342,7 @@ class LoginManager:
             is_send_code: 是否发码(login_send_code)场景(每次必须新短效代理)。
         """
         if not USE_PROXY:
+            self.last_proxy_meta = None
             return None
 
         # 全程短效模式：不绑静态，所有请求走短效代理
@@ -328,8 +350,10 @@ class LoginManager:
         from config import PROXY_MODE
         if PROXY_MODE == 'always_short':
             from utils import get_short_proxy
-            return get_short_proxy(self.city, province=self.province, source=self.proxy_source,
-                                   merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+            _d = get_short_proxy(self.city, province=self.province, source=self.proxy_source,
+                                 merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+            self._set_proxy_meta(_d, self.city)
+            return _d
 
         binding = self.binding_manager.get_binding(self.phone)
         if not binding:
@@ -349,10 +373,24 @@ class LoginManager:
             else:
                 # 未登录 → 短效代理(白名单 ip:port)
                 from utils import get_short_proxy
-                return get_short_proxy(self.city, province=self.province, source=self.proxy_source,
-                                       merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+                _d = get_short_proxy(self.city, province=self.province, source=self.proxy_source,
+                                     merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+                self._set_proxy_meta(_d, self.city)
+                return _d
 
         return self._static_proxy_dict(binding)
+
+    def _set_proxy_meta(self, proxy_dict: Optional[Dict[str, str]], city: Optional[str]) -> None:
+        """记录本次实际使用的代理(ip:port + 城市)，供 mcd_server 回传响应头。
+
+        proxy_dict: requests 的 proxies 字典（可能含账号密码）；None/{} → 清空（视作直连）。
+        city: 代理所属城市；短效代理传生效城市，静态代理由 _static_proxy_dict 用代理记录里的 city。
+        """
+        if not proxy_dict:
+            self.last_proxy_meta = None
+            return
+        ip_port = proxy_url_to_ip_port(proxy_dict.get('https') or proxy_dict.get('http') or '')
+        self.last_proxy_meta = {'proxy': ip_port, 'city': city or ''} if ip_port else None
 
     def _static_proxy_dict(self, binding: Dict) -> Dict[str, str]:
         """由绑定信息构建静态代理 requests 字典；代理不存在返回 {}。"""
@@ -364,6 +402,7 @@ class LoginManager:
 
         proxy = self.proxy_pool.get_proxy(proxy_id)
         if not proxy:
+            self.last_proxy_meta = None
             return {}
 
         if proxy.get('username') and proxy.get('password'):
@@ -371,6 +410,9 @@ class LoginManager:
         else:
             proxy_url = f"{proxy['protocol']}://{proxy['host']}:{proxy['port']}"
 
+        # 城市取代理记录里的（代理池入库时按出口 IP 反查），缺失才退化为账号生效城市
+        self.last_proxy_meta = {'proxy': f"{proxy['host']}:{proxy['port']}",
+                                'city': proxy.get('city') or self.city or ''}
         return {'http': proxy_url, 'https': proxy_url}
 
     def _get_proxy_dict(self) -> Dict[str, str]:

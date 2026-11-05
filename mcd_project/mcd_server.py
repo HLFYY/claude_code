@@ -11,7 +11,7 @@ import subprocess
 import sys
 import traceback
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 import mcd_api
 import json
 import os
@@ -576,6 +576,9 @@ def universal_mcd_api(function_name):
             params['proxies'] = proxy_dict
             proxy_used = proxy_dict
 
+    # 记录本次实际用的代理，供响应头回传（见 _inject_proxy_headers）
+    g.proxy_meta = getattr(login_manager, 'last_proxy_meta', None)
+
     # 打印请求参数（包括自动获得的代理）
     log_params = params.copy()
     # 隐藏敏感信息
@@ -597,6 +600,39 @@ def universal_mcd_api(function_name):
     except Exception as e:
         app.logger.error(f'[{function_name}] 请求异常: {traceback.format_exc()}')
         return jsonify({'success': False, 'message': f'请求异常: {str(e)}'}), 500
+
+
+@app.after_request
+def _inject_proxy_headers(response):
+    """给 /api/mcd/* 的响应回传本次【实际使用】的代理，供客户端记录到订单里排查。
+
+    只覆盖 /api/mcd/ 前缀（登录/开卡/代理管理等其它接口不加）。
+    直连（未取到代理）时两个头都不出，客户端以"头缺失"表示直连。
+
+    X-Proxy-Used: 43.226.63.205:11074   —— 出口代理 ip:port（不含账号密码）
+    X-Proxy-City: 北京                  —— 代理所属城市
+
+    注意：城市是中文，HTTP 头按 UTF-8 字节直出（curl/浏览器直接可读）。
+      Python requests 取到的会是 latin-1 解码后的乱码，需还原：
+        resp.headers['X-Proxy-City'].encode('latin-1').decode('utf-8')
+    """
+    if not request.path.startswith('/api/mcd/'):
+        return response
+
+    meta = g.get('proxy_meta') if hasattr(g, 'get') else getattr(g, 'proxy_meta', None)
+    if not meta:
+        return response
+
+    ip_port = (meta.get('proxy') or '').strip()
+    if ip_port:
+        response.headers['X-Proxy-Used'] = ip_port
+
+    city = (meta.get('city') or '').strip()
+    if city:
+        # utf-8 → latin-1 桥接：写入的是 UTF-8 原始字节，绕开 Werkzeug 的 latin-1 限制
+        response.headers['X-Proxy-City'] = city.encode('utf-8').decode('latin-1')
+
+    return response
 
 
 # ========== 代理管理接口 ==========
