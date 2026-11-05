@@ -1,6 +1,6 @@
 """
 周线票排名字段口径对比：信号日（上周五）固定 vs 每天按前一交易日收盘重算（同实盘股票池）
-其余按已确认的实盘方案。用法：python backtest_rank_refresh.py > stock_result/rank_refresh.log 2>&1
+其余按已确认的实盘方案。用法：python backtest/backtest_rank_refresh.py > stock_result/rank_refresh.log 2>&1
 """
 import pickle
 

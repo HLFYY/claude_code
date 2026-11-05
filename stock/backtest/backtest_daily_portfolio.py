@@ -3,6 +3,11 @@
   信号日T收盘出信号 → T+1 开盘可买（仅当天，过期作废），A=首日突破(昨日非新高) / B=突破第二日(昨日也新高)
   数据同 backtest_weekly_portfolio（cache_bs_long），信号日为 ST 的不做
 """
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))   # stock/ 根目录（stock_screener、stock_check_xinlang 在这）
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
 import pickle
 import sys
 from multiprocessing import Pool

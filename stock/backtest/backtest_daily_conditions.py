@@ -2,7 +2,7 @@
 日线选股条件逐项检验（其余按已确认的实盘方案：合并池 × RPS120(1位小数)高→低,同分10日弱→强 × 开盘>7%不买 × 实盘约束 × 深证综指）
 做法：放宽提取"100日新高 + 连续≥2日新高"的全部候选，记下各项特征，再按条件组合过滤；基准 = 现行 6 条，应与 bd.extract_signals(codes,2,None) 基本一致
 每次只改一项：删条件 / 调阈值 / 加条件，看合并池和日线单独、两段区间是否同向改善
-用法：python backtest_daily_conditions.py > stock_result/daily_conditions.log 2>&1（特征缓存 cache_bs_long/_daily_features.pkl）
+用法：python backtest/backtest_daily_conditions.py > stock_result/daily_conditions.log 2>&1（特征缓存 cache_bs_long/_daily_features.pkl）
 """
 import pickle
 import sys

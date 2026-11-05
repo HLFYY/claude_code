@@ -2,7 +2,7 @@
 日线选股"近2日涨幅"上限对比（其余按已确认的实盘方案：合并池 × RPS120(1位小数)高→低,同分10日弱→强 × 开盘>7%不买 × 实盘约束 × 深证综指）
   20%（现）/ 涨跌幅2倍（主板20%、创业板科创板40%）/ 统一30% / 统一40% / 不限
   信号只提取一次（不限涨幅，带 gain_2d 列），各阈值事后过滤
-用法：python backtest_gain2d.py > stock_result/gain2d.log 2>&1
+用法：python backtest/backtest_gain2d.py > stock_result/gain2d.log 2>&1
 """
 import pickle
 

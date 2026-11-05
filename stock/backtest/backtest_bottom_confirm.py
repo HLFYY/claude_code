@@ -4,7 +4,7 @@
   maxc   确认日收盘 >= 三根最高收盘
   maxc_h 确认日收盘 >= 三根最高收盘 且 最高价 > 三根最高价
   k3c_h  确认日收盘 >= 第3根收盘 且 最高价 > 三根最高价
-用法：python backtest_bottom_confirm.py > stock_result/bottom_confirm.log 2>&1
+用法：python backtest/backtest_bottom_confirm.py > stock_result/bottom_confirm.log 2>&1
 """
 import pickle
 
@@ -18,7 +18,7 @@ from backtest_long_run import REAL, WEEKLY_TYPES, yearly
 RULES = {"k3c": "收盘≥第3根收盘(现)", "maxc": "收盘≥三根最高收盘", "maxc_h": "收盘≥三根最高收盘+最高>三根最高",
          "k3c_h": "收盘≥第3根收盘+最高>三根最高", "k3body": "收盘≥第3根实体顶部", "k3body+wl": "收盘≥第3根实体顶部+弱势线也用实体顶部"}
 import sys
-if len(sys.argv) > 1:          # 只跑指定规则：python backtest_bottom_confirm.py k3c k3body k3body+wl
+if len(sys.argv) > 1:          # 只跑指定规则：python backtest/backtest_bottom_confirm.py k3c k3body k3body+wl
     RULES = {k: RULES[k] for k in sys.argv[1:]}
 
 

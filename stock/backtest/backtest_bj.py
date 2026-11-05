@@ -2,7 +2,7 @@
 回测加入北交所的对比（其余按已确认的实盘方案：合并池 × RPS120(1位小数)高→低,同分10日弱→强 × 开盘>7%不买 × 实盘约束 × 深证综指）
   北交所数据：fetch_bj_eastmoney.py（东方财富前复权，仅现存股票，2020 年精选层起）；涨跌幅 30%，≥100 股后 1 股递增
   含北交所时，RPS120 / 10日排名的全市场分布也含北交所
-用法：python backtest_bj.py > stock_result/bj.log 2>&1（北交所信号缓存 cache_bs_long/_weekly_signals_bj.pkl、_daily_breakout_signals_bj_c2-inf.pkl）
+用法：python backtest/backtest_bj.py > stock_result/bj.log 2>&1（北交所信号缓存 cache_bs_long/_weekly_signals_bj.pkl、_daily_breakout_signals_bj_c2-inf.pkl）
 """
 import pickle
 import sys

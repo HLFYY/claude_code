@@ -4,7 +4,7 @@
   当前代码：1.6 / 1.5 / 0.15 / 0.15 / 1.5
   注释口径：同当前代码，hard_hist_spike_min 0.1
 留池条件：last=前一日收盘≥突破价（现逻辑）；all=信号后每日收盘都≥突破价
-用法：python backtest_weekly_params.py > stock_result/weekly_params.log 2>&1（各组信号缓存 cache_bs_long/_weekly_signals_{组名}.pkl）
+用法：python backtest/backtest_weekly_params.py > stock_result/weekly_params.log 2>&1（各组信号缓存 cache_bs_long/_weekly_signals_{组名}.pkl）
 """
 import pickle
 import sys

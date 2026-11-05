@@ -4,7 +4,7 @@
 大盘：10日线 + 底分型次日确认 + 顶分型次日确认清仓/突破顶点再进场；首日 40%，开仓当天指数涨>3% 首日 70%（MKT_KW）
 大盘指数：深证综指（bw.INDEX_CODE）
 对照：理想成交、周线单独、日线单独、不冻结、旧大盘规则、无大盘择时、深证成指做大盘、指数持有
-用法：python backtest_long_run.py > stock_result/long_run.log 2>&1
+用法：python backtest/backtest_long_run.py > stock_result/long_run.log 2>&1
      （选股信号缓存在 cache_bs_long/_weekly_signals.pkl、_daily_breakout_signals_c2-inf.pkl，改了选股条件要删掉重提）
 """
 import pickle

@@ -21,7 +21,9 @@ import numpy as np
 import pandas as pd
 import requests
 
-import backtest_weekly_portfolio as bw
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent / "backtest"))   # 回测引擎在 backtest/ 目录
+import backtest_weekly_portfolio as bw  # noqa: E402
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
                                  _sina_get_stock_list, _sina_qfq_market, _sina_qfq_factors, _qfq_f_at, _next_trading_day,
                                  _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, MARKET_INDEX, MARKET_INDEX_NAME,
