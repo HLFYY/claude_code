@@ -34,6 +34,10 @@ CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率
 PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
 REAL = {"capital": CAPITAL, "max_open_gap": OPEN_GAP_MAX}   # 实盘约束，其余用 backtest_weekly_portfolio.REAL_DEFAULT
 ACTUAL_FILE = Path("stock_result/actual_account.csv")
+# 实盘手动跳过没买的票（模拟同步：当天不买，顺延买下一只）：(日期, 代码, 原因)
+MANUAL_SKIP = [
+    ("2026-11-06", "sz002811", "郑中设计开盘跌停，实盘跳过，顺延买中原传媒"),
+]
 HISTORY_FILE = Path("stock_result/历史清仓个股.xlsx")   # 模拟已清仓个股，每天合并新增（已有行不改）
 SIG_COLS = ["code", "name", "sig_date", "signal", "score", "vol_ratio", "breakout_price", "atr", "daily_ok", "pool"]
 
@@ -201,7 +205,8 @@ def main(market=None, market_qfq=None) -> dict:
     else:
         sig["rps120_r1"] = sig["gain10_rank"] = pd.Series(dtype=float)
     raw_daily = to_daily_dict({c: dfs[c] for c in set(sig["code"])}) if not sig.empty else {}
-    eq, tr = bw.run_portfolio(sig, daily, mkt, use_freeze=True, priority=PRIORITY, pool_mode="mixed", real=REAL)
+    eq, tr = bw.run_portfolio(sig, daily, mkt, use_freeze=True, priority=PRIORITY, pool_mode="mixed", real=REAL,
+                              skip_buy={(pd.Timestamp(d), c) for d, c, _ in MANUAL_SKIP})
 
     bench = idx.set_index("date")["close"].loc[days[0]:]
     try:   # 对照：深证成指

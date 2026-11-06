@@ -453,7 +453,7 @@ def _limit_pct(code: str) -> float:
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
                   pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
                   grid_atr="prev", grid_geo=False, front_sig=None, front_days=None, front_by=(["vol_ratio"], [False]),
-                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS):
+                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS, open_down=None, skip_buy=None):
     """
     buy_day_exempt：买入当天涨幅（收盘/昨收-1）> 该值时，当天触发的止损/走弱都不算（不在次日开盘卖）；None=不豁免（实盘）
     friday：周五开新仓 all=正常开（实盘，2026-11-05 起）/ no=不开（之前的规则）/ daily_only=只开日线票（周线票已是上周五信号的第5天）
@@ -465,6 +465,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
           open_above  开盘价 ≥ 止损价时才看（开盘就在止损价下方买入的，当天不算止损）
     freeze_mkt：大盘清仓 / 顶分型尾盘降仓卖出的资金也冻结到下周一（默认不冻结）
     mkt 带 tail_level 列（market_levels_v2 的 top_reduce）时：当天尾盘把持仓市值降到 总资产×tail_level，按浮盈低→高整只卖出（当天买的 T+1 不卖）
+    skip_buy：{(日期, 代码)} 实盘手动跳过没买的票（前向跟踪同步实盘用），当天不买、顺延下一只
+    open_down：新开票开盘大跌就跳过、顺延买下一只：None=不跳过（实盘）/ "limit"=开盘跌停 / 0.09 等=开盘跌幅 > 9%
     weak_days：走弱判断覆盖持有前几天（含买入日，None=整个持仓期），实盘 3（2026-11-05 由 2 改 3）
     weak_mode：新开票走弱（当日高>昨高 且 收盘>昨收，少一项=走弱）的处理
           open      买入当天走弱→次日开盘卖；第2天走弱→第2天尾盘卖（实盘）
@@ -675,6 +677,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                     code = s["code"]
                     if code in held or code in traded_this_pool or code not in daily:
                         continue
+                    if skip_buy and (pd.Timestamp(day), code) in skip_buy:
+                        continue
                     dd = daily[code]
                     j = dd["pos"].get(day)
                     if j is None or j < 6:
@@ -697,6 +701,10 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                             continue
                         if max_gap is not None and dd["o"][j] > dd["c"][j - 1] * (1 + max_gap):
                             continue                             # 开盘涨幅过大不追
+                    if open_down is not None:
+                        lim_dn = dd["c"][j - 1] * (1 - _limit_pct(code)) + 0.011 if open_down == "limit" else dd["c"][j - 1] * (1 - open_down)
+                        if dd["o"][j] <= lim_dn if open_down == "limit" else dd["o"][j] < lim_dn:
+                            continue                             # 开盘大跌不买，顺延下一只
                     elif dd["h"][j] == dd["l"][j] and dd["o"][j] >= lim_up:
                         continue
                     buy_px = dd["o"][j] * (1 + slip_auc + (real["slip_bj"] if code.startswith("bj") else 0)) if real else dd["o"][j]
