@@ -1177,6 +1177,43 @@ def sz_market_action(show_days: int = 15, datalen: int = 120) -> pd.DataFrame:
     return states
 
 
+def weekly_screener_mail_part(latest_date) -> tuple:
+    """
+    每周最后一个交易日（下一交易日是新的一周，通常周五）发邮件时，附上 stock_screener 的周线选股结果，
+    正文标明运行日期、周线数据日期、命中数、拉取失败数。返回 (正文行列表, 附件路径或 None)。
+    """
+    nxt = pd.Timestamp(_next_trading_day(latest_date))
+    if nxt.to_period("W-FRI") == pd.Timestamp(latest_date).to_period("W-FRI"):
+        return [], None
+    import json
+    from stock_screener import WEEKLY_RUN_INFO
+    try:
+        with open(WEEKLY_RUN_INFO, encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        return ["⚠ 没找到周线选股运行记录（stock_result/weekly_run_info.json），本周周线结果未附上"], None
+    week = pd.Timestamp(latest_date).to_period("W-FRI")
+    if not info.get("data_date") or pd.Timestamp(info["data_date"]).to_period("W-FRI") != week:
+        return [f"⚠ 周线选股结果的数据日期 {info.get('data_date') or '未知'} 不是本周（{latest_date}），未附上，请检查周线选股"], None
+    n_pool = 0
+    try:
+        w = pd.read_csv(WEEKLY_SIGNALS_FILE, encoding="utf-8-sig")
+        w = w[pd.to_datetime(w["信号周"]).dt.to_period("W-FRI") == week]
+        n_pool = int(w["信号类型"].astype(str).str.startswith(WEEKLY_POOL_SIGNALS).sum())
+    except Exception:
+        pass
+    f = info.get("result_file")
+    lines = [f"▶ 周线选股：运行于 {info['run_time']}，周线数据日期 {info['data_date']}；"
+             f"全市场 {info['total']} 只（最新 {info['fresh']} / 落后(停牌等) {info['lag']} / 无数据 {len(info.get('missing', []))}），"
+             f"命中 {info['hits']} 只，其中进股票池信号(W2/W3/买点2) {n_pool} 只"
+             + (f"（附件 {os.path.basename(f)}）" if f else "")]
+    bad = info.get("scan_failed") or info.get("missing")
+    if bad:
+        lines.append(f"  ⚠ 有 {len(bad)} 只周线拉取失败未参与扫描：{', '.join(bad[:15])}{' ...' if len(bad) > 15 else ''}，"
+                     f"可手动重跑 python stock_screener.py 补齐后再跑 main")
+    return lines, (f if f and os.path.exists(f) else None)
+
+
 def send_mail_advice(summary: list, file_dirs: list):
     """发送操作建议邮件：标题=操作建议，正文=大盘下一日建议，附件=股票池csv"""
     import yagmail
@@ -1238,9 +1275,15 @@ def main():
         summary = [f"[大盘仓位] 获取失败：{type(e).__name__}: {e}"]
         _log(summary[0])
     market, market_raw, daily_sig = None, None, None
+    weekly_file = None
     try:
         market_raw = _sina_load_market()
         summary += run_weekly_screener_if_needed(market_raw[0])
+        try:
+            wk_lines, weekly_file = weekly_screener_mail_part(market_raw[0])
+            summary += wk_lines
+        except Exception as e:
+            _log(f"[周线结果附件] 失败：{type(e).__name__}: {e}")
         market = _sina_qfq_market(market_raw)            # 日线选股/RPS/10日排名/股票池都用前复权，同回测
         daily_sig = screen_new_high_breakout_sina(market=market)
     except Exception as e:
@@ -1271,7 +1314,7 @@ def main():
             summary = summary + ["", err]
     # 服务器定时任务跑时发邮件（本地不发）
     if "houjie-" not in socket.gethostname():
-        send_mail_advice(summary, [f for f in (pool_file, hold_file, hist_file) if f])
+        send_mail_advice(summary, [f for f in (pool_file, hold_file, hist_file, weekly_file) if f])
     _log("运行结束")
 
 

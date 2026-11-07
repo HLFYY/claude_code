@@ -139,8 +139,76 @@ def _ensure_login():
     if not _bs_logged:
         if BS_USE_PROXY:
             _use_bs_proxy()
-        _bs_global.login()
+        lg = _bs_global.login()
+        if lg is None or lg.error_code != "0":
+            raise BsFetchError(f"baostock 登录失败：{getattr(lg, 'error_code', None)} {getattr(lg, 'error_msg', '')}")
         _bs_logged = True
+
+
+# ─────────────────────────────────────────────
+#  网络重试：baostock 长时间运行会断连（Broken pipe / Connection reset / 接收数据异常），
+#  断开后旧 socket 不会自己恢复，必须重新 login 建新连接。
+# ─────────────────────────────────────────────
+class BsFetchError(Exception):
+    """baostock 重试后仍拉取失败（区别于"拉取成功但无数据"）"""
+
+
+BS_RETRY_WAITS   = (2, 5, 15, 30)   # 每次失败后等待秒数，次数 = 重试次数
+BS_DOWN_AFTER    = 20               # 连续这么多只都失败 → 认为接口暂时不可用，本轮剩下的直接记失败，扫完后统一补拉
+_fetch_failed    = set()            # 本轮网络拉取失败的代码（扫完后补拉）
+_bs_consec_fail  = 0
+_bs_down         = False
+
+
+def _bs_relogin():
+    global _bs_logged
+    try:
+        _bs_global.logout()
+    except Exception:
+        pass
+    _bs_logged = False
+    _ensure_login()
+
+
+def _bs_reset_down():
+    global _bs_consec_fail, _bs_down
+    _bs_consec_fail, _bs_down = 0, False
+
+
+def _bs_query(code: str, fields: str, start_date: str, frequency: str) -> pd.DataFrame:
+    """
+    带重试的 baostock K 线查询（必须在 _bs_lock 内调用）。
+    成功返回 DataFrame（可能为空=确实无数据）；接口报错/断线 → 重登重试，全部失败抛 BsFetchError。
+    """
+    global _bs_consec_fail, _bs_down
+    if _bs_down:
+        raise BsFetchError(f"{code} 接口暂不可用，稍后补拉")
+    last = ""
+    for wait in (0,) + BS_RETRY_WAITS:
+        if wait:
+            time.sleep(wait)
+            try:
+                _bs_relogin()
+            except Exception as e:
+                last = repr(e)
+                continue
+        try:
+            _ensure_login()
+            time.sleep(CFG["request_delay"])
+            rs = _bs_global.query_history_k_data_plus(code, fields, start_date=start_date,
+                                                      frequency=frequency, adjustflag="2")
+            if rs.error_code == "0":
+                df = rs.get_data()
+                _bs_consec_fail = 0
+                return df if df is not None else pd.DataFrame()
+            last = f"{rs.error_code} {rs.error_msg}"
+        except Exception as e:
+            last = repr(e)
+    _bs_consec_fail += 1
+    if _bs_consec_fail >= BS_DOWN_AFTER and not _bs_down:
+        _bs_down = True
+        tqdm.write(f"⚠ baostock 连续 {_bs_consec_fail} 只拉取失败，暂停网络请求，扫完后统一补拉（最后错误：{last}）")
+    raise BsFetchError(f"{code} {frequency} 重试 {len(BS_RETRY_WAITS)} 次仍失败：{last}")
 
 
 # ─────────────────────────────────────────────
@@ -187,21 +255,9 @@ def _parse_raw(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _bs_fetch(code: str, start_date: str) -> Optional[pd.DataFrame]:
-    """调用 baostock 接口（必须在 _bs_lock 内调用）"""
-    try:
-        _ensure_login()
-        time.sleep(CFG["request_delay"])
-        rs = _bs_global.query_history_k_data_plus(
-            code,
-            "date,open,high,low,close,volume,amount,turn",
-            start_date=start_date,
-            frequency="w",
-            adjustflag="2",
-        )
-        df = rs.get_data()
-        return _parse_raw(df) if (df is not None and not df.empty) else None
-    except Exception:
-        return None
+    """调用 baostock 周线接口（必须在 _bs_lock 内调用）；无数据返回 None，网络失败抛 BsFetchError"""
+    df = _bs_query(code, "date,open,high,low,close,volume,amount,turn", start_date, "w")
+    return _parse_raw(df) if not df.empty else None
 
 
 def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
@@ -251,7 +307,11 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
             # ── 第一步：轻量探测，只问"最后一天之后"有没有新数据 ──
             last_date    = cached["date"].iloc[-1]
             probe_start  = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            probe_df     = _bs_fetch(code, probe_start)
+            try:
+                probe_df = _bs_fetch(code, probe_start)
+            except BsFetchError:
+                _fetch_failed.add(code)     # 网络失败≠无新数据：不计入"连续无新数据"，先用旧缓存，扫完补拉
+                return cached
 
             if probe_df is None or probe_df.empty:
                 # 确实没有新数据，沿用旧缓存，不做全量下载
@@ -263,7 +323,10 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                 return cached
 
             # ── 第二步：确认有新数据，做全量历史重新拉取并整体覆盖 ──
-            df = _bs_fetch(code, CFG["start_date"])
+            try:
+                df = _bs_fetch(code, CFG["start_date"])
+            except BsFetchError:
+                df = None
             if df is not None and not df.empty:
                 with open(path, "wb") as f:
                     pickle.dump(df, f)
@@ -288,7 +351,11 @@ def fetch_weekly(code: str) -> Optional[pd.DataFrame]:
                 return merged
         else:
             # ── 全量模式：首次下载 ──
-            df = _bs_fetch(code, CFG["start_date"])
+            try:
+                df = _bs_fetch(code, CFG["start_date"])
+            except BsFetchError:
+                _fetch_failed.add(code)
+                return None
             if df is None:
                 return None
             with open(path, "wb") as f:
@@ -322,17 +389,12 @@ def fetch_daily_recent(code: str, n: int = 30, is_new: bool = False) -> Optional
             if cached is not None and not cached.empty:
                 return cached
         try:
-            _ensure_login()
-            time.sleep(CFG["request_delay"])
-            rs = _bs_global.query_history_k_data_plus(
-                code,
-                "date,open,high,low,close,volume,turn",
-                start_date=start,
-                frequency="d",
-                adjustflag="2",
-            )
-            df = rs.get_data()
-            if df is None or df.empty:
+            df = _bs_query(code, "date,open,high,low,close,volume,turn", start, "d")
+        except BsFetchError:
+            _fetch_failed.add(code)
+            return None
+        try:
+            if df.empty:
                 return None
             df = _parse_raw(df).tail(n).reset_index(drop=True)
             with open(path, "wb") as f:
@@ -344,9 +406,23 @@ def fetch_daily_recent(code: str, n: int = 30, is_new: bool = False) -> Optional
 
 def get_stock_list() -> pd.DataFrame:
     """获取全部A股列表（sh.6xxx / sz.0xxx / sz.3xxx）"""
-    _ensure_login()
-    rs = _bs_global.query_stock_basic()
-    df = rs.get_data()
+    df, last = None, ""
+    for wait in (0,) + BS_RETRY_WAITS:
+        try:
+            if wait:
+                time.sleep(wait)
+                _bs_relogin()
+            _ensure_login()
+            rs = _bs_global.query_stock_basic()
+            if rs.error_code == "0":
+                df = rs.get_data()
+                if df is not None and not df.empty:
+                    break
+            last = f"{rs.error_code} {rs.error_msg}"
+        except Exception as e:
+            last = repr(e)
+    if df is None or df.empty:
+        raise BsFetchError(f"获取A股列表失败：{last}")
 
     df = df[(df["type"] == "1") & (df["status"] == "1")]
     df = df[df["code"].str.match(r"^(sh\.6|sz\.0|sz\.3)")]
@@ -765,7 +841,7 @@ def _daily_cache_is_fresh(path: str, is_new: bool) -> bool:
             cached = pickle.load(f)
         if cached is not None and not cached.empty and "date" in cached.columns:
             last_data_date = pd.to_datetime(cached["date"].iloc[-1]).date()
-            if (last_data_date >= _last_friday() and not is_new) or last_data_date == time.strftime('%Y-%m-%d'):
+            if (last_data_date >= _last_friday() and not is_new) or last_data_date == date.today():
                 return True
             # 数据日期早于最近周五 → 需要补拉，直接返回 False，无需再查文件时间
             return False
@@ -805,6 +881,33 @@ def _fetch_daily_for_rps(code: str, force: bool = False) -> None:
 
     fetch_daily_recent(code, n=need_rows)
 
+def _retry_failed(label: str, fn, rounds: int = 3, wait: int = 60) -> list:
+    """
+    对本轮 _fetch_failed 里的代码串行补拉：每轮先等 wait 秒、重登 baostock，再逐只调用 fn(code)。
+    返回补拉后仍失败的代码列表。
+    """
+    for rnd in range(1, rounds + 1):
+        if not _fetch_failed:
+            return []
+        codes = sorted(_fetch_failed)
+        _fetch_failed.clear()
+        print(f"{label}：第 {rnd}/{rounds} 轮补拉 {len(codes)} 只网络失败的股票（先等 {wait}s 重连）...")
+        time.sleep(wait)
+        with _bs_lock:
+            _bs_reset_down()
+            try:
+                _bs_relogin()
+            except Exception as e:
+                print(f"  重登失败：{e!r}")
+        for code in tqdm(codes, desc=f"{label}补拉", unit="只"):
+            try:
+                fn(code)
+            except Exception:
+                _fetch_failed.add(code)
+        print(f"  本轮补拉成功 {len(codes) - len(_fetch_failed)} 只，仍失败 {len(_fetch_failed)} 只")
+    return sorted(_fetch_failed)
+
+
 def collect_market_gains(rows: list):
     """
     1. 多线程为全市场补拉日线（有新鲜缓存则跳过，无缓存则拉取）
@@ -827,6 +930,9 @@ def collect_market_gains(rows: list):
                         fut.result(timeout=30)
                     except Exception:
                         pass
+        still = _retry_failed("RPS日线", lambda c: _fetch_daily_for_rps(c, force=True))
+        if still:
+            print(f"⚠ RPS日线仍有 {len(still)} 只拉取失败（不参与RPS排名）：{still[:30]}{' ...' if len(still) > 30 else ''}")
 
     # ── Step2：读取缓存，计算涨幅 ──
     gains = {}
@@ -1115,7 +1221,7 @@ def save_weekly_signals(results: list):
 
 def save_results(results: list, total_stocks: int, fname_prefix: str = "result", require_signal_type: bool = True):
     if not results:
-        return
+        return None
     df = pd.DataFrame(results)
 
     df["level"] = df.apply(lambda row: _calc_level(row, require_signal_type=require_signal_type), axis=1)
@@ -1135,6 +1241,42 @@ def save_results(results: list, total_stocks: int, fname_prefix: str = "result",
     with open(fname, "w", encoding="utf-8-sig", newline="") as f:
         df.to_csv(f, index=False)
     print(f"结果已保存: {fname}")
+    return fname
+
+
+def _weekly_date_check(rows: list) -> dict:
+    """
+    周线数据日期检测：统计全市场周线缓存的最新日期分布。
+    以最多股票的日期为"本次周线数据日期"，落后的多为停牌；没缓存的是拉取失败/新股。
+    """
+    from collections import Counter
+    dates, missing = {}, []
+    for code, name in rows:
+        p = _cache_path(code)
+        try:
+            with open(p, "rb") as f:
+                dates[code] = pd.to_datetime(pickle.load(f)["date"].iloc[-1]).date()
+        except Exception:
+            missing.append(code)
+    cnt = Counter(dates.values())
+    data_date = cnt.most_common(1)[0][0] if cnt else None
+    lag = sorted(c for c, d in dates.items() if data_date and d < data_date)
+    print(f"\n周线数据日期检测：{len(rows)} 只中 {cnt.get(data_date, 0)} 只为 {data_date}，"
+          f"落后 {len(lag)} 只（多为停牌），无缓存 {len(missing)} 只")
+    if lag:
+        print(f"  落后：{[(c, str(dates[c])) for c in lag[:20]]}{' ...' if len(lag) > 20 else ''}")
+    if missing:
+        print(f"  ⚠ 无缓存（拉取失败，未参与扫描）：{missing[:30]}{' ...' if len(missing) > 30 else ''}")
+    expect = _last_friday()
+    if data_date and (expect - data_date).days >= 7:
+        print(f"  ⚠ 周线数据日期 {data_date} 比最近周五 {expect} 落后一周以上，baostock 可能还没更新本周数据！")
+    return {"data_date": str(data_date) if data_date else "", "fresh": cnt.get(data_date, 0),
+            "lag": len(lag), "missing": missing}
+
+
+WEEKLY_RUN_INFO = "stock_result/weekly_run_info.json"
+
+
 def check_day(d):
     # 判断是否是节假日或节假日前一天
     if d is None:
@@ -1201,6 +1343,21 @@ def main():
                 except Exception:
                     errors += 1
 
+    # ── 网络失败的股票扫完后统一补拉重扫（服务器跑 2 小时以上 baostock 会断连）──
+    names = dict(rows)
+
+    def _rescan(code):
+        res = process_one((code, names.get(code, "")))
+        if code in _fetch_failed:
+            return
+        results[:] = [r for r in results if r["code"] != code]
+        if res:
+            results.append(res)
+
+    scan_failed = _retry_failed("周线扫描", _rescan)
+    _fetch_failed.clear()
+    wk = _weekly_date_check(rows)
+
     # ── 用日线缓存数据日期判断是否需要补拉 ──
     # 抽样检查最多 100 只有日线缓存的股票，
     # 若其中 >= 95% 的数据日期 >= 最近周五，则认为日线全量新鲜，跳过补拉。
@@ -1248,8 +1405,17 @@ def main():
             r["gain10_rank"] = gain10_rank
 
     print_results(results)
-    save_results(results, total)
+    fname = save_results(results, total)
     save_weekly_signals(results)
+    try:
+        import json
+        with open(WEEKLY_RUN_INFO, "w", encoding="utf-8") as f:
+            json.dump({"run_time": datetime.now().strftime("%Y-%m-%d %H:%M"), "result_file": fname,
+                       "data_date": wk["data_date"], "total": total, "fresh": wk["fresh"], "lag": wk["lag"],
+                       "missing": wk["missing"], "scan_failed": scan_failed, "hits": len(results),
+                       "rps_stocks": len(_market_gains)}, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print(f"写 {WEEKLY_RUN_INFO} 失败：{e!r}")
 
 
 

@@ -231,7 +231,8 @@ def market_levels(idx: pd.DataFrame, fractal_mode: str = FRACTAL_MODE) -> pd.Dat
 
 
 def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", confirm_rule="k3c",
-                     weak_line="k3c", first_lv=0.4, strong=None, top_reduce=None) -> pd.DataFrame:
+                     weak_line="k3c", first_lv=0.4, strong=None, top_reduce=None, tail_clear=None, watch_ma=None,
+                     top_no_new=False, top_need_high=None, top_min_days=None) -> pd.DataFrame:
     """
     10日线规则 + 分型确认版（分型：3根K线，不做包含；第3根收盘确认）
       底分型（10日线下）：bottom_confirm=True 时，第3根确认后次日收盘 >= 第3根收盘 → 再次日开盘4层；
@@ -255,6 +256,13 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
       strong=(涨幅阈值, 仓位)：开仓信号当天指数涨幅 > 阈值时首日改用该仓位，如 (0.03, 0.7)
       top_reduce：仅 top_mode=confirm。None=确认后第三日开盘清仓（实盘）；数值 x=确认当天尾盘降到 x 仓（0=尾盘清仓），
                   之后保持 ≤x，收盘突破顶点 → 按10日线规则恢复满仓，跌破10日线 → 清仓（输出 tail_level 列）
+      tail_clear：清仓信号当天尾盘就清（可卖的尾盘卖，当天买的次日开盘卖）：None=全部次日开盘清（实盘）/
+                  "ma10"=只有收盘跌破10日线这一种 / "all"=所有清仓信号（10日线、底分型弱势线、顶分型确认）
+      watch_ma：如 8。10日线规则持仓中收盘跌破10日线、但收盘 ≥ watch_ma 日线 → 次日不清、不开新仓（观察）；
+                次日收盘回到10日线上 → 恢复正常，否则次日尾盘清（输出 no_new 列）。None=不观察（实盘）
+      top_no_new：顶分型出现后的确认日不开新仓（默认照常开）
+      top_need_high：顶分型中间K最高须是近 N 日最高才算（"在顶部"），None=不限（实盘）
+      top_min_days：本轮开仓已持有 ≥ N 天才看顶分型，None=不限（实盘）
       weak_line：底分型持仓后的弱势线（收盘跌破清仓、收盘站上加满）k3c=第3根收盘；k3body=第3根实体顶部
     """
     c, h, l, o = idx["close"].values, idx["high"].values, idx["low"].values, idx["open"].values
@@ -264,6 +272,9 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
     n = len(idx)
     level_open, clear_open = np.zeros(n), np.zeros(n, bool)
     tail_lv = np.full(n, np.nan)
+    maw = pd.Series(c).rolling(watch_ma).mean().values if watch_ma else None
+    no_new = np.zeros(n, bool)
+    watching = False        # watch_ma：跌破10日线未破 watch_ma 线的观察日
     bottom_f, top_f = np.zeros(n, bool), np.zeros(n, bool)
     lv, frac_mode, k3_close = 0.0, False, 0.0
     pending = None          # 已出底分型、等待次日收盘确认的弱势线
@@ -284,12 +295,23 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
         bottom_f[t], top_f[t] = bottom, top
         above = c[t] >= ma10[t]
 
-        def clear_all():
+        def clear_all(why="other"):
             nonlocal lv, frac_mode, pending
             if lv > 0:
                 clear_open[t + 1] = True
+                if tail_clear == "all" or (tail_clear == "ma10" and why == "ma10"):
+                    tail_lv[t] = 0.0
             lv, frac_mode, pending = 0.0, False, None
 
+        # watch_ma 观察日收盘：回到10日线上 → 正常；否则尾盘清
+        if watching:
+            watching = False
+            if not above and lv > 0:
+                clear_all("watch")
+                tail_lv[t] = 0.0
+                level_open[t + 1] = 0.0
+                need_cross = False
+                continue
         # 顶分型：confirm 模式的次日确认
         if top_pending is not None:
             ref, hi = top_pending
@@ -306,11 +328,21 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
                 level_open[t + 1] = lv
                 continue
         # 顶分型：新出现（持仓或等待底分型确认时）
+        if top and top_need_high and h[t - 1] < h[max(0, t - top_need_high + 1):t + 1].max():
+            top = False                   # 中间K不是近 N 日最高：不在顶部，不算
+        if top and top_min_days:
+            k = t
+            while k >= 0 and level_open[k] > 0:
+                k -= 1
+            if t - k < top_min_days:
+                top = False               # 刚开仓没几天：不算
         if top_mode != "off" and top and (lv > 0 or pending is not None):
             if top_mode == "confirm":
                 pending = None
                 if lv > 0:
                     top_pending = (c[t], h[t - 1])
+                    if top_no_new:
+                        no_new[t + 1] = True      # 确认日不开新仓
             else:
                 clear_all()
                 need_cross = top_mode == "cross"
@@ -352,16 +384,19 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
         elif bottom and (not above or need_cross):
             if bottom_confirm:
                 if not above:
-                    clear_all()           # 线下：先按铁律清（若有仓），等确认再开
+                    clear_all("ma10")     # 线下：先按铁律清（若有仓），等确认再开
                 pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
             else:                         # 同 market_levels(break_k3c)：不清，直接进入底分型持仓
                 lv = entry(t) if lv == 0 else (1.0 if c[t] > c[t - 1] else lv)
                 frac_mode, k3_close, need_cross = True, c[t], False
+        elif not above and watch_ma and lv > 0 and c[t] >= maw[t]:
+            watching = True               # 跌破10日线但没破 watch_ma 线：次日观察，不清不开新仓
+            no_new[t + 1] = True
         elif not above:
-            clear_all()
+            clear_all("ma10")
             need_cross = False            # 已跌破，下一次站上即重新触发
         level_open[t + 1] = lv
-    return pd.DataFrame({"date": idx["date"], "level": level_open, "clear": clear_open, "tail_level": tail_lv,
+    return pd.DataFrame({"date": idx["date"], "level": level_open, "clear": clear_open, "tail_level": tail_lv, "no_new": no_new,
                          "fractal": bottom_f, "top": top_f, "below": c < ma10})
 
 
@@ -453,7 +488,7 @@ def _limit_pct(code: str) -> float:
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
                   pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
                   grid_atr="prev", grid_geo=False, front_sig=None, front_days=None, front_by=(["vol_ratio"], [False]),
-                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS, open_down=None, skip_buy=None):
+                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS, open_down=None, skip_buy=None, weak_cond="and", mon_open=None):
     """
     buy_day_exempt：买入当天涨幅（收盘/昨收-1）> 该值时，当天触发的止损/走弱都不算（不在次日开盘卖）；None=不豁免（实盘）
     friday：周五开新仓 all=正常开（实盘，2026-11-05 起）/ no=不开（之前的规则）/ daily_only=只开日线票（周线票已是上周五信号的第5天）
@@ -465,6 +500,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
           open_above  开盘价 ≥ 止损价时才看（开盘就在止损价下方买入的，当天不算止损）
     freeze_mkt：大盘清仓 / 顶分型尾盘降仓卖出的资金也冻结到下周一（默认不冻结）
     mkt 带 tail_level 列（market_levels_v2 的 top_reduce）时：当天尾盘把持仓市值降到 总资产×tail_level，按浮盈低→高整只卖出（当天买的 T+1 不卖）
+    weak_cond：不算走弱的条件：and=创新高且收涨（实盘，少一项就走弱）/ or=两项满足一项即可 / close=只看收涨 / high=只看创新高
+    mon_open：每周第一个交易日开盘卖出的资金：None=冻结到下周一（实盘）/ "same"=上周触发的（顺延开盘卖）当天可用 /
+              "next"=上周触发的次日可用 / "all_same"=周一所有开盘卖出（含开盘止损）当天可用
     skip_buy：{(日期, 代码)} 实盘手动跳过没买的票（前向跟踪同步实盘用），当天不买、顺延下一只
     open_down：新开票开盘大跌就跳过、顺延买下一只：None=不跳过（实盘）/ "limit"=开盘跌停 / 0.09 等=开盘跌幅 > 9%
     weak_days：走弱判断覆盖持有前几天（含买入日，None=整个持仓期），实盘 3（2026-11-05 由 2 改 3）
@@ -491,6 +529,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     dates = list(mkt["date"])
     level = mkt["level"].values
     clear = mkt["clear"].values
+    no_new = mkt["no_new"].values if "no_new" in mkt else np.zeros(len(mkt), bool)
     tail_level = mkt["tail_level"].values if "tail_level" in mkt else None
     mkt_bucket = "frozen" if freeze_mkt else "cash"
     week_id = pd.Series(dates).dt.to_period("W-FRI").values
@@ -568,6 +607,10 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
         j = dd["pos"].get(dates[i])
         return None if j is None else dd[field][j]
 
+    def is_weak(dd, j):
+        up_h, up_c = dd["h"][j] > dd["h"][j - 1], dd["c"][j] > dd["c"][j - 1]
+        return not {"and": up_h and up_c, "or": up_h or up_c, "close": up_c, "high": up_h}[weak_cond]
+
     def close_pos(p, i, price, reason, bucket, slip=0.0):
         nonlocal cash, frozen, pending_grid
         left0 = p.left                                   # 规则退出（非网格）的剩余份额
@@ -575,7 +618,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             price *= 1 - slip - (real["slip_bj"] if p.code.startswith("bj") else 0)
         val = sell_net(p.left * p.shares0 * price, i) if p.left > 1e-12 else 0.0
         p.cost += val
-        if bucket == "frozen":
+        if bucket == "next":
+            pending_grid += val
+        elif bucket == "frozen":
             frozen += val
             if freeze_days is not None:
                 frozen_q.append((i + freeze_days + 1, val))
@@ -647,13 +692,16 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             if p.pending:                  # T+1 / 顺延：该卖未卖的，今天开盘卖
                 if locked_down(p.code, j):
                     continue
-                close_pos(p, i, dd["o"][j], p.pending, mkt_bucket if p.pending.startswith("大盘") else "frozen",
-                          slip_auc if real else 0); continue
+                bk = mkt_bucket if p.pending.startswith("大盘") else "frozen"
+                if new_week and bk == "frozen" and mon_open:
+                    bk = "next" if mon_open == "next" else "cash"     # 上周触发、本周一开盘卖：算上周的钱
+                close_pos(p, i, dd["o"][j], p.pending, bk, slip_auc if real else 0); continue
             stop = max(dd["ma5"][j - 1] * 0.99, dd["l"][j - 1] * 0.99)
             if dd["o"][j] <= stop:
                 if locked_down(p.code, j):
                     p.pending = "止损(跌停顺延)"; continue
-                close_pos(p, i, dd["o"][j], "止损(开盘)", "frozen", slip_auc if real else 0); continue
+                close_pos(p, i, dd["o"][j], "止损(开盘)", "cash" if new_week and mon_open == "all_same" else "frozen",
+                          slip_auc if real else 0); continue
             while p.sold < GRID_PARTS and dd["o"][j] >= p.levels[p.sold]:
                 grid_sell(p, dd["o"][j], i, slip_auc if real else 0)
             if p.left <= 1e-9:
@@ -662,7 +710,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
 
         # 3. 开新仓
         wd = pd.Timestamp(day).weekday()
-        if level[i] > 0 and not clear[i] and (wd != 4 or friday != "no"):
+        if level[i] > 0 and not clear[i] and not no_new[i] and (wd != 4 or friday != "no"):
             pool = get_pool(i)
             if wd == 4 and friday == "daily_only" and pool is not None and "pool" in pool:
                 pool = pool[pool["pool"] == "daily"]
@@ -746,7 +794,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                 continue
             stop = max(dd["ma5"][j - 1] * 0.99, dd["l"][j - 1] * 0.99)
             if t1 and i == p.buy_i:        # T+1：买入当天不卖，触及止损/走弱则次日开盘卖，网格不成交
-                p.weak1 = not (dd["h"][j] > dd["h"][j - 1] and dd["c"][j] > dd["c"][j - 1])
+                p.weak1 = is_weak(dd, j)
                 if buy_day_exempt is not None and dd["c"][j] / dd["c"][j - 1] - 1 > buy_day_exempt:
                     p.weak1 = False
                     continue
@@ -764,7 +812,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             if p.left <= 1e-9:
                 close_pos(p, i, 0, "网格卖完", "cash"); continue
             held_days = sum(1 for k in range(p.buy_i, i + 1) if dd["pos"].get(dates[k]) is not None)
-            weak = not (dd["h"][j] > dd["h"][j - 1] and dd["c"][j] > dd["c"][j - 1])
+            weak = is_weak(dd, j)
             w1 = getattr(p, "weak1", False)
             sell_weak = {"open": weak, "day2only": weak, "tail2": weak or w1, "both": weak and w1, "off": False}[weak_mode]
             if sell_weak and exempt_day2 and buy_day_exempt is not None and dd["c"][j] / dd["c"][j - 1] - 1 > buy_day_exempt:
@@ -794,7 +842,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                 if mv <= target + 1e-9:
                     break
                 mv -= vals[id(p)]
-                close_pos(p, i, daily[p.code]["c"][j], "顶分型尾盘降仓", mkt_bucket, slip_close if real else 0)
+                close_pos(p, i, daily[p.code]["c"][j], "大盘尾盘降仓" if tail_level[i] > 0 else "大盘尾盘清仓(尾盘降仓)", mkt_bucket, slip_close if real else 0)
             positions = [p for p in positions if p.left > 1e-9]
 
         # 5. 估值
