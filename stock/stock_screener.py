@@ -122,27 +122,53 @@ _market_gains_lock = threading.Lock()
 BS_USE_PROXY = "houjie-" in socket.gethostname()
 
 
-def _use_bs_proxy():
+def _bs_routes() -> list:
+    """baostock 连接线路：None=直连，dict=SOCKS5 代理。本地先走代理再直连，服务器先直连再代理"""
+    try:
+        from proxy_bs import PROXIES
+    except Exception:
+        PROXIES = []
+    return list(PROXIES) + [None] if BS_USE_PROXY else [None] + list(PROXIES)
+
+
+_bs_route_i = 0                       # 当前用第几条线路；登录被拉黑(10001011)时自动换下一条
+
+
+def _set_bs_route(px):
     """只替换 baostock 内部建连接用的 socket（其他请求如新浪不受影响）"""
     import types
-    import socks
     import baostock.util.socketutil as bs_sock
-    from proxy_bs import PROXIES
-    px = PROXIES[0]
-    socks.set_default_proxy(socks.SOCKS5, px["host"], px["port"], username=px["user"], password=px["pwd"])
-    bs_sock.socket = types.SimpleNamespace(socket=socks.socksocket, AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM)
+    if px is None:
+        bs_sock.socket = socket
+        print("baostock 直连")
+        return
+    import socks
+
+    class ProxiedSocket(socks.socksocket):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.set_proxy(socks.SOCKS5, px["host"], px["port"], username=px["user"], password=px["pwd"])
+
+    bs_sock.socket = types.SimpleNamespace(socket=ProxiedSocket, AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM)
     print(f"baostock 走代理 {px['host']}:{px['port']}")
 
 
 def _ensure_login():
-    global _bs_logged
-    if not _bs_logged:
-        if BS_USE_PROXY:
-            _use_bs_proxy()
+    global _bs_logged, _bs_route_i
+    if _bs_logged:
+        return
+    routes = _bs_routes()
+    msg = ""
+    for k in range(len(routes)):
+        i = (_bs_route_i + k) % len(routes)
+        _set_bs_route(routes[i])
         lg = _bs_global.login()
-        if lg is None or lg.error_code != "0":
-            raise BsFetchError(f"baostock 登录失败：{getattr(lg, 'error_code', None)} {getattr(lg, 'error_msg', '')}")
-        _bs_logged = True
+        if lg is not None and lg.error_code == "0":
+            _bs_route_i, _bs_logged = i, True
+            return
+        msg = f"{getattr(lg, 'error_code', None)} {getattr(lg, 'error_msg', '')}"
+        print(f"  该线路登录失败（{msg}），换下一条线路")            # 10001011=该出口 IP 被拉黑；网络错误也换线路
+    raise BsFetchError(f"baostock 登录失败：{msg}")
 
 
 # ─────────────────────────────────────────────
@@ -1496,7 +1522,7 @@ if __name__ == "__main__":
     # 周五5点半后出当前周数据
     main()
     # check_recent_100d_high(day=2)
-    # 当日5点半后更新日线
+    # 当日5点半后更新日线、】【‘
     # for code in 'sz.300985,sz.301045,sh.603663,sz.002768,sz.301196,sh.600226,sh.603256,sz.002388,sz.300684,sh.603679,sh.603151,sh.603979'.split(','):
     # for code in 'sh.601169'.split(','):
     #     daily = fetch_daily_recent(code, n=max(CFG["rps_days"] + 10, 30), is_new=True)

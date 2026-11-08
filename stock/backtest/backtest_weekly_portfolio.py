@@ -488,7 +488,7 @@ def _limit_pct(code: str) -> float:
 def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=True, priority="评分高→低(默认)",
                   pool_mode="weekly", t1=True, real=None, hold_rule="last", rank_daily=None,
                   grid_atr="prev", grid_geo=False, front_sig=None, front_days=None, front_by=(["vol_ratio"], [False]),
-                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS, open_down=None, skip_buy=None, weak_cond="and", mon_open=None):
+                  weak_mode="open", freeze_mkt=False, buy_day_stop="on", buy_day_exempt=None, exempt_day2=False, min_step=None, friday="all", weak_days=WEAK_DAYS, open_down=None, skip_buy=None, weak_cond="and", mon_open=None, freeze_mon=False, freeze_rule=None):
     """
     buy_day_exempt：买入当天涨幅（收盘/昨收-1）> 该值时，当天触发的止损/走弱都不算（不在次日开盘卖）；None=不豁免（实盘）
     friday：周五开新仓 all=正常开（实盘，2026-11-05 起）/ no=不开（之前的规则）/ daily_only=只开日线票（周线票已是上周五信号的第5天）
@@ -503,6 +503,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     weak_cond：不算走弱的条件：and=创新高且收涨（实盘，少一项就走弱）/ or=两项满足一项即可 / close=只看收涨 / high=只看创新高
     mon_open：每周第一个交易日开盘卖出的资金：None=冻结到下周一（实盘）/ "same"=上周触发的（顺延开盘卖）当天可用 /
               "next"=上周触发的次日可用 / "all_same"=周一所有开盘卖出（含开盘止损）当天可用
+    freeze_mon：use_freeze=N 时，每周第一个交易日把冻结资金全部解冻（不管是否满 N 天）
+    freeze_rule："mkt"=卖出次日冻结，第3个交易日看次日深证综指：收涨且收红（收盘>昨收 且 收盘>开盘）就解冻，否则冻结到下周一
+                （mkt 需带 idx_up_red 列；None=按 use_freeze）
     skip_buy：{(日期, 代码)} 实盘手动跳过没买的票（前向跟踪同步实盘用），当天不买、顺延下一只
     open_down：新开票开盘大跌就跳过、顺延买下一只：None=不跳过（实盘）/ "limit"=开盘跌停 / 0.09 等=开盘跌幅 > 9%
     weak_days：走弱判断覆盖持有前几天（含买入日，None=整个持仓期），实盘 3（2026-11-05 由 2 改 3）
@@ -597,6 +600,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
     frozen = 0.0                        # 冻结中的资金合计（use_freeze=True 下周一可用；=N 卖出后第N+1个交易日开盘可用）
     frozen_q = []                       # use_freeze=N 时的 [(可用日序号, 金额)]
     freeze_days = use_freeze if type(use_freeze) is int else None
+    idx_up_red = mkt["idx_up_red"].values if freeze_rule == "mkt" else None
+    mkt_q = []                          # freeze_rule="mkt" 时的 [(卖出日序号, 金额)]
     positions: list = []
     trades, equity_curve = [], []
     traded_this_pool = set()
@@ -622,7 +627,9 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             pending_grid += val
         elif bucket == "frozen":
             frozen += val
-            if freeze_days is not None:
+            if freeze_rule == "mkt":
+                mkt_q.append((i, val))
+            elif freeze_days is not None:
                 frozen_q.append((i + freeze_days + 1, val))
         else:
             cash += val
@@ -657,7 +664,18 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             equity_curve.append(1.0)
             continue
         new_week = week_id[i] != week_id[i - 1]
-        if freeze_days is not None:
+        if freeze_rule == "mkt":
+            if new_week:
+                mkt_q = []
+                cash += frozen; frozen = 0.0
+            else:
+                ready = sum(v for k, v in mkt_q if k == i - 2 and idx_up_red[i - 1])
+                mkt_q = [(k, v) for k, v in mkt_q if k > i - 2]
+                cash += ready; frozen -= ready
+        elif freeze_days is not None and freeze_mon and new_week:
+            frozen_q = []
+            cash += frozen; frozen = 0.0
+        elif freeze_days is not None:
             ready = sum(v for k, v in frozen_q if k <= i)
             frozen_q = [(k, v) for k, v in frozen_q if k > i]
             cash += ready; frozen -= ready
@@ -720,7 +738,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
             used_layers = sum(p.left * p.shares0 * p.buy_px for p in positions) / layer_amt if positions else 0
             if pool is not None:
                 for _, s in pool.iterrows():
-                    if used_layers + 1 > level[i] * 10 + 1e-6 or cash < layer_amt * (1 - 1e-6) * (0.9 if real else 1):
+                    if used_layers + 1 > round(level[i] / LAYER, 6) + 1e-6 or cash < layer_amt * (1 - 1e-6) * (0.9 if real else 1):
                         break
                     code = s["code"]
                     if code in held or code in traded_this_pool or code not in daily:
@@ -784,7 +802,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                     positions.append(p)
                     held.add(code); traded_this_pool.add(code)
                     used_layers += 1
-            expo.append((day, used_layers, level[i] * 10))
+            expo.append((day, used_layers, round(level[i] / LAYER, 6)))
 
         # 4. 盘中 + 尾盘
         for p in positions:
