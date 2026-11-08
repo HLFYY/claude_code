@@ -58,3 +58,6 @@ stock/cache_bs_long/
 stock/proxy_bs.py
 # 选股/回测/前向跟踪/股票池等输出 csv（运行生成，本地/服务器各自保留，不提交）
 stock/stock_result/*.csv
+
+# stock 运行结果（股票池/持仓/回测输出等），本地和服务器各自生成，不入库
+stock/stock_result/

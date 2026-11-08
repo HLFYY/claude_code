@@ -46,8 +46,8 @@ def signals_for_stock(args):
     return out
 
 
-def extract_signals(codes, min_consec=1, max_consec=2, max_gain_2d=20):
-    """连续新高天数默认 1~2、近2日涨幅<20%（同实盘），其他参数的信号缓存单独存文件；
+def extract_signals(codes, min_consec=1, max_consec=2, max_gain_2d=40):
+    """连续新高天数默认 1~2、近2日涨幅<40%（同实盘，2026-11-08 由 20% 放宽），其他参数的信号缓存单独存文件；
     max_gain_2d=None 不限近2日涨幅（信号带 gain_2d 列，可事后按任意阈值过滤）"""
     f = SIG_FILE if (min_consec, max_consec, max_gain_2d) == (1, 2, 20) else \
         SIG_FILE.with_name(f"_daily_breakout_signals_c{min_consec}-{max_consec or 'inf'}"

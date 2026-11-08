@@ -241,7 +241,7 @@ def _print_result(code, reason):
 #  100日新高 + 倍量突破 选股（新浪数据源）
 # ─────────────────────────────────────────────
 #  选股条件：
-#   1. 日线收盘新高（近100交易日，不含当日），且连续≥2日新高（今天、昨天都新高），且近2日涨幅 < 20%
+#   1. 日线收盘新高（近100交易日，不含当日），且连续≥2日新高（今天、昨天都新高），且近2日涨幅 < 40%（信号日 2026-11-06 前为 20%）
 #   2. 日线收红（收盘价 > 开盘价 * 1.01），且剔除 收绿/涨幅≤1%/收在中位以下/上影≥实体
 #   3. 突破日成交额 > 前一日往前推5天成交额均值 * 1.5
 #
@@ -259,6 +259,10 @@ _SINA_MAX_WORKERS = 10
 _RPS_DAYS = 120
 _GAIN_RANK_DAYS = 10
 _NEW_HIGH_DAYS = 130
+# 日线"近2日涨幅"上限：2026-11-08 回测由 20% 放宽到 40%（合并池年化 25.8%→28.7%，回撤 −15.6%→−17.3%，见 backtest/backtest_long_run.py）
+# 按信号日切换：信号日 < MAX_GAIN_2D_FROM 仍用旧值，保证前向跟踪里已执行的历史买卖不变（11-06 信号 = 11-09 起买入用新规则）
+MAX_GAIN_2D_OLD, MAX_GAIN_2D = 20, 40
+MAX_GAIN_2D_FROM = "2026-11-06"
 
 
 _SINA_MIN_STOCKS = 4000   # A股约5500只，少于这个数视为列表没拉全
@@ -636,11 +640,12 @@ def _calc_rps_and_rank_sina(code: str, market_gains: dict) -> tuple:
 
 
 def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: dict,
-                         min_consec: int = 1, max_consec=2, max_gain_2d=20) -> dict:
+                         min_consec: int = 1, max_consec=2, max_gain_2d="auto") -> dict:
     """
     检查单只股票是否满足 100日新高+收红+倍量 条件，满足则返回结果字典，否则 None
     min_consec / max_consec：连续新高天数（含当日）的下限 / 上限（None=不限），默认 1~2 即"首日突破或突破第二日"
-    max_gain_2d：近2日涨幅上限%（>= 剔除），None=不限（回测按阈值对比用）
+    max_gain_2d：近2日涨幅上限%（>= 剔除），None=不限（回测按阈值对比用）；
+                "auto"=实盘：信号日 >= MAX_GAIN_2D_FROM 用 MAX_GAIN_2D(40)，之前用 MAX_GAIN_2D_OLD(20)
     """
     if df is None or len(df) < _NEW_HIGH_DAYS + 7:
         return None
@@ -671,7 +676,9 @@ def _check_breakout_sina(code: str, name: str, df: pd.DataFrame, market_gains: d
     if consec < min_consec or (max_consec is not None and consec > max_consec):
         return None
 
-    # 条件1.2：近2日涨幅 < 20%（含当日，对比3个交易日前收盘），过滤已大幅拉升的
+    # 条件1.2：近2日涨幅 < 40%（含当日，对比3个交易日前收盘；信号日 2026-11-06 前为 20%），过滤已大幅拉升的
+    if max_gain_2d == "auto":
+        max_gain_2d = MAX_GAIN_2D if pd.Timestamp(latest_day) >= pd.Timestamp(MAX_GAIN_2D_FROM) else MAX_GAIN_2D_OLD
     close_2d_ago = float(df["close"].iloc[-3])
     if close_2d_ago <= 0:
         return None
@@ -751,7 +758,7 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
     筛选条件：
       1. 新高：收盘价 >= 前100个交易日（不含当日）最高价
       2. 新高天数：连续新高天数在 [min_consec, max_consec] 内，默认至少连续2日（T+1回测下只突破1日的拖后腿）
-      3. 近2日涨幅 < 20%：当日收盘对比3个交易日前收盘，>=20%剔除（过滤连板/已大幅拉升）
+      3. 近2日涨幅 < 40%：当日收盘对比3个交易日前收盘，>=40%剔除（信号日 2026-11-06 前为 20%，见 MAX_GAIN_2D_FROM）
       4. 收红：收盘价 > 开盘价 * 1.01
       5. K线形态，满足任一剔除：
          - 收绿（收盘 < 开盘）
