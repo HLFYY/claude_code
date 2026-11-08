@@ -232,7 +232,7 @@ def market_levels(idx: pd.DataFrame, fractal_mode: str = FRACTAL_MODE) -> pd.Dat
 
 def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", confirm_rule="k3c",
                      weak_line="k3c", first_lv=0.4, strong=None, top_reduce=None, tail_clear=None, watch_ma=None,
-                     top_no_new=False, top_need_high=None, top_min_days=None) -> pd.DataFrame:
+                     top_no_new=False, top_need_high=None, top_min_days=None, ma_n=10) -> pd.DataFrame:
     """
     10日线规则 + 分型确认版（分型：3根K线，不做包含；第3根收盘确认）
       底分型（10日线下）：bottom_confirm=True 时，第3根确认后次日收盘 >= 第3根收盘 → 再次日开盘4层；
@@ -261,6 +261,7 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
       watch_ma：如 8。10日线规则持仓中收盘跌破10日线、但收盘 ≥ watch_ma 日线 → 次日不清、不开新仓（观察）；
                 次日收盘回到10日线上 → 恢复正常，否则次日尾盘清（输出 no_new 列）。None=不观察（实盘）
       top_no_new：顶分型出现后的确认日不开新仓（默认照常开）
+      ma_n：均线天数（默认 10 日线，实盘）；如 8 = 全部规则里的 10 日线换成 8 日线
       top_need_high：顶分型中间K最高须是近 N 日最高才算（"在顶部"），None=不限（实盘）
       top_min_days：本轮开仓已持有 ≥ N 天才看顶分型，None=不限（实盘）
       weak_line：底分型持仓后的弱势线（收盘跌破清仓、收盘站上加满）k3c=第3根收盘；k3body=第3根实体顶部
@@ -268,7 +269,7 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
     c, h, l, o = idx["close"].values, idx["high"].values, idx["low"].values, idx["open"].values
     body_top = np.maximum(o, c)
     wl = body_top if weak_line == "k3body" else c          # 弱势线取值
-    ma10 = pd.Series(c).rolling(10).mean().values
+    ma10 = pd.Series(c).rolling(ma_n).mean().values
     n = len(idx)
     level_open, clear_open = np.zeros(n), np.zeros(n, bool)
     tail_lv = np.full(n, np.nan)
@@ -467,7 +468,8 @@ def add_rank_fields(sig: pd.DataFrame, daily: dict) -> pd.DataFrame:
 # 开盘最大涨幅（None=只跳过开盘涨停；0.06=开盘涨幅>6%就不买）
 # 滑点按成交方式分开：集合竞价（开盘买、开盘卖）和网格限价单按挂单价成交不加；盘中止损条件单 slip_stop；尾盘走弱 slip_close
 REAL_DEFAULT = {"capital": 800_000, "slip_auction": 0.0, "slip_stop": 0.002, "slip_close": 0.001,
-                "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None, "slip_bj": 0.0}   # slip_bj：北交所买入/非网格卖出额外滑点
+                "fee_rate": 0.000135, "min_fee": 0.0, "max_open_gap": None, "slip_bj": 0.0,
+                "gap_before": None}   # slip_bj：北交所买入/非网格卖出额外滑点；gap_before=(日期, 旧值)：该日之前的买入用旧的 max_open_gap（前向跟踪规则切换用）
 
 
 def _atr_pct(dd: dict, j: int, n: int = 14) -> float:
@@ -765,7 +767,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                     if real:
                         if dd["o"][j] >= lim_up:                 # 开盘即涨停，集合竞价买不到
                             continue
-                        if max_gap is not None and dd["o"][j] > dd["c"][j - 1] * (1 + max_gap):
+                        g_ = real["gap_before"][1] if real["gap_before"] and pd.Timestamp(dates[i]) < real["gap_before"][0] else max_gap
+                        if g_ is not None and dd["o"][j] > dd["c"][j - 1] * (1 + g_):
                             continue                             # 开盘涨幅过大不追
                     if open_down is not None:
                         lim_dn = dd["c"][j - 1] * (1 - _limit_pct(code)) + 0.011 if open_down == "limit" else dd["c"][j - 1] * (1 - open_down)

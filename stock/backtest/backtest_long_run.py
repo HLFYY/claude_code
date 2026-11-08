@@ -1,6 +1,6 @@
 """
 长周期回测（cache_bs_long：2018起 baostock 前复权，含退市股）
-实盘方案：合并池（周线 买点1-W2/W3/买点2 + 日线连续≥2日新高）× RPS120(1位小数)高→低,同分10日弱→强 × 开盘涨幅>7%不买 × 实盘约束
+实盘方案：合并池（周线 买点1-W2/W3/买点2 + 日线连续≥2日新高）× RPS120(1位小数)高→低,同分10日弱→强 × 开盘涨幅>6%不买 × 实盘约束
 大盘：10日线 + 底分型次日确认 + 顶分型次日确认清仓/突破顶点再进场；首日 40%，开仓当天指数涨>3% 首日 70%（MKT_KW）
 大盘指数：深证综指（bw.INDEX_CODE）
 对照：理想成交、周线单独、日线单独、不冻结、旧大盘规则、无大盘择时、深证成指做大盘、指数持有
@@ -14,7 +14,7 @@ import pandas as pd
 import backtest_weekly_portfolio as bw
 import backtest_daily_portfolio as bd
 
-REAL = {"max_open_gap": 0.07}            # 其余见 bw.REAL_DEFAULT：本金80万整手、实测费率、止损0.2%/尾盘0.1%滑点
+REAL = {"max_open_gap": 0.06}            # 开盘涨幅>6%不买（2026-11-08 由 7% 改）；其余见 bw.REAL_DEFAULT：本金80万整手、实测费率、止损0.2%/尾盘0.1%滑点
 WEEKLY_TYPES = ("买点1-W2", "买点1-W3", "买点2")
 PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
 MKT_KW = {"first_lv": 0.4, "strong": (0.03, 0.7)}       # 同 stock_check_xinlang FIRST_LV / STRONG_UP_*

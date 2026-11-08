@@ -806,8 +806,9 @@ def screen_new_high_breakout_sina(datalen: int = 250, max_workers: int = _SINA_M
 # ─────────────────────────────────────────────
 #  合并股票池：本周有效的周线信号 + 当日日线信号，按 RPS120 高→低，次日集合竞价买入
 # ─────────────────────────────────────────────
-OPEN_GAP_MAX = 0.07          # 开盘涨幅 > 7% 不买：集合竞价挂单价 = 前收 × 1.07（不超过涨停价）
-SHARES_GAP = 0.04            # 1层参考股数按 前收 × 1.04 估算（按挂单上限 1.07 算会少买太多；开盘高于 4% 时实际金额略超 1 层）
+OPEN_GAP_MAX = 0.06          # 开盘涨幅 > 6% 不买：集合竞价挂单价 = 前收 × 1.06（不超过涨停价）；2026-11-08 由 7% 改（backtest/backtest_open_gap.py）
+OPEN_GAP_OLD, OPEN_GAP_FROM = 0.07, "2026-11-09"   # 前向跟踪：该日之前的买入仍按 7%（已执行的历史买卖不变）
+SHARES_GAP = 0.03            # 1层参考股数按 前收 × 1.03 估算（2026-11-08 由 1.04 改；开盘高于 3% 时实际金额略超 1 层）
 POOL_CAPITAL = 800_000       # 没有模拟账户信息时，按此本金算 1 层参考股数
 
 
@@ -846,7 +847,7 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
     生成下一交易日的合并股票池 stock_result/pool_{日期}.csv：
       - 周线：上一周的买点1-W2/W3/买点2（下一周周一~周五有效），前收 < 突破价 的剔除
       - 日线：当日 screen_new_high_breakout_sina 的信号（连续≥2日新高），只在下一交易日有效
-      - 统一按 RPS120（前复权）高→低给买入顺序，同分 10日涨幅弱→强；开盘买入价上限 = 前收×1.07（不超过涨停价）
+      - 统一按 RPS120（前复权）高→低给买入顺序，同分 10日涨幅弱→强；开盘买入价上限 = 前收×1.06（不超过涨停价，OPEN_GAP_MAX）
       - RPS120 / 10日涨幅排名的取值日：周线票固定用信号周五收盘（整周不变），日线票用当日收盘；与回测/前向跟踪一致
       - sim（forward_track 结果）：标注模拟持仓中/本周已买卖，并给出 1 层参考股数与可新开只数
     """
@@ -920,7 +921,7 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
     _log(f"股票池已保存: {fname}（{next_day} 开盘候选 {len(can_buy)} 只：周线 {can_buy['来源'].str.contains('周线').sum()} / "
          f"日线 {can_buy['来源'].str.contains('日线').sum()}）")
     summary = [f"▶ {next_day} 开盘股票池 {len(can_buy)} 只（附件 {os.path.basename(fname)}）：按「买入顺序」集合竞价，"
-               f"挂「开盘买入价上限」(前收×1.07)，开盘涨幅>7%买不到即跳过；每只1层（参考股数见附件）"]
+               f"挂「开盘买入价上限」(前收×{1 + OPEN_GAP_MAX:.2f})，开盘涨幅>{OPEN_GAP_MAX:.0%}买不到即跳过；每只1层（参考股数按前收×{1 + SHARES_GAP:.2f}算，见附件）"]
     if sim and sim.get("next_level") is not None:
         free = max(0, int(round(sim["next_level"] * 10 - sim.get("held_layers", 0))))
         summary.append(f"▶ 明日大盘目标仓位 {int(sim['next_level'] * 100)}%，模拟持仓约 {sim.get('held_layers', 0):.1f} 层"

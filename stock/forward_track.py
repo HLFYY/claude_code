@@ -4,7 +4,7 @@
     - 周线：stock_screener 写入的 weekly_signals.csv（买点1-W2/W3/买点2），信号周的下一周周一~五可买，前收<突破价不买
     - 日线：_check_breakout_sina 连续≥2日新高，信号日次日开盘可买
   优先级：RPS120 高→低（候选股前复权）；大盘：深证综指 market_levels_v2(底分型确认, 顶分型confirm)，与 sz_market_action 一致
-  个股/资金规则同 backtest_weekly_portfolio.run_portfolio，按实盘约束（real）：本金 CAPITAL 整手、开盘涨幅>7%不买、
+  个股/资金规则同 backtest_weekly_portfolio.run_portfolio，按实盘约束（real）：本金 CAPITAL 整手、开盘涨幅>6%不买（11-09 前 7%）、
     T+1、止损/走弱资金冻结到下周一、实测费率、盘中止损/尾盘滑点
 数据：新浪（同实盘选股，复用 cache_sina 缓存；收盘 15:10 后跑数据才完整）；全市场用新浪复权因子做前复权（同回测）
 实际账户：stock_result/actual_account.csv（列：日期,总资产），每天收盘后追加一行，程序自动对比
@@ -26,13 +26,14 @@ _sys.path.insert(0, str(Path(__file__).resolve().parent / "backtest"))   # 回�
 import backtest_weekly_portfolio as bw  # noqa: E402
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
                                  _sina_get_stock_list, _sina_qfq_market, _sina_qfq_factors, _qfq_f_at, _next_trading_day,
-                                 _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, MARKET_INDEX, MARKET_INDEX_NAME,
+                                 _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, OPEN_GAP_OLD, OPEN_GAP_FROM, MARKET_INDEX, MARKET_INDEX_NAME,
                                  _NEW_HIGH_DAYS, _SINA_MAX_WORKERS, FIRST_LV, STRONG_UP_PCT, STRONG_UP_LV)
 
 START = "2026-11-03"          # 跟踪起始日（当天开盘起按策略操作）
 CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率与之无关
 PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
-REAL = {"capital": CAPITAL, "max_open_gap": OPEN_GAP_MAX}   # 实盘约束，其余用 backtest_weekly_portfolio.REAL_DEFAULT
+REAL = {"capital": CAPITAL, "max_open_gap": OPEN_GAP_MAX,   # 实盘约束，其余用 backtest_weekly_portfolio.REAL_DEFAULT
+        "gap_before": (pd.Timestamp(OPEN_GAP_FROM), OPEN_GAP_OLD)}   # OPEN_GAP_FROM 之前的买入按旧的 7%（历史买卖不变）
 ACTUAL_FILE = Path("stock_result/actual_account.csv")
 # 实盘手动跳过没买的票（模拟同步：当天不买，顺延买下一只）：(日期, 代码, 原因)
 MANUAL_SKIP = [
