@@ -125,7 +125,8 @@ def set_active_tid(tid):
 
 # ========== 工具函数 ==========
 
-def make_request(method, url, headers, params=None, data=None, proxies=None, timeout=None):
+def make_request(method, url, headers, params=None, data=None, proxies=None, timeout=None,
+                 keep_data=False):
     """
     统一的 HTTP 请求处理函数
 
@@ -137,6 +138,10 @@ def make_request(method, url, headers, params=None, data=None, proxies=None, tim
         data: 请求体字符串 (可选)
         proxies: 代理字典 {'http': '...', 'https': '...'} (可选)
         timeout: 超时时间（秒），默认使用 config.PROXY_REQUEST_TIMEOUT
+        keep_data: 失败时是否把原始响应的 data 一并带回。默认 False（保持旧行为，data 为空）。
+            麦当劳的业务失败码（如提单 420）可能在 data.securityContext 里带滑块凭证
+            (punishId / verifySdk)，丢了就永远查不清「420 能不能靠过滑块解决」。
+            所以只有需要排查的调用点（目前仅 submit_order）才打开。
 
     Returns:
         (success, result_data, message)
@@ -160,7 +165,9 @@ def make_request(method, url, headers, params=None, data=None, proxies=None, tim
             data = result.get('data', {})
             return True, data, result.get('message', '请求成功')
         else:
-            return False, {}, f"{result.get('code', '')}, {result.get('message', '请求失败')}"
+            # 失败时默认仍返回空 data（旧行为不变）；keep_data=True 的调用点保留原始 data
+            payload = (result.get('data') or {}) if keep_data else {}
+            return False, payload, f"{result.get('code', '')}, {result.get('message', '请求失败')}"
 
     except requests.exceptions.Timeout:
         return False, {}, f"请求超时 ({timeout}秒)"
@@ -1326,13 +1333,16 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         # v4 签名（降级）
         headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path)
 
-    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies)
+    success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies,
+                                          keep_data=True)
 
     if success:
         order_id = data.get('orderId')
         return True, data, f"订单提交成功，订单号: {order_id}"
     else:
-        return False, {}, message
+        # 失败也要把原始 data 带回去：420 可能在 data.securityContext 里带滑块凭证
+        # (punishId / verifySdk / verifyType)，这里丢掉的话就永远判断不了要不要给提单接滑块。
+        return False, data or {}, message
 
 
 def get_member_benefit_spec(token, sid, benefit_id=106, scene=0, proxies=None):

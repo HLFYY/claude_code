@@ -501,6 +501,40 @@ def member_open_status():
 
 # ========== 通用 mcd_api 接口 ==========
 
+# 提单失败原始响应留档（排查 420 是否带 data.securityContext 用）
+SUBMIT_RAW_LOG = os.path.join(LOG_DIR, 'submit_order_raw.log')
+
+
+def _log_submit_order_raw(phone, data, message):
+    """提单失败时把本次原始 data 落一行到 ~/logs/submit_order_raw.log。
+
+    为什么单独落文件：提单 420 极低频（100002 两天才 2 次），混在 access log 里翻不到。
+    这里单行 JSON（时间/账号/失败消息/是否带 securityContext/原始 data 全量），
+    `grep securityContext` 就能确认到底带不带滑块凭证。
+
+    不落 token/sid（data 里只有业务字段），phone 本身是脱敏号或 acc_ 编号。
+    纯网络层失败（代理/超时，无麦当劳响应）不写，避免噪音。
+    """
+    try:
+        code_like = bool(re.match(r'^\d{3,6},', str(message or '')))
+        if not data and not code_like:
+            return                      # 代理/超时类失败，没有原始响应可留
+        rec = {
+            'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'phone': phone,
+            'message': str(message or '')[:200],
+            'has_security_context': bool((data or {}).get('securityContext')),
+            'data': data if data else None,
+        }
+        line = json.dumps(rec, ensure_ascii=False)
+        if len(line) > 6000:
+            line = line[:6000] + '...(截断)'
+        with open(SUBMIT_RAW_LOG, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        app.logger.warning(f'写 submit_order 原始响应日志失败: {e}')
+
+
 @app.route('/api/mcd/<function_name>', methods=['GET', 'POST'])
 def universal_mcd_api(function_name):
     """
@@ -602,6 +636,8 @@ def universal_mcd_api(function_name):
             utils.mark_proxy_bad((g.get('proxy_meta') or {}).get('proxy'),
                                  source=proxy_source, merchant_id=merchant_id,
                                  reason=str(message))
+        if not success and function_name == 'submit_order':
+            _log_submit_order_raw(phone, data, message)
         return jsonify({'success': success, 'data': data, 'message': message})
     except TypeError as e:
         app.logger.error(f'[{function_name}] 请求参数错误: {traceback.format_exc()}')
