@@ -978,11 +978,16 @@ def run_weekly_screener_if_needed(latest_date) -> list:
 #  顶分型：有持仓时出现即处理；第3根收盘价为参考，收盘高于它算顶分失效
 #          第二日收盘失效 → 不处理；未失效 → 第三日开盘清仓
 #          清仓后：收盘突破分型顶点(中间K最高) → 按10日线规则重新进场；先跌破10日线 → 空仓，等站上10日线或新底分型
+#          确认日同时出底分型：先不清，次日收盘<底分型中间K最低 → 第三日开盘清仓（之后同上）；守住 → 顶分型作废继续持有
 #  只给大盘仓位建议，不影响选股输出
-#  回测见 backtest_weekly_portfolio.market_levels_v2(bottom_confirm=True, top_mode="confirm")
+#  回测见 backtest_weekly_portfolio.market_levels_v2(bottom_confirm=True, top_mode="confirm", top_bottom="defer_low")
 
 MARKET_INDEX, MARKET_INDEX_NAME = "sz399106", "深证综指"   # 大盘仓位用的指数（新浪代码）
 
+
+# 顶分型确认日同时出现底分型：先不清仓，再看一天，次日收盘 < 底分型中间K最低才清（2026-11-09 起，回测合并池 29.6%→30.5%、
+# 回撤 −17.3%→−16.8%，2018 年来仅 9 次，见 backtest/backtest_top_bottom.py defer_low）；回测对应 market_levels_v2(top_bottom="defer_low")
+TOP_BOTTOM_DEFER = True
 
 FIRST_LV = 0.4                  # 首日建仓仓位（站上10日线 / 底分型确认）
 STRONG_UP_PCT, STRONG_UP_LV = 0.03, 0.7   # 开仓信号当天指数涨幅 > 3% 时首日改建 70%（回测见 backtest_first_level.py strong）
@@ -1003,8 +1008,11 @@ def _pos_op(cur: float, nxt: float) -> str:
     return f"开盘加仓{int(round((nxt - cur) * 10))}只，{_pct(cur)}→{_pct(nxt)}"
 
 
-def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now) -> str:
+def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now, top_defer=None) -> str:
     """下一交易日收盘要看的条件，决定再下一日的操作"""
+    if top_defer is not None:
+        return (f"收盘<{top_defer[0]:.2f}(底分型中间K最低)或跌破10日线(今≈{ma10_now:.2f})→后天开盘清仓；"
+                f"否则顶分型作废继续持有")
     if top_pending is not None:
         ref, _ = top_pending
         return f"收盘≤{ref:.2f}→后天开盘清仓；>{ref:.2f}→顶分型失效继续持有"
@@ -1039,6 +1047,7 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
     lv, frac_mode, k3_close = 0.0, False, 0.0
     pending = None          # 底分型待确认的弱势线
     top_pending = None      # 顶分型待确认 (第3根收盘, 顶点)
+    top_defer = None        # 顶分型确认日同时出底分型：再看一天 (底分型中间K最低, 顶点)
     block = None            # 顶分型清仓后需突破的顶点
     for t in range(len(df)):
         bottom = t >= 2 and l[t - 1] < l[t - 2] and l[t - 1] < l[t] and h[t - 1] < h[t - 2] and h[t - 1] < h[t]
@@ -1049,10 +1058,22 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
         else:
             above = c[t] >= ma10[t]
             done = False
-            if top_pending is not None:
+            if top_defer is not None:
+                line, hi = top_defer
+                top_defer = None
+                if c[t] < line and lv > 0:
+                    lv, frac_mode, pending, block = 0.0, False, None, hi
+                    action = f"次日集合竞价清仓（顶分型确认后收盘跌破底分型低点{line:.2f}），收盘突破顶点{hi:.2f}才重新进场"
+                    done = True
+                elif lv > 0:
+                    notes.append(f"守住底分型低点{line:.2f}，顶分型作废")
+            if not done and top_pending is not None:
                 ref, hi = top_pending
                 top_pending = None
-                if c[t] <= ref and lv > 0:
+                if c[t] <= ref and lv > 0 and TOP_BOTTOM_DEFER and bottom:
+                    top_defer = (l[t - 1], hi)
+                    notes.append(f"顶分型确认（收盘≤{ref:.2f}）但当天出底分型，先不清：次日收盘<{l[t - 1]:.2f}(底分型中间K最低)则后天开盘清仓")
+                elif c[t] <= ref and lv > 0:
                     lv, frac_mode, pending, block = 0.0, False, None, hi
                     action = f"次日集合竞价清仓（顶分型确认：收盘≤第3根收盘{ref:.2f}），收盘突破顶点{hi:.2f}才重新进场"
                     done = True
@@ -1126,7 +1147,7 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
             "当前仓位": _pct(prev_lv), "下一日仓位": _pct(lv), "下一日操作": _pos_op(prev_lv, lv),
             "原因": "；".join(notes + [action]) if notes else action,
             "下一日收盘关注": _watch(lv, frac_mode, k3_close, pending, top_pending, block,
-                              ma10[t] if not np.isnan(ma10[t]) else c[t]),
+                              ma10[t] if not np.isnan(ma10[t]) else c[t], top_defer),
         })
     return pd.DataFrame(rows)
 

@@ -232,7 +232,7 @@ def market_levels(idx: pd.DataFrame, fractal_mode: str = FRACTAL_MODE) -> pd.Dat
 
 def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", confirm_rule="k3c",
                      weak_line="k3c", first_lv=0.4, strong=None, top_reduce=None, tail_clear=None, watch_ma=None,
-                     top_no_new=False, top_need_high=None, top_min_days=None, ma_n=10) -> pd.DataFrame:
+                     top_no_new=False, top_need_high=None, top_min_days=None, ma_n=10, top_k=1.0, top_wait=None, top_bottom=None, bottom_any=None) -> pd.DataFrame:
     """
     10日线规则 + 分型确认版（分型：3根K线，不做包含；第3根收盘确认）
       底分型（10日线下）：bottom_confirm=True 时，第3根确认后次日收盘 >= 第3根收盘 → 再次日开盘4层；
@@ -264,6 +264,12 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
       ma_n：均线天数（默认 10 日线，实盘）；如 8 = 全部规则里的 10 日线换成 8 日线
       top_need_high：顶分型中间K最高须是近 N 日最高才算（"在顶部"），None=不限（实盘）
       top_min_days：本轮开仓已持有 ≥ N 天才看顶分型，None=不限（实盘）
+      top_wait：顶分型清仓后，确认日之后连续 N 天收盘都在10日线上（未突破顶点）也解除顶点限制、按10日线规则开仓；None=必须突破顶点（实盘）
+      top_bottom：顶分型确认日同时出现底分型时：None=照常清仓（实盘）；"cancel"=顶分型作废继续持有；
+                  "defer"=先不清，再看一天，收盘<确认日收盘才清；"defer_low"=同上，收盘<底分型中间K最低才清；"defer_body"=收盘<中间K实体最低(min(开,收))才清
+      bottom_any：顶分型清仓后 10日线上的底分型也算（不要求在10日线下），次日确认就开仓、无视顶点：
+                  None=实盘；"topday"=只算顶分型确认日当天的底分型；"all"=确认日 + 等待突破顶点期间出现的底分型
+      top_k：顶分型确认阈值，次日收盘 ≤ 第3根收盘×top_k 才算确认（1.0=实盘）
       weak_line：底分型持仓后的弱势线（收盘跌破清仓、收盘站上加满）k3c=第3根收盘；k3body=第3根实体顶部
     """
     c, h, l, o = idx["close"].values, idx["high"].values, idx["low"].values, idx["open"].values
@@ -281,6 +287,8 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
     pending = None          # 已出底分型、等待次日收盘确认的弱势线
     top_pending = None      # confirm 模式：等待次日确认的顶分型 (第3根收盘, 顶点)
     block = None            # 顶分型清仓后的失效线：收盘突破才允许重新开仓
+    top_defer = None        # top_bottom=defer：(清仓线, 顶点)
+    block_n = 0             # top_wait：确认日后连续在10日线上的天数
     need_cross = False      # cross 模式：等待重新触发
 
     def entry(t):
@@ -314,18 +322,30 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
                 need_cross = False
                 continue
         # 顶分型：confirm 模式的次日确认
+        if top_defer is not None:
+            line, hi = top_defer
+            top_defer = None
+            if c[t] < line and lv > 0:
+                clear_all(); block, block_n = hi, 0
+                continue
         if top_pending is not None:
             ref, hi = top_pending
             top_pending = None
-            if c[t] <= ref and lv > 0:
+            if c[t] <= ref * top_k and lv > 0 and top_bottom and bottom:
+                if top_bottom in ("defer", "defer_low", "defer_body"):
+                    line = {"defer": c[t], "defer_low": l[t - 1], "defer_body": min(o[t - 1], c[t - 1])}[top_bottom]
+                    top_defer = (line, hi)
+            elif c[t] <= ref * top_k and lv > 0:
                 if top_reduce is None:
-                    clear_all(); block = hi
+                    clear_all(); block, block_n = hi, 0
+                    if bottom_any and bottom:
+                        pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
                     continue
                 if lv > top_reduce:
                     tail_lv[t] = top_reduce
                 if top_reduce == 0:
                     clear_open[t + 1] = True      # 当天买的（T+1 尾盘卖不了）次日开盘清
-                lv, frac_mode, pending, block = min(lv, top_reduce), False, None, hi
+                lv, frac_mode, pending, block, block_n = min(lv, top_reduce), False, None, hi, 0
                 level_open[t + 1] = lv
                 continue
         # 顶分型：新出现（持仓或等待底分型确认时）
@@ -350,14 +370,20 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
                 block = {"reclaim_k3": c[t], "reclaim_high": h[t - 1]}.get(top_mode)
                 continue
         # 顶分型失效线
-        if block is not None:
+        if block is not None and not (bottom_any and pending is not None):
             if not above:
                 block = None              # 已跌破10日线：转铁律/底分型逻辑
             elif c[t] > block:
                 block = None              # 顶分型失效，下面按10日线规则重新开仓
             else:
-                level_open[t + 1] = lv
-                continue
+                block_n += 1
+                if top_wait and block_n >= top_wait:
+                    block = None          # 连续 N 天守住10日线：解除顶点限制，下面按10日线规则开仓
+                else:
+                    if bottom_any == "all" and bottom:
+                        pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
+                    level_open[t + 1] = lv
+                    continue
 
         if pending is not None and lv == 0:
             # 底分型确认日：收盘不破第3根收盘 → 次日4层
@@ -367,6 +393,7 @@ def market_levels_v2(idx: pd.DataFrame, bottom_confirm=True, top_mode="off", con
                 ok = ok and h[t] > mh
             if ok:
                 lv, frac_mode, k3_close, need_cross = entry(t), True, kw, False
+                block = None
             pending = None
             if bottom and not above and lv == 0:
                 pending = (c[t], c[t - 2:t + 1].max(), h[t - 2:t + 1].max(), body_top[t], wl[t])
@@ -525,7 +552,7 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
       - 按本金整手买入（100股，科创板≥200股），买不起一手跳过；网格每份按整手卖，最后一份卖剩余
       - 开盘即涨停（不只一字）买不到，跳过；一字跌停卖不出，顺延到下一交易日开盘
       - 滑点（买入价上浮、卖出价下浮）：集合竞价 slip_auction、盘中止损 slip_stop、尾盘 slip_close，网格限价不加；佣金 fee_rate（最低 min_fee 元）；印花税 2023-08-28 前千1、之后万5
-      - max_open_gap：开盘涨幅超过该值不买（None 时只跳过开盘涨停）
+      - max_open_gap：开盘涨幅超过该值不买（None 时只跳过开盘涨停；可为函数 code→上限，按板块区分）
     rank_daily: None=排名字段用信号日的值（周线票整周用上周五的）；rank_tables(daily) 的结果=每天按前一交易日收盘重算（同实盘股票池）
     grid_geo: 网格价位 False=按价格（等差，各格都相对买入价：买入价×(1+k×步长)）；True=按比例（下一格=上一格×(1+步长)，买入价×(1+步长)^k）
     grid_atr: 网格步长用的 ATR14%：prev=买入前一交易日（同实盘）；signal=信号日（周线票是信号周五）
@@ -768,6 +795,8 @@ def run_portfolio(sig: pd.DataFrame, daily: dict, mkt: pd.DataFrame, use_freeze=
                         if dd["o"][j] >= lim_up:                 # 开盘即涨停，集合竞价买不到
                             continue
                         g_ = real["gap_before"][1] if real["gap_before"] and pd.Timestamp(dates[i]) < real["gap_before"][0] else max_gap
+                        if callable(g_):
+                            g_ = g_(code)                        # 按个股（如按涨跌停幅度）给开盘涨幅上限
                         if g_ is not None and dd["o"][j] > dd["c"][j - 1] * (1 + g_):
                             continue                             # 开盘涨幅过大不追
                     if open_down is not None:
