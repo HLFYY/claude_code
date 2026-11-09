@@ -529,6 +529,8 @@ def universal_mcd_api(function_name):
     province = params.pop('province', None)
     merchant_id = params.pop('merchant_id', None) or MERCHANT_ID_DEFAULT
     proxy_source = params.pop('proxy_source', None) or PROXY_SOURCE_DEFAULT
+    # 调用方要求换新短效代理（如清车失败后重试）：不落业务函数，只影响本次取代理
+    force_new_proxy = bool(params.pop('force_new_proxy', False))
 
     if not phone:
         return jsonify({'success': False, 'message': '缺少登录信息: 需要 phone 或 (token+sid)'}), 400
@@ -567,7 +569,8 @@ def universal_mcd_api(function_name):
     if USE_PROXY and phone and 'proxies' not in params and 'proxies' in sig.parameters:
         # 统一入口：已绑定→静态；未绑定+已登录→绑定静态(无可用代理会抛错)；未绑定+未登录→短效复用
         try:
-            proxy_dict = login_manager.get_login_proxy(is_send_code=False)
+            proxy_dict = login_manager.get_login_proxy(is_send_code=False,
+                                                      force_new=force_new_proxy)
         except Exception as e:
             # 登录成功后无可用静态代理 → 报错暴露，提示补充代理资源(不降级直连)
             app.logger.error(f"[{function_name}] {phone} 代理分配失败: {str(e)}")
@@ -593,6 +596,12 @@ def universal_mcd_api(function_name):
     try:
         func = getattr(mcd_api, function_name)
         success, data, message = func(**params)
+        # 代理/网络层失败 → 把【这一个】ip:port 拉黑，下次轮巡不再用它（mcd_api 里把异常吞成了
+        # 字符串，不在这里记账的话，坏端口会在池 TTL 内被反复复用，每个请求白等 15s 超时）
+        if not success and proxy_used and utils.is_proxy_error(message):
+            utils.mark_proxy_bad((g.get('proxy_meta') or {}).get('proxy'),
+                                 source=proxy_source, merchant_id=merchant_id,
+                                 reason=str(message))
         return jsonify({'success': success, 'data': data, 'message': message})
     except TypeError as e:
         app.logger.error(f'[{function_name}] 请求参数错误: {traceback.format_exc()}')

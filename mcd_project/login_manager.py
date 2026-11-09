@@ -326,7 +326,8 @@ class LoginManager:
         except Exception as e:
             log_info(f'⚠️  写麦金卡状态失败 {self.phone}: {e}')
 
-    def get_login_proxy(self, is_send_code: bool = False) -> Optional[Dict[str, str]]:
+    def get_login_proxy(self, is_send_code: bool = False,
+                        force_new: bool = False) -> Optional[Dict[str, str]]:
         """
         本次请求应使用的代理(requests proxies 字典)，或 None=直连。【统一入口】
 
@@ -340,7 +341,9 @@ class LoginManager:
 
         Args:
             is_send_code: 是否发码(login_send_code)场景(每次必须新短效代理)。
+            force_new: 调用方要求【换新短效代理】(如上一跳代理挂了重试)，清该城市池重提。
         """
+        force_new = bool(force_new or is_send_code)   # 发码场景本来就每次换新
         if not USE_PROXY:
             self.last_proxy_meta = None
             return None
@@ -351,7 +354,7 @@ class LoginManager:
         if PROXY_MODE == 'always_short':
             from utils import get_short_proxy
             _d = get_short_proxy(self.city, province=self.province, source=self.proxy_source,
-                                 merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+                                 merchant_id=self.merchant_id, as_dict=True, force_new=force_new)
             self._set_proxy_meta(_d, self.city)
             return _d
 
@@ -374,7 +377,7 @@ class LoginManager:
                 # 未登录 → 短效代理(白名单 ip:port)
                 from utils import get_short_proxy
                 _d = get_short_proxy(self.city, province=self.province, source=self.proxy_source,
-                                     merchant_id=self.merchant_id, as_dict=True, force_new=is_send_code)
+                                     merchant_id=self.merchant_id, as_dict=True, force_new=force_new)
                 self._set_proxy_meta(_d, self.city)
                 return _d
 
@@ -485,12 +488,21 @@ class LoginManager:
                     if action in ["temp_switch", "permanent_switch", "permanent_switch_immediate"]:
                         retry_count = 0
                 else:
-                    # 短效代理(未绑定/全程短效)：代理有问题就换掉——清该城市池强制提新 IP 再重试
+                    # 短效代理(未绑定/全程短效)：代理有问题就换掉
+                    #   1) 先把【这一个】ip:port 记进黑名单，否则池 TTL 内会被反复轮回来（2026-11-07 站大爷降级事故）
+                    #   2) 再清该城市池强制提新 IP 重试
+                    try:
+                        from utils import mark_proxy_bad
+                        _cur = (getattr(self, 'last_proxy_meta', None) or {}).get('proxy')
+                        mark_proxy_bad(_cur, source=self.proxy_source, merchant_id=self.merchant_id,
+                                       reason=str(e))
+                    except Exception:
+                        pass
                     try:
                         from utils import get_short_proxy
                         get_short_proxy(self.city, province=self.province, source=self.proxy_source,
                                         merchant_id=self.merchant_id, as_dict=True, force_new=True)
-                        log_info(f"  代理失败({str(e)[:40]})，已换新短效 IP 重试 (city={self.city})")
+                        log_info(f"  代理失败({str(e)[:40]})，已拉黑并换新短效 IP 重试 (city={self.city})")
                     except Exception:
                         pass
                     retry_count += 1

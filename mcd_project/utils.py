@@ -600,6 +600,88 @@ def query_proxy_stats(merchant_id: Optional[str] = None, days: int = 7, date: Op
     return {'tree': tree, 'totals': totals, 'dates': sorted(allow)}
 
 
+# ==================== 坏代理黑名单 ====================
+# 短效代理会被上游整批失效（2026-11-07 站大爷账号降级：全省只发同一个 IP、端口大面积不可达）。
+# 池里的 ip:port 一旦判死，不记下来的话，池 TTL（160s）内每次轮巡都会再拿到它，
+# 一个请求就白等一个 15s 超时 —— 所以按「源」维度把坏 ip:port 记进 Redis set，轮巡时跳过。
+PROXY_BAD_TTL = 180   # 与短效池 TTL 同量级；过期自动恢复候选资格（端口可能被上游重启）
+# 这些返回值说明「是代理/网络这一层挂了」，而不是账号/参数问题
+PROXY_ERROR_HINTS = ('代理连接失败', '请求超时', '网络连接失败', 'ProxyError',
+                     'ConnectionError', '隧道连接失败')
+
+
+def _bad_key(source: Optional[str], merchant_id: Optional[str] = None) -> str:
+    mid = merchant_id or config.MERCHANT_ID_DEFAULT
+    return f'mkt:prod:{mid}:proxy:bad:{source or config.PROXY_SOURCE_DEFAULT}'
+
+
+def _as_ip_port(proxy) -> str:
+    """'ip:port' / {'http': 'http://ip:port'} / bytes → 'ip:port'；认不出返回 ''。"""
+    if not proxy:
+        return ''
+    if isinstance(proxy, dict):
+        proxy = proxy.get('https') or proxy.get('http') or ''
+    if isinstance(proxy, bytes):
+        proxy = proxy.decode('utf-8', 'ignore')
+    s = str(proxy).strip()
+    if '://' in s:
+        s = s.split('://', 1)[1]
+    if '@' in s:          # 带账号密码的代理串
+        s = s.rsplit('@', 1)[1]
+    return s.rstrip('/')
+
+
+def mark_proxy_bad(proxy, source: Optional[str] = None, merchant_id: Optional[str] = None,
+                   ttl: int = PROXY_BAD_TTL, reason: str = '') -> bool:
+    """把本次用挂的短效代理记进黑名单（下次轮巡跳过它）。失败不影响主流程。"""
+    ip_port = _as_ip_port(proxy)
+    if not ip_port:
+        return False
+    key = _bad_key(source, merchant_id)
+    try:
+        r = _get_redis()
+        pipe = r.pipeline()
+        pipe.sadd(key, ip_port)
+        pipe.expire(key, ttl)
+        pipe.execute()
+        log_info(f'🚫 代理进黑名单 {ip_port} (T={ttl}s)' + (f' 原因={reason[:40]}' if reason else ''))
+        return True
+    except Exception as e:
+        log_info(f'⚠️  写代理黑名单失败 {ip_port}: {e}')
+        return False
+
+
+def is_proxy_bad(proxy, source: Optional[str] = None, merchant_id: Optional[str] = None) -> bool:
+    """该 ip:port 是否在（未过期的）黑名单里。Redis 不可用按「不坏」处理。"""
+    ip_port = _as_ip_port(proxy)
+    if not ip_port:
+        return False
+    try:
+        return bool(_get_redis().sismember(_bad_key(source, merchant_id), ip_port))
+    except Exception:
+        return False
+
+
+def clear_proxy_bad(source: Optional[str] = None, merchant_id: Optional[str] = None) -> int:
+    """清空黑名单（人工排查/上游修好后调用），返回删掉的个数。"""
+    try:
+        r = _get_redis()
+        key = _bad_key(source, merchant_id)
+        n = int(r.scard(key) or 0)
+        r.delete(key)
+        log_info(f'🧹 清空代理黑名单 {key}（{n} 个）')
+        return n
+    except Exception as e:
+        log_info(f'⚠️  清空代理黑名单失败: {e}')
+        return 0
+
+
+def is_proxy_error(message) -> bool:
+    """返回消息是否属于代理/网络层故障（可安全判 system，不误伤账号）。"""
+    s = str(message or '')
+    return any(h in s for h in PROXY_ERROR_HINTS)
+
+
 def get_short_proxy(
     city: Optional[str] = None,
     province: Optional[str] = None,
@@ -677,19 +759,44 @@ def get_short_proxy(
     def _stat_use(req=0, proxy=0):
         stat_incr(source, st_prov, st_city, merchant_id=merchant_id, req=req, proxy=proxy)
 
+    def _pool_take(tag='轮巡复用'):
+        """从池里轮巡取一个 ip:port；撞到黑名单就【丢弃】继续取，最多看一池长度次。
+
+        RPOPLPUSH 保证多进程原子轮转；坏代理直接 LREM 出池，避免同一进程反复拿到同一个死端口。
+        """
+        if r is None:
+            return None
+        try:
+            n = int(r.llen(rk) or 0)
+        except Exception:
+            n = 1
+        for _ in range(max(1, min(n, 50))):
+            try:
+                p = r.rpoplpush(rk, rk)
+            except Exception as e:
+                log_info(f'⚠️  读 Redis 池失败 city={area_city}: {e}')
+                return None
+            if not p:
+                return None
+            if is_proxy_bad(p, source, merchant_id):
+                try:
+                    r.lrem(rk, 1, p)      # 坏代理出池，别再轮回来
+                except Exception:
+                    pass
+                log_info(f'🚫 {tag} 跳过坏代理 city={area_city} -> {_as_ip_port(p)}')
+                continue
+            return p
+        return None
+
     try:
         r = _get_redis()
     except Exception as e:
         log_info(f'⚠️  Redis 不可用，降级直接提取 city={area_city}: {e}')
         r = None
 
-    # 2) 轮巡复用(RPOPLPUSH 原子轮转，多进程安全)
+    # 2) 轮巡复用(RPOPLPUSH 原子轮转，多进程安全；自动跳过黑名单)
     if r is not None and not force_new:
-        try:
-            p = r.rpoplpush(rk, rk)
-        except Exception as e:
-            log_info(f'⚠️  读 Redis 池失败，改为提新 city={area_city}: {e}')
-            p = None
+        p = _pool_take()
         if p:
             log_info(f'♻️  轮巡复用 city={area_city} -> {p}')
             _stat_use(req=1)
@@ -706,10 +813,7 @@ def get_short_proxy(
         if not got_lock and not force_new:
             # 别的进程正在补池，稍等后再轮巡一次
             time.sleep(1.5)
-            try:
-                p = r.rpoplpush(rk, rk)
-            except Exception:
-                p = None
+            p = _pool_take('他进程补池后复用')
             if p:
                 log_info(f'♻️  (他进程已补池)轮巡复用 city={area_city} -> {p}')
                 _stat_use(req=1)
@@ -729,6 +833,15 @@ def get_short_proxy(
         if not ips:
             log_info(f'❌ 提取短效代理失败 source={source} loc={area_city}')
             return None
+        # 上游可能把刚判死的端口又发回来 → 入池前再滤一遍（全坏就照原样用，别把可用性彻底掐死）
+        fresh = [i for i in ips if not is_proxy_bad(i, source, merchant_id)]
+        if len(fresh) < len(ips):
+            log_info(f'🚫 新提 {len(ips)} 个里有 {len(ips) - len(fresh)} 个在黑名单，已剔除')
+            if not fresh:
+                log_info(f'⚠️  新提的代理全在黑名单（上游疑似降级/持续发同一批死端口）'
+                         f' source={source} loc={area_city}，本次仍按原样返回')
+            else:
+                ips = fresh
         _stat_use(req=1, proxy=len(ips))   # 本次取用1 + 新消耗 len(ips) 个短效代理
         if r is not None:
             try:
@@ -738,8 +851,8 @@ def get_short_proxy(
                 pipe.rpush(rk, *ips)
                 pipe.expire(rk, ttl)
                 pipe.execute()
-                p = r.rpoplpush(rk, rk)
-                log_info(f'🆕 提取 {len(ips)} 个入池 city={area_city} (TTL={ttl}s)，取用 {p}')
+                p = _pool_take()
+                log_info(f'🆕 提取 {len(ips)} 个入池 city={area_city} (TTL={ttl}s)，取用 {p or ips[0]}')
                 return _fmt_proxy(p or ips[0], as_dict)
             except Exception as e:
                 log_info(f'⚠️  写 Redis 池失败(不影响返回) city={area_city}: {e}')
