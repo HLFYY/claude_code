@@ -17,7 +17,7 @@ import backtest_daily_portfolio as bd
 REAL = {"max_open_gap": 0.06}            # 开盘涨幅>6%不买（2026-11-08 由 7% 改）；其余见 bw.REAL_DEFAULT：本金80万整手、实测费率、止损0.2%/尾盘0.1%滑点
 WEEKLY_TYPES = ("买点1-W2", "买点1-W3", "买点2")
 PRIORITY = "RPS120(1位小数)高→低,同分10日弱→强"
-MKT_KW = {"first_lv": 0.4, "strong": (0.03, 0.7), "top_bottom": "defer_low"}   # 同 stock_check_xinlang FIRST_LV / STRONG_UP_* / TOP_BOTTOM_DEFER
+MKT_KW = {"first_lv": 0.4, "strong": (0.025, 0.7), "top_bottom": "defer_low", "strong_nofreeze": (7, 0.025)}   # 同 stock_check_xinlang FIRST_LV / STRONG_UP_* / TOP_BOTTOM_DEFER / STRONG_NOFREEZE_DAYS
 
 
 def yearly(eq):

@@ -842,6 +842,32 @@ def load_weekly_signals() -> pd.DataFrame:
     return w[w["信号类型"].str.startswith(WEEKLY_POOL_SIGNALS)].reset_index(drop=True)
 
 
+def _sim_open_line(sim: dict) -> str:
+    """邮件「明日最多新开」行：全部按模拟仓（forward_track.main 的 sim）算，同回测开仓规则。
+    先写今日收盘状态（持仓含明早要卖的），再写明早开盘的变化和可开只数"""
+    L = lambda k: f"{sim[k]:.1f}"
+    why = ("仓位额度" if sim["cap_n"] < sim["cash_n"] else "可用资金" if sim["cash_n"] < sim["cap_n"] else "仓位额度和可用资金")
+    now = (f"今日收盘模拟持仓 {L('held_all_layers')} 层（按成本"
+           + (f"，其中 {sim['n_sell']} 只 {L('sell_layers')} 层明早开盘卖出" if sim["n_sell"] else "") + "）"
+           + f"，可用资金 {L('cash_now_layers')} 层，冻结 {L('frozen_now_layers')} 层")
+    if sim.get("next_no_freeze"):
+        chg = (f"明早在「开仓信号日涨>{STRONG_NOFREEZE_UP:.1%}且站上10日线、开仓日起{STRONG_NOFREEZE_DAYS}天」不冻结窗口内：冻结资金解冻"
+               + (f"，明早开盘卖出的 {L('sell_layers')} 层不冻结、但赶不上明早集合竞价，后天开盘可用" if sim["n_sell"] else ""))
+    else:
+        parts = []
+        if sim["frozen_now_layers"] > 0.05:
+            parts.append("冻结资金" + ("明早解冻（新的一周）" if sim.get("new_week") else "下周一才解冻"))
+        if sim["sell_frozen_layers"] > 0.05:
+            parts.append(f"明早止损/走弱卖出的 {L('sell_frozen_layers')} 层也冻结到下周一")
+        if sim["sell_cash_layers"] > 0.05:
+            parts.append(f"明早大盘清仓卖出的 {L('sell_cash_layers')} 层后天开盘可用")
+        chg = "，".join(parts) or "无冻结资金"
+    return (f"▶ 明日大盘目标仓位 {int(sim['next_level'] * 100)}%（{sim['next_level'] * 10:.0f} 层）；{now}；{chg}"
+            f" → 明早可用资金 {L('cash_layers')} 层，最多新开 {sim['max_new']} 只（受{why}限制：额度可开 {sim['cap_n']} 只"
+            f"（{sim['next_level'] * 10:.0f} 层 − 留下的持仓 {L('held_layers')} 层），资金可开 {sim['cash_n']} 只；"
+            f"1 层 = 总资产 10% ≈ {sim['equity'] * 0.1 / 1e4:.1f} 万，现金 ≥ 0.9 层才买）")
+
+
 def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.DataFrame:
     """
     生成下一交易日的合并股票池 stock_result/pool_{日期}.csv：
@@ -923,9 +949,7 @@ def build_buy_pool(market, daily_sig: pd.DataFrame, sim: dict = None) -> pd.Data
     summary = [f"▶ {next_day} 开盘股票池 {len(can_buy)} 只（附件 {os.path.basename(fname)}）：按「买入顺序」集合竞价，"
                f"挂「开盘买入价上限」(前收×{1 + OPEN_GAP_MAX:.2f})，开盘涨幅>{OPEN_GAP_MAX:.0%}买不到即跳过；每只1层（参考股数按前收×{1 + SHARES_GAP:.2f}算，见附件）"]
     if sim and sim.get("next_level") is not None:
-        free = max(0, int(round(sim["next_level"] * 10 - sim.get("held_layers", 0))))
-        summary.append(f"▶ 明日大盘目标仓位 {int(sim['next_level'] * 100)}%，模拟持仓约 {sim.get('held_layers', 0):.1f} 层"
-                       f" → 最多新开 {free} 只（止损/走弱资金冻结到下周一，以实际可用资金为准）")
+        summary.append(_sim_open_line(sim))
     pool.attrs["fname"], pool.attrs["summary"] = fname, summary
     return pool
 
@@ -990,7 +1014,16 @@ MARKET_INDEX, MARKET_INDEX_NAME = "sz399106", "深证综指"   # 大盘仓位用
 TOP_BOTTOM_DEFER = True
 
 FIRST_LV = 0.4                  # 首日建仓仓位（站上10日线 / 底分型确认）
-STRONG_UP_PCT, STRONG_UP_LV = 0.03, 0.7   # 开仓信号当天指数涨幅 > 3% 时首日改建 70%（回测见 backtest_first_level.py strong）
+STRONG_UP_PCT, STRONG_UP_LV = 0.025, 0.7  # 开仓信号当天指数涨幅 > 2.5% 时首日改建 70%（2026-11-11 由 3% 改，合并池 31.8%→33.1%、回撤不变，
+                                          # 见 backtest/backtest_strong_lv.py；与 STRONG_NOFREEZE_UP 同一门槛）
+# 空仓→开仓、开仓信号日（开仓前一交易日）指数涨 > 2.5% 且收在 10 日线上：开仓日起 7 个交易日（含开仓日）不执行冻结
+# （已冻结资金解冻、止损/走弱卖出的钱不冻结；开盘卖出的钱赶不上同一场集合竞价，次日开盘才能用）；窗口内大盘清仓则结束。
+# 2026-11-11 起（之前已按冻结规则执行的不变；11-10 定的是「首日70%次日满仓 6 天」，当天改为 2.5% + 7 天，都从 11-11 生效）；
+# 回测合并池 30.5%→31.8%、回撤 −16.8%（不变），2018 年来 20 次，见 backtest/backtest_up2_nofreeze.py 2.5；
+# 回测对应 market_levels_v2(strong_nofreeze=(7, 0.025))
+STRONG_NOFREEZE_DAYS = 7
+STRONG_NOFREEZE_UP = 0.025
+STRONG_NOFREEZE_FROM = "2026-11-11"
 
 
 def _pct(lv: float) -> str:
@@ -1017,9 +1050,9 @@ def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now, top_d
         ref, _ = top_pending
         return f"收盘≤{ref:.2f}→后天开盘清仓；>{ref:.2f}→顶分型失效继续持有"
     if block is not None:
-        return f"收盘>{block:.2f}(顶点)且在10日线上→后天开盘建40%（当天涨>3%则70%）；否则继续空仓"
+        return f"收盘>{block:.2f}(顶点)且在10日线上→后天开盘建40%（当天涨>{STRONG_UP_PCT:.1%}则{_pct(STRONG_UP_LV)}）；否则继续空仓"
     if pending is not None:
-        return f"收盘≥{pending:.2f}→后天开盘建40%（当天涨>3%则70%）；<{pending:.2f}→底分型作废"
+        return f"收盘≥{pending:.2f}→后天开盘建40%（当天涨>{STRONG_UP_PCT:.1%}则{_pct(STRONG_UP_LV)}）；<{pending:.2f}→底分型作废"
     if frac_mode and lv > 0:
         if lv < 1:
             return f"收盘≥{k3_close:.2f}→后天加满100%；<{k3_close:.2f}→后天开盘清仓"
@@ -1028,7 +1061,7 @@ def _watch(lv, frac_mode, k3_close, pending, top_pending, block, ma10_now, top_d
         if lv < 1:
             return f"收盘仍在10日线上(今≈{ma10_now:.2f})→后天加满100%；跌破→后天开盘清仓"
         return f"收盘跌破10日线(今≈{ma10_now:.2f})→后天开盘清仓；否则满仓持有"
-    return f"收盘站上10日线(今≈{ma10_now:.2f})→后天开盘建40%（当天涨>3%则70%）；10日线下出底分型→等次日确认"
+    return f"收盘站上10日线(今≈{ma10_now:.2f})→后天开盘建40%（当天涨>{STRONG_UP_PCT:.1%}则{_pct(STRONG_UP_LV)}）；10日线下出底分型→等次日确认"
 
 
 def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
@@ -1041,7 +1074,7 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
         """首日建仓仓位及说明：当天涨幅 > STRONG_UP_PCT 用 STRONG_UP_LV，否则 FIRST_LV"""
         g = c[t] / c[t - 1] - 1 if t > 0 else 0
         if g > STRONG_UP_PCT:
-            return STRONG_UP_LV, f"建{_pct(STRONG_UP_LV)}（当天涨{g:.1%}>{STRONG_UP_PCT:.0%}）"
+            return STRONG_UP_LV, f"建{_pct(STRONG_UP_LV)}（当天涨{g:.1%}>{STRONG_UP_PCT:.1%}）"
         return FIRST_LV, f"建{_pct(FIRST_LV)}"
 
     lv, frac_mode, k3_close = 0.0, False, 0.0
@@ -1135,7 +1168,7 @@ def _sz_market_states(df: pd.DataFrame) -> pd.DataFrame:
                 elif bottom and not above:
                     pre = "当天停止新开/加仓/补仓，次日集合竞价清仓（跌破10日线）；" if lv > 0 else ""
                     lv, frac_mode, pending = 0.0, False, c[t]
-                    action = pre + f"10日线下底分型（弱势线{c[t]:.2f}），次日收盘不跌破则第三日开盘建40%（确认当天涨>3%则70%）"
+                    action = pre + f"10日线下底分型（弱势线{c[t]:.2f}），次日收盘不跌破则第三日开盘建40%（确认当天涨>{STRONG_UP_PCT:.1%}则{_pct(STRONG_UP_LV)}）"
                 elif not above:
                     action = "当天停止新开/加仓/补仓，次日集合竞价清仓（收盘跌破10日线）" if lv > 0 else "空仓观望（10日线下）"
                     lv, frac_mode = 0.0, False

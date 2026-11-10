@@ -27,7 +27,8 @@ import backtest_weekly_portfolio as bw  # noqa: E402
 from stock_check_xinlang import (_check_breakout_sina, _sina_get_kline, _sina_get_latest_trading_date,
                                  _sina_get_stock_list, _sina_qfq_market, _sina_qfq_factors, _qfq_f_at, _next_trading_day,
                                  _sz_market_states, load_weekly_signals, OPEN_GAP_MAX, OPEN_GAP_OLD, OPEN_GAP_FROM, MARKET_INDEX, MARKET_INDEX_NAME,
-                                 _NEW_HIGH_DAYS, _SINA_MAX_WORKERS, FIRST_LV, STRONG_UP_PCT, STRONG_UP_LV, TOP_BOTTOM_DEFER)
+                                 _NEW_HIGH_DAYS, _SINA_MAX_WORKERS, FIRST_LV, STRONG_UP_PCT, STRONG_UP_LV, TOP_BOTTOM_DEFER,
+                                 STRONG_NOFREEZE_DAYS, STRONG_NOFREEZE_UP, STRONG_NOFREEZE_FROM)
 
 START = "2026-11-03"          # 跟踪起始日（当天开盘起按策略操作）
 CAPITAL = 800_000             # 模拟本金，只影响金额显示，收益率与之无关
@@ -186,6 +187,11 @@ def main(market=None, market_qfq=None) -> dict:
         return {"holdings_file": None, "summary": [f"▶ 前向跟踪：{msg}"], "sim": None}
     k0 = int(idx.index[idx["date"] >= start][0]) - 1          # 起始日前一交易日：权益=1，信号可在起始日开盘买
     mkt = mkt_full.iloc[k0:].reset_index(drop=True)
+    # 开仓信号日涨 > STRONG_NOFREEZE_UP 且站上10日线的不冻结窗口（STRONG_NOFREEZE_FROM 起，之前的按冻结执行不变）
+    idx_c = idx["close"].astype(float).values
+    nf_all = bw.strong_nofreeze_mask(mkt_full["level"].values, idx_c, STRONG_NOFREEZE_DAYS, STRONG_NOFREEZE_UP) if STRONG_NOFREEZE_DAYS else None
+    if nf_all is not None:
+        mkt["no_freeze"] = nf_all[k0:] & (mkt["date"] >= pd.Timestamp(STRONG_NOFREEZE_FROM)).values
     days = list(mkt["date"])
     print(f"跟踪区间 {days[1].date()} ~ {days[-1].date()}（{len(days) - 1} 个交易日），加载行情...")
 
@@ -274,11 +280,11 @@ def main(market=None, market_qfq=None) -> dict:
     if not hold.empty:
         print(hold.to_string(index=False))
 
+    sell_open = hold[hold["下一日操作"].str.startswith("开盘卖出")]
     summary = [f"▶ 策略前向跟踪（{START} 起）：累计 {last['策略累计%']:+.2f}%，{MARKET_INDEX_NAME} {last[f'{MARKET_INDEX_NAME}累计%']:+.2f}%"
                f"，深证成指 {last['深证成指累计%']:+.2f}%"
                + (f"，实际 {last['实际累计%']:+.2f}%" if "实际累计%" in out and pd.notna(last.get("实际累计%")) else ""),
-               f"▶ 模拟持仓 {len(hold)} 只：见附件 {Path(hold_file).name}，按「下一日盘中清仓价」更新条件单"]
-    sell_open = hold[hold["下一日操作"].str.startswith("开盘卖出")]
+               f"▶ 模拟持仓 {len(hold)} 只" + (f"（其中 {len(sell_open)} 只明日开盘卖出）" if len(sell_open) else "") + f"：见附件 {Path(hold_file).name}，按「下一日盘中清仓价」更新条件单"]
     if len(sell_open):
         summary.append("▶ 明日开盘卖出（买入当天触发止损/走弱，T+1）：" + "，".join(sell_open["名称"]))
     tail_watch = hold[hold["下一日操作"].str.contains("尾盘卖")]
@@ -310,14 +316,47 @@ def main(market=None, market_qfq=None) -> dict:
     # 给股票池用的模拟账户状态
     next_day = pd.Timestamp(_next_trading_day(days[-1]))
     eq_last = float(eq.iloc[-1])
-    held = [p["code"] for p in eq.attrs["open_positions"]]
-    held_layers = sum(p["left"] * p["shares0"] * p["buy_px"] for p in eq.attrs["open_positions"]) / (0.1 * eq_last)
+    ops = eq.attrs["open_positions"]
+    layer = 0.1 * eq_last                                      # 1 层 = 前一交易日收盘总资产（含冻结）× 10%，同回测
+    keep = [p for p in ops if not p["pending"]]                # 明天开盘要卖的（T+1 顺延）不算持仓
+    sell = [p for p in ops if p["pending"]]
+    held = [p["code"] for p in keep]
+    held_layers = sum(p["left"] * p["shares0"] * p["buy_px"] for p in keep) / layer        # 按成本，同回测开仓额度
     same_week = next_day.to_period("W-FRI") == pd.Timestamp(days[-1]).to_period("W-FRI")
     traded_week = sorted(set(tr.loc[pd.to_datetime(tr["buy_date"]).dt.to_period("W-FRI") == next_day.to_period("W-FRI"), "code"])
                          ) if same_week and not tr.empty else []
+    traded_week = sorted(set(traded_week) | {p["code"] for p in sell                         # 本周买的、明天开盘卖掉的，本周不再买
+                                             if pd.Timestamp(p["buy_date"]).to_period("W-FRI") == next_day.to_period("W-FRI")})
     st = _sz_market_states(idx[["day", "open", "high", "low", "close"]].reset_index(drop=True)).iloc[-1]
+    next_level = int(st["下一日仓位"].rstrip("%")) / 100
+    next_nf = False                                            # 明天是否在不冻结窗口内（明天只用到今天及以前的收盘）
+    if STRONG_NOFREEZE_DAYS and next_day >= pd.Timestamp(STRONG_NOFREEZE_FROM):
+        next_nf = bool(bw.strong_nofreeze_mask(np.append(mkt_full["level"].values, next_level), np.append(idx_c, np.nan),
+                                               STRONG_NOFREEZE_DAYS, STRONG_NOFREEZE_UP)[-1])
+    # 明天开盘的资金（同 run_portfolio 开仓前的顺序：解冻 → 网格款到账 → 开盘卖出 → 开新仓）
+    cash, frozen = eq.attrs["cash"] + eq.attrs["pending_grid"], eq.attrs["frozen"]
+    cash_now, frozen_now = cash, frozen                       # 今日收盘的现金（含网格待到账）/ 冻结
+    held_all = sum(p["left"] * p["shares0"] * p["buy_px"] for p in ops) / layer          # 今日收盘全部持仓（含明早卖出的）
+    if not same_week or next_nf:                               # 新的一周 / 不冻结窗口：冻结资金解冻
+        cash, frozen = cash + frozen, 0.0
+    sell_cash = sell_frozen = 0.0                              # 开盘卖出的钱（按最新收盘估）：赶不上同一场集合竞价买入，不冻结的也要后天开盘才能用
+    for p in sell:
+        v = p["left"] * p["shares0"] * p["last_close"]
+        if p["pending"].startswith("大盘") or next_nf:
+            sell_cash += v
+        else:
+            sell_frozen += v
+    frozen = frozen + sell_frozen
+    cap_n = max(0, int(np.floor(next_level * 10 - held_layers + 1e-6)))   # 持仓 + 1 层 ≤ 目标仓位
+    cash_n, c = 0, cash
+    while c >= layer * 0.9 * (1 - 1e-6):                        # 现金 ≥ 0.9 层才买（买不满一层按剩余现金买）
+        cash_n += 1; c -= min(layer, c)
     sim = {"equity": eq_last * CAPITAL, "held": held, "held_layers": held_layers, "traded_week": traded_week,
-           "next_level": int(st["下一日仓位"].rstrip("%")) / 100}
+           "next_level": next_level, "next_no_freeze": next_nf,
+           "cash_layers": cash / layer, "frozen_layers": frozen / layer, "sell_layers": (sell_cash + sell_frozen) / layer,
+           "held_all_layers": held_all, "cash_now_layers": cash_now / layer, "frozen_now_layers": frozen_now / layer,
+           "sell_cash_layers": sell_cash / layer, "sell_frozen_layers": sell_frozen / layer,
+           "n_sell": len(sell), "cap_n": cap_n, "cash_n": cash_n, "max_new": min(cap_n, cash_n), "new_week": not same_week}
     return {"holdings_file": hold_file, "summary": summary, "sim": sim,
             "history_file": str(HISTORY_FILE) if HISTORY_FILE.exists() else None}
 
