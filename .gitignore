@@ -49,15 +49,5 @@ mcd/resources/apk/
 # 大体积抓包/二进制落盘目录（保留 logs 里的文本证据）
 mcd/resources/*.bin
 
-# ---- stock：拉取的行情数据（本地保留，不提交）----
-stock/cache/
-stock/cache_sina/
-stock/cache_sina_long/
-stock/cache_bs_long/
-# baostock 代理账密
-stock/proxy_bs.py
-# 选股/回测/前向跟踪/股票池等输出 csv（运行生成，本地/服务器各自保留，不提交）
-stock/stock_result/*.csv
-
-# stock 运行结果（股票池/持仓/回测输出等），本地和服务器各自生成，不入库
-stock/stock_result/
+# ---- stock：已拆为独立仓库 git@github.com:HLFYY/stock.git（2026-11-10），这里整体忽略 ----
+stock/
