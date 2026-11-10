@@ -755,6 +755,51 @@ def get_store_menu(token, sid, store_code, be_code='', order_type=1, daypart_cod
         return False, {}, message
 
 
+def get_available_coupons(token, sid, store_code, order_type=1, coupon_ids=None, proxies=None):
+    """拉账号券包里「本店 + 本取餐方式」可用的券（对应 /bff/promotion/coupons/menu/available）
+
+    券码是账号维度的：同一个 coupon_id 不同账号下的实例码不同，所以下单时只能用
+    履约账号自己拉到的码，不能用方案里存的（那是编辑方案时账号的码）。
+
+    Args:
+        token: 设备 Token
+        sid: 会话 SID
+        store_code: 门店编码（必填，不传麦当劳报 10010）
+        order_type: 1=到店取餐 2=麦乐送
+        coupon_ids: 期望的券模板 ID 列表（仅 mock 用；真接口会返回全量，这里用不到）
+        proxies: 代理字典
+
+    Returns:
+        (success, {'coupons': [{coupon_id, code, title, enable, special_product_codes,
+                                trade_end, total_available}]}, message)
+    """
+    params = {'storeCode': store_code, 'orderType': str(order_type)}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/promotion/coupons/menu/available', query_params=params)
+    url = f'{API_BASE}/bff/promotion/coupons/menu/available'
+    success, data, message = make_request('GET', url, headers, params=params, proxies=proxies)
+    if not success:
+        return False, {}, message
+
+    coupons = []
+    for tab in (data or {}).get('couponTabList') or []:
+        for group in tab.get('coupons') or []:
+            for c in group.get('coupons') or []:
+                code = str(c.get('code') or '').strip()
+                if not code:
+                    continue
+                coupons.append({
+                    'coupon_id': str(c.get('id') or group.get('id') or ''),
+                    'code': code,
+                    'title': c.get('title') or '',
+                    'enable': bool(c.get('enable')),
+                    'special_product_codes': c.get('specialProductCodes') or [],
+                    'trade_end': c.get('tradeEndDateTime') or '',
+                    'total_available': c.get('totalAvailableCount'),
+                })
+    return True, {'coupons': coupons}, f'共 {len(coupons)} 张券'
+
+
 def get_product_detail(token, sid, product_code, store_code, be_code='', order_type=1, daypart_code=None,
                        card_id='', coupon_code='', coupon_id='', channel_code='03', order_mode='0',
                        page_source=1, pin_id='', product_promotions=None, proxies=None):
