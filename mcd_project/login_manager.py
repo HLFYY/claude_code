@@ -204,6 +204,8 @@ class LoginManager:
         self.meddy_id: Optional[str] = None
         self.d: Optional[str] = None  # 数美设备指纹(设备池自动领取/set_device 写入)，请求头 d
         self.device_id: Optional[str] = None  # 设备池中的设备唯一 id(绑定来源,便于失效换设备)
+        # cred_source 凭据来源标记：coupon=券号(借来的 sid，无登录历史)
+        self.cred_source: str = ""
         self.tid: Optional[str] = None          # Token 激活标识(7天有效,ensure_tid 刷新)
         self.tid_expire: Optional[float] = None  # tid 过期时间戳(秒)
 
@@ -551,7 +553,15 @@ class LoginManager:
             return self.token
         if not self.sid:
             return None   # 没 sid 不是已登录态,不给补 token
-        new_token = generate_token()
+        # 券号（source=coupon）是借来的 sid：没有设备指纹 d、token 也是随机生成的，
+        # 麦当劳风控会判「账号环境异常」→ 701135，券单提单被拦。
+        # 这里改成先从设备池领一套成对的 (d, 固定 token)，与真机登录的号保持一致。
+        if self.cred_source == 'coupon' and not self.d:
+            try:
+                self.ensure_device()
+            except Exception as e:
+                log_info(f"⚠️ 券号领设备失败({self.phone}): {e}")
+        new_token = self.token or generate_token()
         if proxies is None:
             try:
                 proxies = self.get_login_proxy(is_send_code=False)
@@ -838,6 +848,7 @@ class LoginManager:
                 self.meddy_id = meddy_id
                 self.d = cred.get('d')
                 self.device_id = cred.get('device_id')
+                self.cred_source = cred.get('source', '') or ''
                 self.tid = cred.get('tid')
                 self.tid_expire = cred.get('tid_expire')
                 self.province_bound = cred.get('province', '') or ''
