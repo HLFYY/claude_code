@@ -701,6 +701,8 @@ class LoginManager:
             chk_st_keep = self.check_status or _old_row.get('check_status', '') or ''
             vip_at_keep = self.vip_time or _old_row.get('vip_time', '') or ''
             vip_st_keep = self.vip_status or _old_row.get('vip_status', '') or ''
+            # source 也要保留：券号（source=coupon）靠它判断要不要从设备池领设备
+            src_keep = self.cred_source or _old_row.get('source', '') or ''
             # token/sid/meddy 传入 None/空 = "不改,保留原值"(禁止把已登录凭证的 token/sid 清空)
             token = token if token else _old_row.get('token')
             sid = sid if sid else _old_row.get('sid')
@@ -708,6 +710,7 @@ class LoginManager:
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             self.vip_time, self.vip_status = vip_at_keep, vip_st_keep
+            self.cred_source = src_keep
             # Redis 存储
             credential_data = {
                 'token': token,
@@ -723,6 +726,7 @@ class LoginManager:
                 'check_status': chk_st_keep,
                 'vip_time': vip_at_keep,
                 'vip_status': vip_st_keep,
+                'source': src_keep,
                 'saved_at': datetime.now().isoformat()
             }
             try:
