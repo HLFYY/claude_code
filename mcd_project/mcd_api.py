@@ -1006,7 +1006,7 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
                 modification=None, suggestion_embedding='',
                 store_name='', channel_code='03', order_mode='0', pin_id='', pickup_time_type='',
                 card_id='', card_type=0, coupon_code='', coupon_id='', gm_assist_service_code='',
-                membership_code='', sequence=-1, animation_id='', proxies=None):
+                membership_code='', sequence=-1, animation_id='', promotion_id='', proxies=None):
     """
     添加商品到购物车 (对应 curl: /bff/cart/carts PUT)
 
@@ -1034,6 +1034,10 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         card_type: 卡片类型
         coupon_code: 优惠券代码
         coupon_id: 优惠券ID
+        promotion_id: 促销活动ID（用券必需）。不带这个字段，麦当劳不会把券挂到商品上：
+            实测同券码带 promotionId → discountAmount=1160（券后 11.9），不带 → discountAmount=0（按原价 23.5）。
+            取值来自 GET /bff/promotion/coupons/v2 里该券模板组的 promotionId（与 coupon_id 对应）。
+            留空则完全不下发该字段，行为与改造前一致（不影响原有加购/早餐卡逻辑）。
         gm_assist_service_code: GM助手服务代码
         membership_code: 会员代码
         sequence: 序列号
@@ -1067,6 +1071,11 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         "sequence": sequence,
         "type": product_type
     }
+
+    # 用券必需：麦当劳只有拿到 promotionId 才会把券挂到商品上（不带 → 按原价结算）。
+    # 留空就不下发这个 key，行为与改造前完全一致。
+    if promotion_id:
+        product_data["promotionId"] = promotion_id
 
     # 添加规格修改 (modification)
     if modification:
