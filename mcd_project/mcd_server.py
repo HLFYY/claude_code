@@ -938,12 +938,35 @@ def proxy_whitelist_get():
 
 @app.route('/api/proxy/whitelist/add', methods=['POST'])
 def proxy_whitelist_add():
-    """加白名单。body: {ip?(不传=加本机当前出口IP; 传则 str/逗号分隔多个), merchant_id?}。"""
+    """加白名单。body: {ip?(不传=加本机当前出口IP; 传则 str/逗号分隔多个), merchant_id?}。
+
+    被「在其他实例/其他用户有绑定」拒绝时，会自动从 config.ZDTPS_LEGACY_INSTANCES 的旧实例解绑后重试。
+    """
     data = request.json or {}
     merchant_id = data.get('merchant_id') or MERCHANT_ID_DEFAULT
-    ok, msg = utils.zdtps_whitelist_add(ip=data.get('ip'), merchant_id=merchant_id)
+    ok, msg, released = utils.zdtps_whitelist_add_smart(ip=data.get('ip'), merchant_id=merchant_id)
     return jsonify({'success': ok, 'message': msg,
-                    'data': {'whitelist': utils.zdtps_whitelist_list(merchant_id)}}), (200 if ok else 502)
+                    'data': {'released_from': released,
+                             'whitelist': utils.zdtps_whitelist_list(merchant_id)}}), (200 if ok else 502)
+
+
+@app.route('/api/proxy/whitelist/auto', methods=['POST'])
+def proxy_whitelist_auto():
+    """出口 IP 自愈(定时任务 / 人工排查用)：探测本机出口IP → 查白名单 → 缺的补上。
+
+    和 ProxyError 后的后台刷新走同一个 utils.ensure_egress_whitelisted：
+    涵盖「新 IP 不在白名单」和「新 IP 被历史实例占着(AddWhiteIp 被拒)」两种情况。
+    """
+    data = request.json or {}
+    merchant_id = data.get('merchant_id') or MERCHANT_ID_DEFAULT
+    try:
+        egress = utils.ensure_egress_whitelisted(merchant_id)
+        lst = utils.zdtps_whitelist_list(merchant_id)
+        ok = bool(egress) and lst is not None and all(ip in lst for ip in egress)
+        return jsonify({'success': ok,
+                        'data': {'egress': egress, 'whitelist': lst}}), (200 if ok else 502)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'自愈失败: {e}'}), 500
 
 
 @app.route('/api/proxy/whitelist/del', methods=['POST'])

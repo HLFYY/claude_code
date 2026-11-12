@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
@@ -329,8 +330,74 @@ def zdtps_whitelist_add(ip=None, merchant_id: Optional[str] = None):
     return ok, data.get('msg')
 
 
+def _zdtps_wl_direct(inst_id, akey, action, extra=None,
+                     whitelist_base='http://www.zdopen.com/ShortEdgeProxy'):
+    """用【指定实例】的凭据直调白名单接口(不读 Redis,专供历史实例解绑用)。"""
+    params = {'inst_id': inst_id, 'akey': akey}
+    params.update(extra or {})
+    try:
+        r = requests.get(whitelist_base + '/' + action + '/', params=params,
+                         proxies={'http': None, 'https': None}, timeout=10)
+        return r.json()
+    except Exception as e:
+        log_info(f'❌ 白名单 {action}(inst={inst_id}) 异常: {str(e)[:60]}')
+        return None
+
+
+def zdtps_whitelist_release_legacy(ip, merchant_id: Optional[str] = None) -> List[str]:
+    """把被【我们自己的历史实例】占着的 IP 从那些实例解绑,返回成功解绑的 inst_id 列表。
+
+    只动 config.ZDTPS_LEGACY_INSTANCES 里列出的实例,且【先查再删】(确认该实例真持有这个 IP 才删),
+    对未知实例不做任何写操作。
+    """
+    ips = [ip] if isinstance(ip, str) else list(ip or [])
+    ips = [x for x in ','.join(str(i) for i in ips).split(',') if x]
+    if not ips:
+        return []
+    conn = _zdtps_conn(load_proxy_source('zdtps', merchant_id) or {})
+    wl_base, cur_inst = conn['whitelist_base'], conn['inst_id']
+    released = []
+    for legacy in (getattr(config, 'ZDTPS_LEGACY_INSTANCES', None) or []):
+        li, la = legacy.get('inst_id'), legacy.get('akey')
+        if not (li and la) or li == cur_inst:
+            continue
+        got = _zdtps_wl_direct(li, la, 'GetIpWhiteList', whitelist_base=wl_base)
+        if not got or str(got.get('code')) != '10001':
+            continue
+        held = [x for x in (got.get('list') or []) if x in ips]
+        if not held:
+            continue
+        d = _zdtps_wl_direct(li, la, 'DelWhiteIp', {'ipList': ','.join(held)}, whitelist_base=wl_base)
+        if d and str(d.get('code')) == '10001':
+            released.append(li)
+            log_info(f'↪ 历史实例 {li} 释放 IP {held}（该 IP 被旧实例占着，当前实例绑不上）')
+    return released
+
+
+def zdtps_whitelist_add_smart(ip=None, merchant_id: Optional[str] = None):
+    """加白名单;被「在其他实例/其他用户有绑定」拒绝时,自动从历史实例解绑后重试。
+
+    返回 (ok, msg, released_from)。2026-11-12 的「代理连接失败」就是卡在这条链上:
+    宽带换来的新出口 IP 早被 10-20 的旧实例扣着,AddWhiteIp 直接失败,当时是人工 Del 才绑上。
+    """
+    ok, msg = zdtps_whitelist_add(ip=ip, merchant_id=merchant_id)
+    if ok or not ip:
+        return ok, msg, []
+    if '其他实例' not in str(msg or '') and '其他用户' not in str(msg or ''):
+        return ok, msg, []
+    released = zdtps_whitelist_release_legacy(ip, merchant_id)
+    if not released:
+        log_info(f'⚠️  加白被拒且无历史实例可解绑（需人工确认 IP 被谁占用）: {msg}')
+        return ok, msg, []
+    ok2, msg2 = zdtps_whitelist_add(ip=ip, merchant_id=merchant_id)
+    return ok2, msg2, released
+
+
 def ensure_egress_whitelisted(merchant_id: Optional[str] = None) -> List[str]:
-    """探测本机出口公网 IP(多出口) → 先查 zdtps 白名单,只加【不在里面】的 IP。返回在白名单内的出口 IP。"""
+    """探测本机出口公网 IP(多出口) → 查 zdtps 白名单 → 缺的补上(被历史实例占着时自动解绑)。
+
+    返回在白名单内的出口 IP。启动时 / 定时巡检 / ProxyError 后台刷新都走这一个入口。
+    """
     ips = get_egress_ip(want_all=True) or []
     if not ips:
         log_info('⚠️  未探测到出口IP,跳过白名单自动添加')
@@ -343,11 +410,44 @@ def ensure_egress_whitelisted(merchant_id: Optional[str] = None) -> List[str]:
     if not missing:
         log_info(f'✓ 出口IP已在白名单,无需添加: {ips}')
         return ips
-    ok, msg = zdtps_whitelist_add(ip=missing, merchant_id=merchant_id)
-    log_info(f'{"✓" if ok else "❌"} 白名单新增 {missing}: {msg}')
+    ok, msg, released = zdtps_whitelist_add_smart(ip=missing, merchant_id=merchant_id)
+    log_info(f'{"✓" if ok else "❌"} 白名单新增 {missing}: {msg}'
+             + (f'（已从历史实例 {released} 解绑）' if released else ''))
     if ok:
         return ips
     return [ip for ip in ips if current and ip in current]  # 新增失败,返回已在白名单的那部分
+
+
+# ---- 出口 IP 自愈:节流 + 异步触发 ----
+# 动态宽带换 IP 后白名单就过期,所有走代理的请求都会 407(表现为「代理连接失败」)。
+# 除了定时巡检,请求侧也要能自愈:撞到 ProxyError 就后台补一次白名单(不阻塞本次请求),
+# 用 Redis 锁节流,5 个 worker 不会把服务商接口打爆。
+_WHITELIST_REFRESH_LOCK_TMPL = 'mkt:prod:{merchant_id}:proxy:whitelist:refresh_lock'
+
+
+def _refresh_throttle_ok(merchant_id: Optional[str], min_interval: int) -> bool:
+    mid = merchant_id or config.MERCHANT_ID_DEFAULT
+    try:
+        return bool(_get_redis().set(
+            _WHITELIST_REFRESH_LOCK_TMPL.format(merchant_id=mid), '1',
+            nx=True, ex=max(30, int(min_interval))))
+    except Exception:
+        return True   # Redis 不可用时无法节流:宁可多发几次,也别不修
+
+
+def maybe_async_whitelist_refresh(merchant_id: Optional[str] = None, min_interval: int = 300) -> bool:
+    """ProxyError 后的自愈入口:节流通过 → 起后台线程补白名单,立刻返回,不影响本次请求耗时。"""
+    if not _refresh_throttle_ok(merchant_id, min_interval):
+        return False
+
+    def _run():
+        try:
+            ensure_egress_whitelisted(merchant_id)
+        except Exception as e:
+            log_info(f'⚠️  后台补白名单失败: {str(e)[:80]}')
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
 
 
 def zdtps_whitelist_del(ip, merchant_id: Optional[str] = None):

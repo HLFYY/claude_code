@@ -28,7 +28,7 @@ from Crypto.Util.Padding import pad
 
 # 导入配置
 from config import PROXY_REQUEST_TIMEOUT
-from utils import log_info
+from utils import log_info, maybe_async_whitelist_refresh
 
 # v5 RPC 客户端（可选）
 try:
@@ -172,6 +172,14 @@ def make_request(method, url, headers, params=None, data=None, proxies=None, tim
     except requests.exceptions.Timeout:
         return False, {}, f"请求超时 ({timeout}秒)"
     except requests.exceptions.ProxyError:
+        # 代理连不上，多半是「本机出口公网 IP 变了，但站大爷白名单没跟上」（2026-11-12 事故：
+        # 宽带 03:30 重拨换 IP → 白名单过期 → 407 → 每单都报这句，全店停摆）。
+        # 这里顺手在后台补一次白名单（Redis 锁节流 5 分钟，不阻塞本次请求）；
+        # 本次仍按失败返回，重试/换号由调用方决定。
+        try:
+            maybe_async_whitelist_refresh()
+        except Exception:
+            pass
         return False, {}, "代理连接失败"
     except requests.exceptions.ConnectionError:
         return False, {}, "网络连接失败"
