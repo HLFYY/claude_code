@@ -501,6 +501,63 @@ def member_open_status():
 
 # ========== 通用 mcd_api 接口 ==========
 
+# ---------- 提单 420 过滑块（2026-11-16）----------
+# 架构：mcd_server(94) 收到提单 420 → 返回 securityContext + 本次代理(X-Proxy-Used)
+#  → 客户端调 /api/captcha/submit_solve 派任务（win 机器 worker 过滑块，必须同出口 IP）
+#  → 客户端轮询 /api/captcha/submit_status 拿 PASS rid
+#  → 客户端拼 sec_verify + pin_proxy(同一代理) 重提 submit_order
+
+@app.route('/api/captcha/submit_solve', methods=['POST'])
+def api_captcha_submit_solve():
+    """派发提单滑块任务到 win 机器 worker（mcd:captcha:login_queue, type=submit）。
+
+    body: {phone, order_id, punish_id, verify_sdk, proxy}
+    立即返回，不阻塞（过滑块要 10~60s，客户端轮询 submit_status）。
+    """
+    p = request.get_json(silent=True) or {}
+    phone = str(p.get('phone') or '').strip()
+    punish_id = str(p.get('punish_id') or '').strip()
+    if not phone or not punish_id:
+        return jsonify({'success': False, 'message': '缺少 phone / punish_id'}), 400
+    payload = {
+        'type': 'submit', 'phone': phone,
+        'punish_id': punish_id,
+        'verify_sdk': p.get('verify_sdk') or 1,
+        'order_id': p.get('order_id') or '',
+        'proxy': str(p.get('proxy') or '').strip(),
+        'merchant_id': p.get('merchant_id') or '',
+    }
+    try:
+        rds = make_redis()
+        rds.lpush(CAPTCHA_LOGIN_CONFIG['queue_key'], json.dumps(payload, ensure_ascii=False))
+        st_key = f'mcd:captcha:submit_status:{phone}'
+        rds.delete(st_key)   # 清旧状态，避免客户端轮询拿到上一次的结果
+        rds.setex(f'mcd:captcha:submit_pending:{phone}', 300, punish_id)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'派发失败: {e}'}), 503
+    return jsonify({'success': True, 'message': '滑块任务已派发', 'status_key': f'mcd:captcha:submit_status:{phone}'})
+
+
+@app.route('/api/captcha/submit_status', methods=['GET'])
+def api_captcha_submit_status():
+    """轮询提单滑块结果：?phone=acc_xxx → {status: processing/done/failed, rid}"""
+    phone = request.args.get('phone', '').strip()
+    if not phone:
+        return jsonify({'success': False, 'message': '缺少 phone'}), 400
+    try:
+        rds = make_redis()
+        raw = rds.get(f'mcd:captcha:submit_status:{phone}')
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Redis 读取失败: {e}'}), 503
+    if not raw:
+        return jsonify({'success': True, 'status': 'pending'})
+    try:
+        st = json.loads(raw)
+    except Exception:
+        st = {'status': 'failed', 'msg': '状态解析失败'}
+    return jsonify({'success': True, **st})
+
+
 # 提单失败原始响应留档（排查 420 是否带 data.securityContext 用）
 SUBMIT_RAW_LOG = os.path.join(LOG_DIR, 'submit_order_raw.log')
 
@@ -600,7 +657,15 @@ def universal_mcd_api(function_name):
         params['mcd_id'] = meddy_id_from_redis
     # 5. 自动获取代理（如果有 phone 参数且函数支持 proxies）
     proxy_used = None
-    if USE_PROXY and phone and 'proxies' not in params and 'proxies' in sig.parameters:
+    # pin_proxy（2026-11-16）：客户端指定的代理（提单过滑块重提必须与第一次同出口 IP，
+    # 否则 punishId 校验失效再次 420）。优先于自动代理。
+    if 'pin_proxy' in sig.parameters and str(params.get('pin_proxy') or '').strip():
+        pp = str(params['pin_proxy']).strip()
+        if not pp.startswith('http'):
+            pp = 'http://' + pp
+        params['proxies'] = {'http': pp, 'https': pp}
+        proxy_used = params['proxies']
+    elif USE_PROXY and phone and 'proxies' not in params and 'proxies' in sig.parameters:
         # 统一入口：已绑定→静态；未绑定+已登录→绑定静态(无可用代理会抛错)；未绑定+未登录→短效复用
         try:
             proxy_dict = login_manager.get_login_proxy(is_send_code=False,

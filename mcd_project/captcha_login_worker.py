@@ -733,6 +733,58 @@ def _vip_verdict(r):
     return 'error'
 
 
+
+
+def handle_submit(payload, headless=True):
+    """提单 420 过滑块（2026-11-16 新增任务类型 submit）。
+
+    调用方（mcd_server /api/captcha/submit_solve）派任务，本函数只负责
+    「用与提单相同的出口代理过数美滑块，拿 PASS rid」——不代提单、不碰购物车。
+
+    payload: {type:'submit', phone, punish_id, verify_sdk, order_id, proxy, merchant_id}
+    结果写  mcd:captcha:submit_status:{phone}（TTL 300s）：
+      {"status":"done","rid":...} / {"status":"failed","msg":...} / {"status":"processing",...}
+
+    为什么 proxy 必须由调用方传：420 的 punishId 绑定当次提单的出口 IP，
+    过滑块的浏览器必须用同一个代理，rid 才对这个 punishId 有效。
+    """
+    import json as _json
+    phone = payload.get('phone') or ''
+    punish_id = payload.get('punish_id') or ''
+    verify_sdk = payload.get('verify_sdk') or 1
+    order_id = payload.get('order_id') or ''
+    proxy_str = (payload.get('proxy') or '').strip()   # http://[user:pwd@]host:port
+    beat(phone)
+    status_key = f'mcd:captcha:submit_status:{phone}'
+    if not phone or not punish_id:
+        if phone:
+            _redis.setex(status_key, 300, _json.dumps({'status': 'failed', 'msg': '缺少 punish_id', 'order_id': order_id}))
+        return
+
+    def _st(st, msg=''):
+        _redis.setex(status_key, 300, _json.dumps(
+            {'status': st, 'msg': msg, 'order_id': order_id, 'ts': int(time.time()), 'ts_str': time.strftime('%H:%M:%S')}))
+
+    _st('processing', '过滑块中')
+    log_info(f"[worker] 提单滑块 {phone} order={order_id} punishId={punish_id} proxy={proxy_str or '直连'}")
+    proxies = None
+    if proxy_str:
+        proxies = {'http': proxy_str, 'https': proxy_str}
+    try:
+        rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
+                           max_try=4, on_beat=lambda: beat(phone), tag=f'submit-{phone}')
+        if rid:
+            _st('done', rid)
+            log_info(f"[worker] 提单滑块 {phone} PASS rid={rid[:24]}…")
+        else:
+            _st('failed', '滑块多次未通过')
+            log_info(f"[worker] 提单滑块 {phone} 多次未通过")
+    except Exception as e:
+        import traceback
+        log_info(f"[worker] 提单滑块 {phone} 异常: {traceback.format_exc()}")
+        _st('failed', f'异常:{e}'[:200])
+
+
 def handle_mcgold(payload, headless=True):
     """
     异步开通麦金卡/电商下单：order/create → 420 则过滑块(get_pass_rid,可内部重试4-5次)带
@@ -857,6 +909,8 @@ def main():
         try:
             if task == 'mcgold':
                 handle_mcgold(payload, headless=headless)
+            elif task == 'submit':
+                handle_submit(payload, headless=headless)
             else:
                 handle_login(phone, city=payload.get('city'),
                              force_new_device=payload.get('force_new_device', False), headless=headless,

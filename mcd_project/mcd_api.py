@@ -1294,7 +1294,8 @@ def get_nearest_store_info(token, sid, store_code, latitude, longitude, be_code=
 def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=None,
                 order_type='1', eat_type_code='eat-in', tableware_code='no',
                 order_mode='0', pin_id='', latitude=0.0, longitude=0.0,
-                date='', time='', menu_card_list=None, real_total_amount=0, proxies=None):
+                date='', time='', menu_card_list=None, real_total_amount=0,
+                sec_verify=None, pin_proxy=None, proxies=None):
     """
     提交订单 (对应 curl: /bff/order/orders)
     使用 v5 加密
@@ -1391,9 +1392,13 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
             'Date': formatdate(timeval=None, localtime=False, usegmt=True),
             'User-Agent': 'okhttp/4.9.0'
         }
+        if sec_verify:
+            headers['x-mcd-sec-verify'] = sec_verify
     else:
         # v4 签名（降级）
         headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path)
+        if sec_verify:
+            headers['x-mcd-sec-verify'] = sec_verify
 
     success, data, message = make_request('POST', url, headers, data=body_str, proxies=proxies,
                                           keep_data=True)
@@ -1438,6 +1443,8 @@ def ectrade_order_create(token, sid, mcd_id, sku_id, city_code='310100', shop_id
     低层:发一次 /bff/ectrade/order/create,返回【完整响应 json(dict)】。
     - 成功: {"success":true,"data":{"orderId","payId",...}}
     - 需过滑块: {"success":false,"code":420,"data":{"securityContext":{"punishId","verifyType","verifySdk"}}}
+      过滑块后重提：sec_verify = base64("{punishId};{verifySdk};{毫秒ts};{rid}")（worker 过滑块拿 rid），
+      pin_proxy = 第一次提单的出口代理（http://...， punishId 绑定出口 IP，重提必须同 IP）
     - 设备风控: {"success":false,"code":6000232,"message":"账号环境存在异常"}
     sec_verify: 过滑块后拼的 x-mcd-sec-verify(base64(punishId;verifySdk;ts;rid)),重试时带。
     每次调用自动用新 preCommitNo(未显式传时),符合真机"重试换号"规则。
