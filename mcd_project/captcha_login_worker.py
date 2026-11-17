@@ -774,7 +774,9 @@ def handle_submit(payload, headless=True):
         rid = get_pass_rid(proxy_parts=browser_proxy_parts(proxies), headless=headless,
                            max_try=4, on_beat=lambda: beat(phone), tag=f'submit-{phone}')
         if rid:
-            _st('done', rid)
+            _redis.setex(status_key, 300, _json.dumps(
+                {'status': 'done', 'rid': rid, 'msg': rid, 'order_id': order_id,
+                 'ts': int(time.time()), 'ts_str': time.strftime('%H:%M:%S')}))
             log_info(f"[worker] 提单滑块 {phone} PASS rid={rid[:24]}…")
         else:
             _st('failed', '滑块多次未通过')
