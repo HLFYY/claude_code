@@ -630,7 +630,7 @@ def raw_send(phone, token, proxies, tid='', d='', sec_verify=None):
     return requests.post(SEND_URL, headers=h, data=body, proxies=proxies, timeout=15).json()
 
 
-def handle_login(phone, city=None, force_new_device=False, headless=True,
+def handle_login(phone, city=None, force_new_device=False, headless=True, pinned_proxy='',
                  province=None, merchant_id=None, proxy_source=None):
     beat(phone)  # 开始处理，上报心跳
     try:
@@ -639,7 +639,15 @@ def handle_login(phone, city=None, force_new_device=False, headless=True,
                                province=province, merchant_id=merchant_id, proxy_source=proxy_source)
         # 发码场景：未绑定→每次新短效代理(force_new)；已绑定→静态；USE_PROXY 关=None 直连。
         # 整个发码流程(activate/发码/滑块/重发)全程复用这同一个 proxies，保证 IP 一致性。
-        proxies = manager.get_login_proxy(is_send_code=True)
+        # pinned_proxy（注册现场造设备场景）：造 d 用的出口就是它，发码必须同 IP，否则
+        # 数美的「设备注册 IP ≠ 业务 IP」关联风控会直接 706070。
+        pinned_proxy = str(pinned_proxy or '').strip()
+        if pinned_proxy:
+            px = pinned_proxy if pinned_proxy.startswith('http') else ('http://' + pinned_proxy)
+            proxies = {'http': px, 'https': px}
+            log_info(f"[worker] {phone} 使用钉住的出口 {pinned_proxy}（与造设备同 IP）")
+        else:
+            proxies = manager.get_login_proxy(is_send_code=True)
         newly = force_new_device or not manager.token
         if newly:
             manager.token = generate_token()
@@ -917,7 +925,8 @@ def main():
                 handle_login(phone, city=payload.get('city'),
                              force_new_device=payload.get('force_new_device', False), headless=headless,
                              province=payload.get('province'), merchant_id=payload.get('merchant_id'),
-                             proxy_source=payload.get('proxy_source'))
+                             proxy_source=payload.get('proxy_source'),
+                             pinned_proxy=payload.get('pinned_proxy', ''))
         except Exception as e:
             import traceback
             log_info(f"[worker] {phone} 异常: {traceback.format_exc()}")

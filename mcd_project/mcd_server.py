@@ -154,7 +154,8 @@ def is_frozen(phone):
     return _cap_redis.exists(_freeze_key(phone)) == 1
 
 
-def enqueue_login(phone, city=None, force_new_device=False, province=None, merchant_id=None, proxy_source=None):
+def enqueue_login(phone, city=None, force_new_device=False, province=None, merchant_id=None,
+                  proxy_source=None, pinned_proxy=''):
     """冻结账号(兜底TTL) + 入队交给 captcha_login_worker + 置 queued 状态。
     province/merchant_id/proxy_source 一并入队,worker 发码时用同一商户(凭证 key 一致)、同一代理源/地域。"""
     _cap_redis.setex(_freeze_key(phone), CAPTCHA_LOGIN_CONFIG['freeze_ttl'], '1')
@@ -165,7 +166,9 @@ def enqueue_login(phone, city=None, force_new_device=False, province=None, merch
     _cap_redis.rpush(CAPTCHA_LOGIN_CONFIG['queue_key'],
                      json.dumps({'phone': phone, 'city': city, 'force_new_device': force_new_device,
                                  'province': province, 'merchant_id': merchant_id or MERCHANT_ID_DEFAULT,
-                                 'proxy_source': proxy_source or PROXY_SOURCE_DEFAULT}, ensure_ascii=False))
+                                 'proxy_source': proxy_source or PROXY_SOURCE_DEFAULT,
+                                 # pinned_proxy：现场造设备时钉住的出口（发码必须同 IP）
+                                 'pinned_proxy': pinned_proxy or ''}, ensure_ascii=False))
 
 
 def unfreeze_login(phone):
@@ -204,6 +207,10 @@ def login_send_code():
     data = request.json or {}
     phone = data.get('phone')
     use_new_device = data.get('use_new_device', False)
+    # fresh_device（2026-11-17 注册场景）：现场用该城市代理造一台全新设备 ——
+    # 造 d 的出口 IP 与发码出口 IP 完全对齐（设备池预造的 d 是批量+随机城市造的，
+    # 注册判 706070「设备环境异常」）。发码入队时带 pinned_proxy，worker 用同一代理。
+    fresh_device = bool(data.get('fresh_device', False))
     city = data.get('city')  # 新增：获取城市参数
     province, merchant_id, proxy_source = _biz_params(data)  # 省份/商户ID/代理源
 
@@ -230,20 +237,51 @@ def login_send_code():
     # 确保账号已绑定数美设备指纹 d：新账号自动从设备池领一个;已有但无 d 的也自动补领并写入凭证。
     # use_new_device=True 时换新设备(旧设备标记失效)。失败不阻断发码(worker 侧仍会用现有 d)。
     eff_province, eff_city = province, city
-    try:
-        _lm = get_login_manager(phone, city, province, merchant_id, proxy_source)
-        # 定本次生效省/市(没传取凭证已绑定;账号未绑定则绑定写入)
-        eff_province, eff_city = _lm.apply_location(province, city)
-        _d = _lm.ensure_device(force_new=use_new_device)
-        app.logger.info(f"[send_code] {phone} 省市 province={eff_province} city={eff_city} "
-                        f"设备绑定 d={'有' if _d else '无(池空?)'} device_id={_lm.device_id}")
-    except Exception as e:
-        app.logger.warning(f"[send_code] {phone} 设备/省市绑定失败(继续入队): {e}")
+    pinned_proxy = ''
+    if fresh_device:
+        # 现场造设备：用该城市代理调数美 deviceprofile/v4 拿新 d，绑定到本号，
+        # 并把该代理钉给 worker（发码必须同 IP，否则 IP 对齐白做）
+        try:
+            from local_device_gen import register_local
+            _lm = get_login_manager(phone, city, province, merchant_id, proxy_source)
+            eff_province, eff_city = _lm.apply_location(province, city)
+            _pxy = _lm.get_login_proxy(is_send_code=True)
+            _dev = register_local(use_proxy=False, proxies=_pxy, timeout=25)
+            if not _dev:
+                return jsonify({'success': False,
+                                'message': '现场造设备失败（数美拒绝或代理不可用），请重试'}), 502
+            _lm.d = _dev['d']
+            _lm.token = _dev.get('token') or _lm.token
+            _lm.device_id = str(_dev.get('smid') or '')[:12]
+            try:
+                from mcd_api import set_active_d
+                set_active_d(_lm.d)
+            except Exception:
+                pass
+            _lm._persist_device(_lm.d, _lm.device_id)
+            _px = (_pxy or {}).get('http') or (_pxy or {}).get('https') or ''
+            pinned_proxy = _px if _px.startswith('http') else (('http://' + _px) if _px else '')
+            app.logger.info(f"[send_code] {phone} 现场造设备 新d={_lm.d[:16]}… model={_dev.get('model')} "
+                            f"proxy={_px}（发码将钉同一出口）")
+        except Exception as e:
+            app.logger.error(f"[send_code] {phone} 现场造设备异常: {e}")
+            return jsonify({'success': False, 'message': f'现场造设备异常: {e}'}), 502
+    else:
+        try:
+            _lm = get_login_manager(phone, city, province, merchant_id, proxy_source)
+            # 定本次生效省/市(没传取凭证已绑定;账号未绑定则绑定写入)
+            eff_province, eff_city = _lm.apply_location(province, city)
+            _d = _lm.ensure_device(force_new=use_new_device)
+            app.logger.info(f"[send_code] {phone} 省市 province={eff_province} city={eff_city} "
+                            f"设备绑定 d={'有' if _d else '无(池空?)'} device_id={_lm.device_id}")
+        except Exception as e:
+            app.logger.warning(f"[send_code] {phone} 设备/省市绑定失败(继续入队): {e}")
 
     _cap_redis.delete(_status_key(phone))  # 清掉上次残留的 code_sent，避免轮询误判"已发送"而实际没重发
     # 入队用【生效】省市,worker 发码按同一省市取代理
     enqueue_login(phone, city=eff_city, force_new_device=use_new_device,
-                  province=eff_province, merchant_id=merchant_id, proxy_source=proxy_source)
+                  province=eff_province, merchant_id=merchant_id, proxy_source=proxy_source,
+                  pinned_proxy=pinned_proxy)
     app.logger.info(f"[send_code] {phone} 已(重新)入队验证码登录 (prev status={status})")
     return jsonify({'success': True, 'data': {'status': 'queued'}, 'message': '已入队，请轮询 /api/login/captcha_status'})
 
