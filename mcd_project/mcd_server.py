@@ -1207,8 +1207,11 @@ def _whitelist_call(url: str, timeout: int = 15):
     try:
         r = requests.get(url, timeout=timeout)
         body = (r.text or '')[:200]
+        # 成功码：神龙 200=添加成功 / 1007=已存在（幂等成功，重复同步必然遇到）；
+        # 站大爷 "10001"=成功。不能把 1007 当失败，否则每次同步都误报、last_ip 也更新不了。
         good = r.status_code == 200 and (
             '"code":200' in body or '"code": 200' in body
+            or '"code":1007' in body or '"code": 1007' in body
             or '"code":"10001"' in body or '"code": "10001"' in body
             or '"success":true' in body or '"success": true' in body
         )
