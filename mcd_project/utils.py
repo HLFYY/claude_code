@@ -187,6 +187,213 @@ def load_proxy_source(source: Optional[str] = None, merchant_id: Optional[str] =
     return cfg
 
 
+# ==================== v2 代理路由表（2026-11-21 平台改造） ====================
+# 平台后台把「全国默认 + 省市覆盖」算成一张路由表写进 Hash 的 field="route"：
+#   {v:2, default:{fallback, map:{省市key:url}, provider, format, ...},
+#    overrides:{省市key:{url, provider, format, ...}}}
+# 这里的 url 是【配置时拼好地域参数的最终 URL】，下单端拿到直接 GET，
+# 不做任何中文→拼音/区划码转换（字典只在平台侧、只在保存配置时跑一次）。
+#
+# 兼容：老版平台没写 "route" field → load_proxy_route 返回 None，get_short_proxy
+# 原样走老逻辑（load_proxy_source + 按城市现拼参数）。因此平台与 94 可独立发版。
+
+PROXY_ROUTE_FIELD = 'route'
+
+
+def load_proxy_route(merchant_id: Optional[str] = None) -> Optional[Dict]:
+    """读 v2 路由表。老版平台/Redis 缺失时返回 None（调用方回退老逻辑）。"""
+    key = _proxy_cfg_key(merchant_id)
+    try:
+        raw = _get_redis().hget(key, PROXY_ROUTE_FIELD)
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'ignore')
+        route = json.loads(raw)
+        return route if isinstance(route, dict) and route.get('v') == 2 else None
+    except Exception as e:
+        log_info(f'⚠️  读 v2 代理路由表失败 {key}: {e}(回退老逻辑)')
+        return None
+
+
+def select_proxy_route(route: Dict, province: Optional[str], city: Optional[str]):
+    """按号的城市查路由表 → (entry, level, log_msg)。
+
+    优先级：覆盖精确市 → 覆盖省 → 默认表精确市 → 默认表省 → 全国兜底。
+    未命中地域【不报错】：用全国兜底 URL 并产生一条日志（用户要求）。
+    完全没配置才返回 (None, 'none', 日志)。
+    """
+    province = (province or '').strip()
+    city = (city or '').strip()
+    full_key = f'{province}|{city}' if city else province
+    overrides = route.get('overrides') or {}
+    default = route.get('default') or {}
+
+    if full_key and overrides.get(full_key):
+        return overrides[full_key], 'override:city', ''
+    if province and overrides.get(province):
+        return overrides[province], 'override:province', ''
+
+    region_map = default.get('map') or {}
+    if full_key and region_map.get(full_key):
+        return _route_entry_from_map(default, region_map[full_key]), 'default:city', ''
+    if province and region_map.get(province):
+        return _route_entry_from_map(default, region_map[province]), 'default:province', ''
+
+    fallback = default.get('fallback')
+    if fallback:
+        entry = {k: v for k, v in default.items() if k not in ('map', 'fallback')}
+        entry['url'] = fallback
+        msg = (f'⚠️  代理路由未命中地域 province={province!r} city={city!r}，'
+               f'回退全国兜底 URL（merchant 需核对是否漏配省市）')
+        return entry, 'default:fallback', msg
+    return None, 'none', f'❌ 代理路由无可用配置 province={province!r} city={city!r}'
+
+
+def _route_entry_from_map(default: Dict, url: str) -> Dict:
+    """默认表里的 value 只是 URL，其余元信息（provider/format/加白）从 default 继承。"""
+    entry = {k: v for k, v in default.items() if k not in ('map', 'fallback')}
+    entry['url'] = url
+    return entry
+
+
+def _normalize_proxy_line(line: str) -> str:
+    """把各家返回的线路统一规范成 'ip:port' 或 'user:pass@ip:port'。
+
+    - 'ip:port'              原样
+    - 'ip:port:user:pass'    → 'user:pass@ip:port'（星宇 auth_mode=password 常见）
+    - 'user:pass@ip:port'    原样
+    统一后 _fmt_proxy 才能拼出合法 URL，黑名单 key 也保持一致。
+    """
+    line = (line or '').strip()
+    if not line:
+        return ''
+    # 有些平台一行带附加信息（空格/制表符），只取第一个 token
+    line = line.split()[0]
+    if '@' in line:
+        cred, host = line.rsplit('@', 1)
+        parts = host.split(':')
+        if len(parts) == 2 and _is_ipv4(parts[0]) and _is_port(parts[1]) and cred:
+            return f'{cred}@{host}'
+        return ''
+    parts = line.split(':')
+    if len(parts) == 2 and _is_ipv4(parts[0]) and _is_port(parts[1]):
+        return line
+    if len(parts) == 4 and _is_ipv4(parts[0]) and _is_port(parts[1]) and parts[2] and parts[3]:
+        return f'{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}'
+    return ''
+
+
+def _is_ipv4(s: str) -> bool:
+    s = (s or '').strip()
+    parts = s.split('.')
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or not 0 <= int(p) <= 255:
+            return False
+    return True
+
+
+def _is_port(s: str) -> bool:
+    try:
+        return 1 <= int(s) <= 65535
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_route_proxy_response(text: str, fmt: str = 'txt') -> List[str]:
+    """解析「最终 URL」的响应，返回规范化后的线路列表。
+
+    兼容纯文本（每行一条）与各家 JSON（站大爷 proxy_list / 神龙 data 数组 /
+    星宇 list 等）：递归找出所有含 ip+port 的节点，带账密的拼上 username/password。
+    fmt='json' 时优先按 JSON 解，解不开再退回文本；fmt='txt' 反之。
+    """
+    text = (text or '').strip()
+    if not text:
+        return []
+
+    def from_lines() -> List[str]:
+        out = []
+        for ln in re.split(r'[\r\n\t]+', text):
+            p = _normalize_proxy_line(ln)
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    def collect(node) -> List[str]:
+        """递归找 ip/port 节点。返回规范化线路列表。"""
+        out = []
+        if isinstance(node, dict):
+            ip = node.get('ip')
+            port = node.get('port')
+            if ip and port:
+                host = f'{str(ip).strip()}:{str(port).strip()}'
+                user = node.get('username') or node.get('user') or ''
+                password = node.get('password') or node.get('pass') or ''
+                p = _normalize_proxy_line(f'{host}:{user}:{password}' if user and password else host)
+                if p:
+                    out.append(p)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    out.extend(collect(v))
+        elif isinstance(node, list):
+            for v in node:
+                out.extend(collect(v))
+        # 去重保序
+        seen, uniq = set(), []
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        return uniq
+
+    def from_json() -> List[str]:
+        try:
+            data = json.loads(text)
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            code = data.get('code')
+            # 站大爷/神龙的错误码：明确失败就别硬解析
+            if code is not None and str(code) not in ('0', '200', '10001', '1'):
+                msg = data.get('msg') or data.get('message') or ''
+                log_info(f'❌ 代理提取接口返回失败 code={code} msg={msg}')
+                return []
+        return collect(data)
+
+    if fmt == 'json':
+        return from_json() or from_lines()
+    if fmt == 'txt':
+        return from_lines() or from_json()
+    # auto：JSON 开头按 JSON，否则按文本
+    return from_json() if text.startswith(('{', '[')) else (from_lines() or from_json())
+
+
+def _extract_by_final_url(entry: Dict, count: int = 1, timeout: int = 12) -> List[str]:
+    """v2 直通：GET 路由表里那条【最终 URL】，解析线路。零地域转换。"""
+    url = (entry.get('url') or '').strip()
+    if not url:
+        log_info('❌ v2 路由条目缺 url')
+        return []
+    fmt = (entry.get('format') or 'auto').strip().lower()
+    try:
+        r = requests.get(url, proxies={'http': None, 'https': None}, timeout=timeout)
+        text = r.text or ''
+    except Exception as e:
+        log_info(f'❌ 最终 URL 提取异常 provider={entry.get("provider")} url={url[:120]}: {str(e)[:80]}')
+        return []
+    if r.status_code != 200:
+        log_info(f'❌ 最终 URL 返回 HTTP {r.status_code}: {(text or "")[:120]}')
+        return []
+    ips = _parse_route_proxy_response(text, fmt)
+    if ips:
+        log_info(f'✓ v2 路由提取成功 provider={entry.get("provider")} fmt={fmt} -> {len(ips)} 个')
+    else:
+        log_info(f'⚠️  v2 路由提取无结果 provider={entry.get("provider")} fmt={fmt} body={(text or "")[:120]}')
+    return ips[:max(1, count)] if count and count > 1 else ips
+
+
 # ==================== 站大爷(zdtps)短效代理 ====================
 def _zdtps_conn(cfg: Dict) -> Dict:
     """
@@ -462,8 +669,14 @@ def zdtps_whitelist_del(ip, merchant_id: Optional[str] = None):
 
 
 def _extract_for_source(src_cfg: Dict, province: Optional[str], city: Optional[str], count: int) -> List[str]:
-    """按代理源类型提取 count 个 ['ip:port',...](统一调度入口)。"""
+    """按代理源类型提取 count 个 ['ip:port',...](统一调度入口)。
+
+    v2 路由表(type='route')：直接 GET 配置时算好的最终 URL，零地域转换。
+    其余走老逻辑（zdtps 拼 adr / shenlong city→area）。
+    """
     t = (src_cfg or {}).get('type')
+    if t == 'route':
+        return _extract_by_final_url(src_cfg.get('route_entry') or {}, count=count)
     if t == 'zdtps':
         return _zdtps_extract(src_cfg, province=province, city=city, count=count)
     if t == 'shenlong':
@@ -829,17 +1042,35 @@ def get_short_proxy(
     """
     source = source or config.PROXY_SOURCE_DEFAULT
     merchant_id = merchant_id or config.MERCHANT_ID_DEFAULT
-    src_cfg = load_proxy_source(source, merchant_id)
-    if not src_cfg:
-        return None
+
+    # ---- v2 路由表优先（2026-11-21）----
+    # 平台后台已把中文省市换成平台地域参数、算好最终 URL，这里只按号的城市查表并直接 GET。
+    # 老版平台没写 "route" field → 整段跳过，下面原样走老逻辑，保证可独立发版。
+    src_cfg = None
+    route = load_proxy_route(merchant_id)
+    if route:
+        entry, level, route_msg = select_proxy_route(route, province, city)
+        if route_msg:
+            log_info(route_msg)  # 回退全国兜底 / 无配置：都记日志，但不抛错
+        if entry:
+            # source 按平台隔离，池/黑名单/统计都跟着走；loc 带上命中层级避免不同链接串池
+            source = f'route:{entry.get("provider") or "default"}'
+            src_cfg = {'type': 'route', 'route_entry': entry, 'route_level': level}
+    if src_cfg is None:
+        src_cfg = load_proxy_source(source, merchant_id)
+        if not src_cfg:
+            return None
 
     cfg = config.SHORT_PROXY_CONFIG
     # 过期时间(默认 config 180),实际池 TTL = 过期时间 - 20
     expire = cfg.get('expire', 180) if expire is None else expire
     ttl = (expire - 20) if ttl is None else ttl
 
-    # 1) 定地域(作池 key 的一部分):神龙按城市落到最近支持节点;zdtps 按 省/市。
-    if src_cfg.get('type') == 'shenlong':
+    # 1) 定地域(作池 key 的一部分):神龙按城市落到最近支持节点;zdtps 按 省/市;v2 按命中层级。
+    if src_cfg.get('type') == 'route':
+        level = src_cfg.get('route_level') or 'default'
+        loc = f'{level}:{(province or "")}{(f"_{city}" if city else "")}' or 'any'
+    elif src_cfg.get('type') == 'shenlong':
         if not city:
             city = random.choice(list(config.SHENLONG_SUPPORTED))
             log_info(f'🎲 未指定城市，随机选 {city}')
@@ -850,7 +1081,7 @@ def get_short_proxy(
     # 池 key 按 商户+源+地域 隔离,不同源/地域互不串
     rk = f'mkt:prod:{merchant_id}:proxy:pool:{source}:{loc}'
 
-    # 统计维度:神龙(省=按落点城市推导, 市=落点城市);zdtps 按传入省/市
+    # 统计维度:神龙(省=按落点城市推导, 市=落点城市);其余按传入省/市
     if src_cfg.get('type') == 'shenlong':
         st_prov, st_city = city_to_province(loc), loc
     else:
