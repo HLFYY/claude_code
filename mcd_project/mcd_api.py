@@ -549,7 +549,7 @@ def login(phone, verify_code, token, proxies=None):
         proxies: 代理字典 {'http': '...', 'https': '...'}
 
     Returns:
-        (success, sid, meddy_id, message)
+        (success, sid, meddy_id, refresh_token, message)
     """
     # 加密手机号和验证码
     encrypted_phone = aes_encrypt(phone, AES_KEY)
@@ -578,9 +578,13 @@ def login(phone, verify_code, token, proxies=None):
     if success:
         sid = data.get('sid', '')
         meddy_id = data.get('meddyId', '')
-        return True, sid, meddy_id, "登录成功"
+        # refreshToken（2026-11-21）：登录响应 data 里除 sid/meddyId 还有 refreshToken，
+        # 之前整块丢弃。它用于「不重新发短信就能续期会话」，掉登录时可免接码。
+        # 返回值：success, sid, meddy_id, refresh_token, message（唯一调用方 login_manager.do_login）
+        refresh_token = str(data.get('refreshToken') or data.get('refresh_token') or '')
+        return True, sid, meddy_id, refresh_token, "登录成功"
     else:
-        return False, '', '', message
+        return False, '', '', '', message
 
 
 # ========== 店铺相关 API ==========

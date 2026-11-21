@@ -184,6 +184,9 @@ class LoginManager:
         self.check_status: str = ''
         # 麦金卡状态:vip_time=最近开通下单时间(ISO);vip_status=valid/invalid/error(定义同 check_*,含义是麦金卡)
         self.vip_time: str = ''
+        # refreshToken（2026-11-21）：登录响应里带回的续期凭证，掉登录时可免重新接码。
+        # 之前完全没有保存，登录只返回一次，丢了就永久拿不回来。
+        self.refresh_token: str = ''
         self.vip_status: str = ''
 
         # 凭证文件路径
@@ -676,7 +679,8 @@ class LoginManager:
             log_info(f"✗ tid 激活失败: {message}")
         return self.tid
 
-    def save_credentials(self, token: str, sid: str, meddy_id: str) -> None:
+    def save_credentials(self, token: str, sid: str, meddy_id: str,
+                         refresh_token: Optional[str] = None) -> None:
         """
         保存登录凭证到文件或 Redis（原子写入，支持多账号）
 
@@ -707,6 +711,9 @@ class LoginManager:
             token = token if token else _old_row.get('token')
             sid = sid if sid else _old_row.get('sid')
             meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
+            # refreshToken 同理：传空 = 保留原值（登录只下发一次，任何一次保存都不能把它抹掉）
+            refresh_token = refresh_token if refresh_token else (_old_row.get('refresh_token', '') or '')
+            self.refresh_token = refresh_token or ''
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             self.vip_time, self.vip_status = vip_at_keep, vip_st_keep
@@ -716,6 +723,7 @@ class LoginManager:
                 'token': token,
                 'sid': sid,
                 'meddy_id': meddy_id,
+                'refresh_token': refresh_token,
                 'd': d_keep,
                 'device_id': self.device_id,
                 'tid': self.tid,
@@ -762,6 +770,8 @@ class LoginManager:
             token = token if token else _old_row.get('token')
             sid = sid if sid else _old_row.get('sid')
             meddy_id = meddy_id if meddy_id else _old_row.get('meddy_id')
+            refresh_token = refresh_token if refresh_token else (_old_row.get('refresh_token', '') or '')
+            self.refresh_token = refresh_token or ''
             self.province_bound, self.city_bound = p_keep, c_keep
             self.checked_at, self.check_status = chk_at_keep, chk_st_keep
             self.vip_time, self.vip_status = vip_at_keep, vip_st_keep
@@ -769,6 +779,7 @@ class LoginManager:
                 'token': token,
                 'sid': sid,
                 'meddy_id': meddy_id,
+                'refresh_token': refresh_token,
                 'd': d_keep,
                 'device_id': self.device_id,
                 'tid': self.tid,
@@ -831,6 +842,7 @@ class LoginManager:
         self.check_status = ''
         self.vip_time = ''
         self.vip_status = ''
+        self.refresh_token = ''
         set_active_d('')  # 先重置，避免同 worker 上个账号的 d 残留
         set_active_tid('')
         if self.use_redis:
@@ -855,6 +867,7 @@ class LoginManager:
                 self.cred_source = cred.get('source', '') or ''
                 self.tid = cred.get('tid')
                 self.tid_expire = cred.get('tid_expire')
+                self.refresh_token = cred.get('refresh_token', '') or ''
                 self.province_bound = cred.get('province', '') or ''
                 self.city_bound = cred.get('city', '') or ''
                 self.checked_at = cred.get('checked_at', '') or ''
@@ -895,6 +908,7 @@ class LoginManager:
                 self.meddy_id = meddy_id
                 self.d = cred.get('d')
                 self.device_id = cred.get('device_id')
+                self.refresh_token = cred.get('refresh_token', '') or ''
                 self.tid = cred.get('tid')
                 self.tid_expire = cred.get('tid_expire')
                 self.province_bound = cred.get('province', '') or ''
@@ -1000,11 +1014,13 @@ class LoginManager:
 
         log_info(f"\n正在登录 (手机号: {self.phone})...")
         proxies = self._get_proxy_dict()
-        success, sid, meddy_id, message = login(self.phone, verify_code, self.token, proxies=proxies)
+        success, sid, meddy_id, refresh_token, message = login(
+            self.phone, verify_code, self.token, proxies=proxies)
 
         if success:
-            # 保存凭证
-            self.save_credentials(self.token, sid, meddy_id)
+            # 保存凭证（含 refreshToken：掉登录时可用它续期，免得重新接码）
+            self.refresh_token = refresh_token or self.refresh_token
+            self.save_credentials(self.token, sid, meddy_id, refresh_token=refresh_token)
             return True, "登录成功"
         else:
             return False, message

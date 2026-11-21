@@ -320,7 +320,9 @@ def login_verify():
             'data': {
                 'token': login_manager.token,
                 'sid': login_manager.sid,
-                'meddy_id': login_manager.meddy_id
+                'meddy_id': login_manager.meddy_id,
+                # refreshToken：平台/注册脚本要能拿到并持久化（掉登录时用它续期，免重新接码）
+                'refresh_token': getattr(login_manager, 'refresh_token', '') or ''
             },
             'message': message
         })
