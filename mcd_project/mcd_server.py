@@ -21,7 +21,7 @@ import inspect
 import time
 from config import (CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis,
                     MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, CREDENTIALS_KEY_TMPL)
-from login_manager import LoginManager
+from login_manager import LoginManager, login_refresh
 import utils
 
 app = Flask(__name__)
@@ -341,6 +341,111 @@ def login_captcha_status():
     if not raw:
         return jsonify({'success': True, 'data': {'status': 'none'}, 'message': '无状态(未入队或已过期)'})
     return jsonify({'success': True, 'data': json.loads(raw)})
+
+
+@app.route('/api/maintenance/keepalive', methods=['POST'])
+def maintenance_keepalive():
+    """账号保活：对已登录号调 /bff/passport/login/refresh 续期 sid。
+
+    2026-11-21 麦当劳方说明：会话每天需要用 refresh(rfk) 接口激活一次，
+    真机 APP 后台进程每天自动做，不做就会掉登录。实测行为：
+      · sid 仍有效 → 200，返回同一 sid（等效续期）
+      · sid 已失效 → 401「登录失效或账号在其他设备登录」（救不活，只能重登）
+    所以按天跑一次能显著降低「号放着放着就 401」。
+
+    入参（均可选）：merchant_id / limit(0=不限) / min_interval_hours(默认20)
+    返回：total/ok/invalid/skipped/failed/elapsed_ms/details
+    """
+    body = request.get_json(silent=True) or {}
+    only_merchant = str(body.get('merchant_id') or '').strip()
+    try:
+        limit = int(body.get('limit') or 0)
+        min_hours = float(body.get('min_interval_hours') or 20)
+    except Exception:
+        limit, min_hours = 0, 20
+
+    t0 = time.time()
+    stats = {'total': 0, 'ok': 0, 'invalid': 0, 'skipped': 0, 'failed': 0}
+    details, errors = [], []
+    pattern = CREDENTIALS_KEY_TMPL.format(merchant_id='*')
+
+    for key in _cap_redis.scan_iter(match=pattern, count=200):
+        parts = str(key).split(':')
+        if len(parts) < 3:
+            continue
+        merchant_id = parts[2]
+        if only_merchant and merchant_id != only_merchant:
+            continue
+        try:
+            creds = _cap_redis.hgetall(key)
+        except Exception as e:
+            errors.append('读 %s 失败: %s' % (key, e))
+            continue
+        for phone, raw in creds.items():
+            if limit and stats['total'] >= limit:
+                break
+            try:
+                cred = json.loads(raw)
+            except Exception:
+                continue
+            token = str(cred.get('token') or '')
+            sid = str(cred.get('sid') or '')
+            if not (token and sid):
+                stats['skipped'] += 1
+                continue
+            # 距上次保活不足 min_hours 就跳过（每天一次足够）
+            last = str(cred.get('keepalive_at') or '')
+            if last:
+                try:
+                    if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < min_hours * 3600:
+                        stats['skipped'] += 1
+                        continue
+                except Exception:
+                    pass
+            stats['total'] += 1
+            city = str(cred.get('city') or '')
+            province = str(cred.get('province') or '')
+            pxy_src = str(cred.get('proxy_source') or '') or None
+            mgr = None
+            try:
+                mgr = get_login_manager(phone, city or None, province or None, merchant_id, pxy_src)
+                mgr.load_credentials()
+                mgr.apply_location(province, city)
+                try:
+                    proxies = mgr.get_login_proxy(is_send_code=False)
+                except Exception:
+                    proxies = None
+                ok, msg = login_refresh(mgr.token, mgr.sid, d=mgr.d or '', proxies=proxies)
+            except Exception as e:
+                ok, msg = False, '%s: %s' % (type(e).__name__, str(e)[:120])
+            if mgr is not None:
+                try:
+                    mgr.record_check('valid' if ok else 'invalid')
+                    mgr._merge_cred_fields({'keepalive_at': datetime.now().isoformat(),
+                                            'keepalive_ok': bool(ok)})
+                except Exception:
+                    pass
+            if ok:
+                stats['ok'] += 1
+            else:
+                low = str(msg or '')
+                if ('401' in low) or ('登录失效' in low) or ('重新登录' in low):
+                    stats['invalid'] += 1
+                else:
+                    stats['failed'] += 1
+            if len(details) < 50:
+                details.append({'merchant_id': merchant_id, 'phone': phone,
+                                'ok': bool(ok), 'msg': str(msg)[:100]})
+            time.sleep(0.2)  # 别把代理和麦当劳打太急
+
+    stats['elapsed_ms'] = int((time.time() - t0) * 1000)
+    app.logger.info('[keepalive] 完成 total=%d ok=%d invalid=%d skipped=%d failed=%d 用时 %dms'
+                    % (stats['total'], stats['ok'], stats['invalid'], stats['skipped'],
+                       stats['failed'], stats['elapsed_ms']))
+    data = dict(stats)
+    data['details'] = details
+    data['errors'] = errors[:10]
+    return jsonify({'success': True, 'data': data})
 
 
 @app.route('/api/login/status', methods=['GET'])
