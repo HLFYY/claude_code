@@ -419,20 +419,24 @@ def maintenance_keepalive():
             except Exception as e:
                 ok, msg = False, '%s: %s' % (type(e).__name__, str(e)[:120])
             if mgr is not None:
+                # 区分「真失效(401)」和「网络/代理异常」：后者记 error(不确定)，不能当掉线——
+                # 否则一次代理抖动就把好号标成 invalid，平台据此停派就误伤了。
+                low_msg = str(msg or '')
+                is_auth_dead = ('401' in low_msg) or ('登录失效' in low_msg) or ('重新登录' in low_msg)
                 try:
-                    mgr.record_check('valid' if ok else 'invalid')
+                    mgr.record_check('valid' if ok else ('invalid' if is_auth_dead else 'error'))
                     mgr._merge_cred_fields({'keepalive_at': datetime.now().isoformat(),
                                             'keepalive_ok': bool(ok)})
                 except Exception:
                     pass
+            low_msg = str(msg or '')
+            is_auth_dead = ('401' in low_msg) or ('登录失效' in low_msg) or ('重新登录' in low_msg)
             if ok:
                 stats['ok'] += 1
+            elif is_auth_dead:
+                stats['invalid'] += 1
             else:
-                low = str(msg or '')
-                if ('401' in low) or ('登录失效' in low) or ('重新登录' in low):
-                    stats['invalid'] += 1
-                else:
-                    stats['failed'] += 1
+                stats['failed'] += 1
             if len(details) < 50:
                 details.append({'merchant_id': merchant_id, 'phone': phone,
                                 'ok': bool(ok), 'msg': str(msg)[:100]})
