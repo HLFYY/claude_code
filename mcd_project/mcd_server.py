@@ -19,6 +19,7 @@ import redis
 from datetime import datetime
 import inspect
 import time
+import requests
 from config import (CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis,
                     MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, CREDENTIALS_KEY_TMPL)
 from login_manager import LoginManager, login_refresh
@@ -1194,6 +1195,132 @@ def proxy_whitelist_del():
     ok, msg = utils.zdtps_whitelist_del(ip, merchant_id=merchant_id)
     return jsonify({'success': ok, 'message': msg,
                     'data': {'whitelist': utils.zdtps_whitelist_list(merchant_id)}}), (200 if ok else 502)
+
+
+# 白名单同步节流窗口（秒）：外部每分钟调一次，接口内按商户 30 分钟一次
+WHITELIST_SYNC_INTERVAL = 1800
+
+
+def _whitelist_call(url: str, timeout: int = 15):
+    """调一次白名单接口。不同代理商成功表达不同（神龙 {"code":200}、站大爷 {"code":"10001"}），
+    所以判定放宽为：HTTP 200 且 body 里 code=200 / code=10001 / success=true。"""
+    try:
+        r = requests.get(url, timeout=timeout)
+        body = (r.text or '')[:200]
+        good = r.status_code == 200 and (
+            '"code":200' in body or '"code": 200' in body
+            or '"code":"10001"' in body or '"code": "10001"' in body
+            or '"success":true' in body or '"success": true' in body
+        )
+        return good, 'HTTP %s %s' % (r.status_code, body)
+    except Exception as e:
+        return False, '%s: %s' % (type(e).__name__, str(e)[:120])
+
+
+@app.route('/api/proxy/whitelist/sync', methods=['POST'])
+def proxy_whitelist_sync():
+    """商户代理白名单同步（通用 URL 模板，2026-11-21）。
+
+    配置来源：Redis Hash `mkt:prod:{商户}:whitelist`（平台保存时写入，94 不连平台 DB）
+      add_url   必填，含 {ip} 占位符
+      del_url   选填，留空 = 只加不删（旧 IP 会残留，用户已确认接受）
+      fixed_ips 常驻 IP（逗号分隔，只加不删）
+      enabled   '1' 才同步
+
+    body：{merchant_id?(不传=扫全部), force?(忽略节流)}
+    节奏：外部每分钟调一次；接口内按商户判断——有 sync_requested 立即跑（保存后即时生效），
+    否则距上次同步不足 WHITELIST_SYNC_INTERVAL 就跳过（等效 30 分钟一次）。
+
+    动态出口变化时：有 del_url 就先删旧 IP、再加新 IP，然后更新 last_ip。
+    """
+    data = request.get_json(silent=True) or {}
+    only = str(data.get('merchant_id') or '').strip()
+    force = bool(data.get('force'))
+
+    targets = []
+    try:
+        for key in _cap_redis.scan_iter(match='mkt:prod:*:whitelist', count=200):
+            parts = str(key).split(':')
+            if len(parts) < 4:
+                continue
+            if only and parts[2] != only:
+                continue
+            targets.append((parts[2], key))
+    except Exception as e:
+        return jsonify({'success': False, 'message': '扫描白名单配置失败: %s' % e}), 500
+
+    if only and not targets:
+        return jsonify({'success': False, 'message': '该商户没有启用的白名单配置'}), 400
+
+    results = []
+    for m, key in targets:
+        try:
+            cfg = _cap_redis.hgetall(key)
+        except Exception as e:
+            results.append({'merchant_id': m, 'ok': False, 'msg': '读配置失败: %s' % e})
+            continue
+        if str(cfg.get('enabled') or '') != '1':
+            continue
+        add_url = str(cfg.get('add_url') or '').strip()
+        if not add_url or '{ip}' not in add_url:
+            results.append({'merchant_id': m, 'ok': False, 'msg': 'add_url 缺失或不含 {ip}'})
+            continue
+
+        req_key, sync_key, ip_key = key + ':sync_requested', key + ':last_sync', key + ':last_ip'
+        try:
+            requested = _cap_redis.exists(req_key) == 1
+            last_ts = float(_cap_redis.get(sync_key) or 0)
+        except Exception:
+            requested, last_ts = False, 0
+        if not force and not requested and (time.time() - last_ts) < WHITELIST_SYNC_INTERVAL:
+            continue
+
+        del_url = str(cfg.get('del_url') or '').strip()
+        fixed = [x.strip() for x in str(cfg.get('fixed_ips') or '').split(',') if x.strip()]
+        cur = utils.get_egress_ip()
+        try:
+            last_ip = _cap_redis.get(ip_key) or ''
+        except Exception:
+            last_ip = ''
+
+        steps, ok_all = [], True
+
+        # 1) 固定 IP：每次都确保在白名单里（幂等；防止被别人删掉）
+        for ip in fixed:
+            ok, msg = _whitelist_call(add_url.replace('{ip}', ip))
+            steps.append({'action': 'add_fixed', 'ip': ip, 'ok': ok, 'msg': msg})
+            ok_all = ok_all and ok
+
+        # 2) 动态出口：变了才动
+        if cur and cur != last_ip:
+            if last_ip and del_url:
+                ok, msg = _whitelist_call(del_url.replace('{ip}', last_ip))
+                steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok, 'msg': msg})
+            ok, msg = _whitelist_call(add_url.replace('{ip}', cur))
+            steps.append({'action': 'add_new', 'ip': cur, 'ok': ok, 'msg': msg})
+            if ok:
+                try:
+                    _cap_redis.set(ip_key, cur)
+                except Exception:
+                    pass
+            else:
+                ok_all = False
+        else:
+            steps.append({'action': 'skip', 'ip': cur, 'ok': True, 'msg': '出口未变化'})
+
+        try:
+            _cap_redis.set(sync_key, str(int(time.time())))
+            if requested:
+                _cap_redis.delete(req_key)
+            _cap_redis.hset(key, 'last_sync_msg',
+                            ('OK ' if ok_all else 'FAIL ') + time.strftime('%Y-%m-%d %H:%M:%S'))
+        except Exception:
+            pass
+        results.append({'merchant_id': m, 'ok': ok_all, 'egress': cur,
+                        'last_ip': last_ip, 'steps': steps[:8]})
+
+    app.logger.info('[whitelist-sync] 同步商户数=%d' % len(results))
+    return jsonify({'success': True, 'data': {'synced': len(results), 'details': results}})
 
 
 @app.route('/api/proxy/stats', methods=['GET'])
