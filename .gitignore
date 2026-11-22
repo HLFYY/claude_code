@@ -48,6 +48,8 @@ mcd/resources/so/
 mcd/resources/apk/
 # 大体积抓包/二进制落盘目录（保留 logs 里的文本证据）
 mcd/resources/*.bin
+# mitm 抓包落盘目录：每轮生成 cap_<时间戳>/，含截图+JSON，单轮 6MB+，只留本地
+mcd/tools/mitm/cap_*/
 
 # ---- stock：已拆为独立仓库 git@github.com:HLFYY/stock.git（2026-11-10），这里整体忽略 ----
 stock/

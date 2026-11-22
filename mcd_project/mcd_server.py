@@ -838,6 +838,8 @@ def universal_mcd_api(function_name):
         log_params['token'] = f"{log_params['token'][:10]}..." if log_params['token'] else None
     if 'sid' in log_params:
         log_params['sid'] = f"{log_params['sid'][:10]}..." if log_params['sid'] else None
+    if 'refresh_token' in log_params:
+        log_params['refresh_token'] = '***'
 
     app.logger.info(f"[{function_name}] 账号({'有代理' if proxy_used else '无代理'}):{phone}, 请求参数: {log_params}")
 

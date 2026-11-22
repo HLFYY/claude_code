@@ -69,6 +69,35 @@
 }
 ```
 
+### 2.1 刷新登录会话
+`POST /api/mcd/login_session_refresh`
+
+上游为 `POST https://api2.mcd.cn/bff/passport/login/session/refresh`，JSON 请求体只有
+`{"refreshToken":"..."}`。与空请求体的 `/bff/passport/login/refresh` 是不同接口。
+依据为服务器 `/tmp/mcd_cap.tgz` 中 2026-10-21 的 `0055` 请求及 HTTP 200、业务成功响应。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| phone | string | 是 | 凭证账号标识，服务端据此加载 token/sid/d/tid |
+| refresh_token | string | 是 | 登录或上次刷新返回的 refreshToken，需显式传入 |
+| d | string | 否 | 默认使用账号凭证中的设备指纹 |
+| province / city / merchant_id / proxy_source | string | 否 | 见公共参数 |
+
+请求示例：
+```json
+{"phone":"acc_example","refresh_token":"<refreshToken>","merchant_id":"100001"}
+```
+
+响应结构示例（凭证均为占位符）：
+```json
+{"success":true,"data":{"sid":"<sid>","refreshToken":"<refreshToken>"},"message":"请求成功"}
+```
+
+Python 调用为 `login_session_refresh(token, sid, refresh_token, d='', proxies=None)`，
+返回 `(success, data, message)`。成功结果不自动写回 Redis/文件，调用方应保存返回的
+`sid` 和 `refreshToken`（凭证存储字段名为 `refresh_token`）。历史样本两者均未变化，
+不能假设必然轮换，也尚未验证已失效 sid 的恢复能力；此改动不接入自动保活任务。
+
 ### 3. 查询登录状态
 `GET /api/login/status`
 

@@ -500,6 +500,39 @@ def login_refresh(token, sid, d='', proxies=None):
     return False, message
 
 
+def login_session_refresh(token, sid, refresh_token, d='', proxies=None):
+    """
+    刷新登录会话: POST /bff/passport/login/session/refresh。
+
+    与空体 login_refresh 不同，本接口发送 {"refreshToken": "..."}，
+    返回 (success, data, message)，成功时 data 包含 sid 和 refreshToken。
+    依据：2026-10-21 服务器 /tmp/mcd_cap.tgz 中的 0055 请求及成功响应。
+    该样本返回的 sid/refreshToken 与请求相同，不能据此认定每次都会轮换，
+    也未验证已失效 sid 能否恢复。调用方应保存成功响应，不在此处修改凭证。
+
+    Args:
+        token: 账号固定的设备 Token。
+        sid: 当前登录会话 SID。
+        refresh_token: 登录或上次刷新返回的 refreshToken，原样传入。
+        d: 数美设备指纹；未传时沿用当前请求上下文。
+        proxies: 代理字典。
+
+    Returns:
+        (success, data, message)，data 保留上游字段名 sid/refreshToken。
+    """
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        return False, {}, "缺少有效的 refresh_token"
+
+    path = '/bff/passport/login/session/refresh'
+    body_str = json.dumps({'refreshToken': refresh_token}, separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body_str, method='POST', path=path, d=d)
+    headers['Host'] = 'api2.mcd.cn'
+    headers['Content-Type'] = 'application/json; charset=UTF-8'
+
+    url = f'{API2_BASE}{path}'
+    return make_request('POST', url, headers, data=body_str, proxies=proxies)
+
+
 def send_verification_code(phone, token, proxies=None):
     """
     步骤 2: 发送验证码
