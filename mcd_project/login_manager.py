@@ -369,20 +369,32 @@ class LoginManager:
         return px
 
     def _probe_proxy(self, proxies: Optional[Dict[str, str]]) -> bool:
-        """代理连通性探活：收到任何 HTTP 响应即算可用（403 也算，见 get_login_proxy 说明）。"""
+        """代理连通性探活：收到任何 HTTP 响应即算可用（403 也算，见 get_login_proxy 说明）。
+
+        2026-11-23 实测：神龙**刚分配出来**的代理，头一两次连接经常失败（curl 第一次 000，
+        紧接着连试三次都 403），是代理节点初始化/瞬时抖动，不是死端口也不是白名单。
+        所以同一个代理先原地重试 1 次再判死，避免把好代理换掉、又换回另一个同样没热起来的。
+        """
         if not proxies:
             return True
         if not getattr(config, 'PROXY_PROBE_ENABLED', True):
             return True
-        try:
-            requests.get(getattr(config, 'PROXY_PROBE_URL',
-                                'https://api2.mcd.cn/bff/common/normal/config'), proxies=proxies,
-                         timeout=getattr(config, 'PROXY_PROBE_TIMEOUT', 4))
-            return True
-        except Exception as e:
-            ip_port = proxy_url_to_ip_port(proxies.get('https') or proxies.get('http') or '')
-            log_info(f'  ✗ 代理不可用 {ip_port}（{type(e).__name__}）')
-            return False
+        url = getattr(config, 'PROXY_PROBE_URL',
+                      'https://api2.mcd.cn/bff/common/normal/config')
+        timeout = getattr(config, 'PROXY_PROBE_TIMEOUT', 4)
+        retries = max(1, int(getattr(config, 'PROXY_PROBE_RETRIES', 2)))
+        last_err = None
+        for i in range(retries):
+            try:
+                requests.get(url, proxies=proxies, timeout=timeout)
+                return True
+            except Exception as e:
+                last_err = e
+                if i < retries - 1:
+                    time.sleep(1.0)   # 给刚分配的节点 1 秒热起来
+        ip_port = proxy_url_to_ip_port(proxies.get('https') or proxies.get('http') or '')
+        log_info(f'  ✗ 代理不可用 {ip_port}（{type(last_err).__name__}，试了 {retries} 次）')
+        return False
 
     def _get_login_proxy_raw(self, is_send_code: bool = False,
                              force_new: bool = False) -> Optional[Dict[str, str]]:

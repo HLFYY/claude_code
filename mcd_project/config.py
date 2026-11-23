@@ -36,6 +36,8 @@ PROXY_MODE = 'always_short'
 # 探活目标用麦当劳网关（无签名返回 403 也算通——能收到响应就证明隧道可用）。
 PROXY_PROBE_ENABLED = (os.getenv('MCD_PROXY_PROBE', '1').strip() not in ('0', 'false', 'False'))
 PROXY_PROBE_TIMEOUT = float(os.getenv('MCD_PROXY_PROBE_TIMEOUT', '4'))
+# 同一个代理最多试几次（2026-11-23 实测：刚分配的神龙节点头一两次会连不上，1 秒后就正常）
+PROXY_PROBE_RETRIES = int(os.getenv('MCD_PROXY_PROBE_RETRIES', '2'))
 PROXY_PROBE_MAX = int(os.getenv('MCD_PROXY_PROBE_MAX', '3'))   # 最多取几次代理
 PROXY_PROBE_URL = 'https://api2.mcd.cn/bff/common/normal/config'
 
