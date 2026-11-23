@@ -666,6 +666,10 @@ def handle_login(phone, city=None, force_new_device=False, headless=True, pinned
             ok, tid, amsg = activate_token(manager.token, proxies=proxies)
             if ok:
                 break
+            # 失败必须打日志（2026-11-23）：原来只写 Redis 状态不打印，
+            # 出问题时日志里什么都看不到，只能靠猜（REG20261123-083 seq5 无从判断）。
+            log_info(f"[worker] {phone} 激活失败（第 {_try+1}/3 次）"
+                     f"proxy={(proxies or {}).get('http') if proxies else '直连'} 原因={amsg}")
             if not ('代理连接失败' in str(amsg) or 'ProxyError' in str(amsg)):
                 break   # 非代理问题，重试没意义
         beat(phone)  # activate 后
