@@ -1319,13 +1319,15 @@ def proxy_whitelist_sync():
             steps.append({'action': 'add_fixed', 'ip': ip, 'ok': ok, 'msg': msg})
             ok_all = ok_all and ok
 
-        # 2) 动态出口：变了才动
-        if cur and cur != last_ip:
-            if last_ip and del_url:
-                ok, msg = _whitelist_call(del_url.replace('{ip}', last_ip))
-                steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok, 'msg': msg})
+        # 2) 动态出口：每次都 ensure（2026-11-23 修）
+        # 原来只在 `cur != last_ip` 时才调添加接口，一旦 last_ip 被写成当前 IP
+        # （或神龙侧把 IP 清了/过期），就永远走 'skip 出口未变化'，从此不再添加 →
+        # 表现就是「宽带换 IP 后注册/下单全报代理连接失败，却一分钟都没自愈」。
+        # 神龙对已存在 IP 返回 code=1007「已存在」，幂等安全，所以每次都调。
+        if cur:
             ok, msg = _whitelist_call(add_url.replace('{ip}', cur))
-            steps.append({'action': 'add_new', 'ip': cur, 'ok': ok, 'msg': msg})
+            action = 'add_new' if (cur != last_ip) else 'ensure_cur'
+            steps.append({'action': action, 'ip': cur, 'ok': ok, 'msg': msg})
             if ok:
                 try:
                     _cap_redis.set(ip_key, cur)
@@ -1333,8 +1335,12 @@ def proxy_whitelist_sync():
                     pass
             else:
                 ok_all = False
+            # 只有真正换过 IP 才删旧的（旧 IP 已无用；当前 IP 绝不能删）
+            if last_ip and cur != last_ip and del_url:
+                ok_del, msg_del = _whitelist_call(del_url.replace('{ip}', last_ip))
+                steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok_del, 'msg': msg_del})
         else:
-            steps.append({'action': 'skip', 'ip': cur, 'ok': True, 'msg': '出口未变化'})
+            steps.append({'action': 'skip', 'ip': '', 'ok': False, 'msg': '取不到出口 IP'})
 
         try:
             _cap_redis.set(sync_key, str(int(time.time())))
