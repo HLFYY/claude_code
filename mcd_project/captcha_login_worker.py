@@ -651,8 +651,23 @@ def handle_login(phone, city=None, force_new_device=False, headless=True, pinned
         newly = force_new_device or not manager.token
         if newly:
             manager.token = generate_token()
-        # 激活拿 tid（登录场景头用）；新 token 激活失败则中止，复用 token 失败则 tid 置空继续
-        ok, tid, amsg = activate_token(manager.token, proxies=proxies)
+        # 激活拿 tid（登录场景头用）；新 token 激活失败则中止，复用 token 失败则 tid 置空继续。
+        # 2026-11-23：代理挂了就换代理重试——神龙短效代理约 1/3 不稳定，探活也不保证准
+        # （探通之后激活时照样可能断）。一次就判死会白烧一个手机号（REG20261123-613/258 的教训）。
+        # 钉住出口（造设备同 IP）的场景不能换，只能原样重试一次。
+        ok, tid, amsg = False, '', ''
+        for _try in range(3):
+            if _try:
+                if pinned_proxy:
+                    log_info(f"[worker] {phone} 钉住出口激活失败，原出口重试（{_try+1}/3）")
+                else:
+                    log_info(f"[worker] {phone} 激活时代理失败，换新代理重试（{_try+1}/3）")
+                    proxies = manager.get_login_proxy(is_send_code=True, force_new=True)
+            ok, tid, amsg = activate_token(manager.token, proxies=proxies)
+            if ok:
+                break
+            if not ('代理连接失败' in str(amsg) or 'ProxyError' in str(amsg)):
+                break   # 非代理问题，重试没意义
         beat(phone)  # activate 后
         if newly and not ok:
             set_status(phone, 'failed', f'token激活失败:{amsg}'); unfreeze(phone); return
