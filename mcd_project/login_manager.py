@@ -335,6 +335,57 @@ class LoginManager:
 
     def get_login_proxy(self, is_send_code: bool = False,
                         force_new: bool = False) -> Optional[Dict[str, str]]:
+        """统一入口 + 代理探活（2026-11-23）。
+
+        取到代理先发一个轻量请求验连通性，坏的立刻换新重取（最多 PROXY_PROBE_MAX 次）。
+        起因：神龙短效代理实测约 25% 是坏端口，注册时一撞上就
+        「token激活失败:代理连接失败」，直接白烧一个手机号。
+
+        探活判定：**只要能收到 HTTP 响应就算通**——麦当劳对无签名请求返回 403，
+        那恰好证明隧道是通的；只有 ProxyError / 连接超时 / 握手失败才算坏。
+        换不出新代理（如静态代理）时直接返回，不做无意义重试。
+        """
+        attempts = (getattr(config, 'PROXY_PROBE_MAX', 3)
+                    if getattr(config, 'PROXY_PROBE_ENABLED', True) else 1)
+        last = None
+        same = 0
+        px = None
+        for i in range(max(1, attempts)):
+            px = self._get_login_proxy_raw(is_send_code, force_new or i > 0)
+            if not px or not getattr(config, 'PROXY_PROBE_ENABLED', True):
+                return px
+            # 连续两次都换不出别的代理（静态代理、或池里只剩它）→ 认命返回，
+            # 只重复 1 次不直接放弃：短效池偶发重复时仍能走到下一次 force_new
+            if px == last:
+                same += 1
+                if same >= 2:
+                    return px
+            else:
+                same = 0
+            if self._probe_proxy(px):
+                return px
+            last = px
+            log_info(f'代理探活失败，换新重试（{i + 1}/{attempts}）')
+        return px
+
+    def _probe_proxy(self, proxies: Optional[Dict[str, str]]) -> bool:
+        """代理连通性探活：收到任何 HTTP 响应即算可用（403 也算，见 get_login_proxy 说明）。"""
+        if not proxies:
+            return True
+        if not getattr(config, 'PROXY_PROBE_ENABLED', True):
+            return True
+        try:
+            requests.get(getattr(config, 'PROXY_PROBE_URL',
+                                'https://api2.mcd.cn/bff/common/normal/config'), proxies=proxies,
+                         timeout=getattr(config, 'PROXY_PROBE_TIMEOUT', 4))
+            return True
+        except Exception as e:
+            ip_port = proxy_url_to_ip_port(proxies.get('https') or proxies.get('http') or '')
+            log_info(f'  ✗ 代理不可用 {ip_port}（{type(e).__name__}）')
+            return False
+
+    def _get_login_proxy_raw(self, is_send_code: bool = False,
+                             force_new: bool = False) -> Optional[Dict[str, str]]:
         """
         本次请求应使用的代理(requests proxies 字典)，或 None=直连。【统一入口】
 

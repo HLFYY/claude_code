@@ -30,6 +30,15 @@ USE_PROXY = True
 #                          其他接口用指定城市(city 参数)的复用代理(短效池轮巡)
 PROXY_MODE = 'always_short'
 
+# 代理探活（2026-11-23）：取到代理后先发一个轻量请求验连通性，坏的立刻换新重取。
+# 起因：神龙短效代理实测约 25% 是坏端口（连不上/5 秒超时），注册时一撞上就报
+# 「token激活失败:代理连接失败」，白烧一个手机号；下单也会撞，只是有换号/换代理兜底。
+# 探活目标用麦当劳网关（无签名返回 403 也算通——能收到响应就证明隧道可用）。
+PROXY_PROBE_ENABLED = (os.getenv('MCD_PROXY_PROBE', '1').strip() not in ('0', 'false', 'False'))
+PROXY_PROBE_TIMEOUT = float(os.getenv('MCD_PROXY_PROBE_TIMEOUT', '4'))
+PROXY_PROBE_MAX = int(os.getenv('MCD_PROXY_PROBE_MAX', '3'))   # 最多取几次代理
+PROXY_PROBE_URL = 'https://api2.mcd.cn/bff/common/normal/config'
+
 # 浏览器(自动化过滑块)代理认证方式：
 #   True  = 动态 Chrome 扩展带账号密码(支持需认证的代理)
 #   False = 白名单(浏览器只用 IP:端口，代理侧按 IP 放行)
