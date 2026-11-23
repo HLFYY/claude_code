@@ -23,6 +23,7 @@ from mcd_api import (
     generate_token,
     activate_token,
     login_refresh,
+    login_session_refresh,
     send_verification_code,
     login,
     build_headers,
@@ -926,6 +927,47 @@ class LoginManager:
             except Exception as e:
                 log_info(f"✗ 加载凭证失败: {e}")
                 return None, None, None
+
+    def refresh_session(self, province=None, city=None):
+        """读取 Redis 会话并刷新，仅在原会话未被替换时合并回写。"""
+        if not self.use_redis:
+            return False, {}, '自动刷新会话仅支持 Redis 凭证'
+        token, sid, _ = self.load_credentials()
+        refresh_token = self.refresh_token
+        if not token or not sid:
+            return False, {}, '账号缺少 token 或 sid，无法刷新会话'
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            return False, {}, '账号凭证缺少 refresh_token，请检查登录响应及凭证保存'
+        self.apply_location(province, city)
+        proxies = self.get_login_proxy(is_send_code=False) if USE_PROXY else None
+        success, data, message = login_session_refresh(
+            token, sid, refresh_token, d=self.d or '', proxies=proxies)
+        if not success:
+            return False, {}, message
+        if not isinstance(data, dict):
+            return False, {}, '刷新响应格式异常，未更新本地凭证'
+        new_sid = data.get('sid')
+        new_refresh_token = data.get('refreshToken')
+        if not isinstance(new_sid, str) or not new_sid.strip() or not isinstance(new_refresh_token, str) or not new_refresh_token.strip():
+            return False, {}, '刷新响应缺少有效 sid 或 refreshToken，未更新本地凭证'
+        for attempt in range(3):
+            try:
+                with self.redis_client.pipeline() as pipeline:
+                    pipeline.watch(self.redis_key)
+                    raw = pipeline.hget(self.redis_key, self.phone)
+                    current = json.loads(raw) if raw else {}
+                    if (current.get('token'), current.get('sid'), current.get('refresh_token')) != (token, sid, refresh_token):
+                        return False, {}, '账号登录凭证已被其他请求更新，本次刷新结果未回写，请重新读取凭证'
+                    current.update(sid=new_sid, refresh_token=new_refresh_token)
+                    pipeline.multi()
+                    pipeline.hset(self.redis_key, self.phone, json.dumps(current, ensure_ascii=False))
+                    pipeline.execute()
+                self.sid = new_sid
+                self.refresh_token = new_refresh_token
+                return True, data, message
+            except redis.WatchError:
+                continue
+        return False, {}, '凭证并发更新频繁，本次刷新结果未回写，请重新读取凭证'
 
     @retry_on_network_error(max_attempts=3, base_delay=1.0)
     def check_login_status(self) -> Tuple[bool, Optional[Dict]]:

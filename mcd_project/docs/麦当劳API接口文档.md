@@ -5,6 +5,10 @@
 登录管理：`login_manager.py`（基于 Redis/文件的多账号凭证管理）
 客户端示例：`run_api_client.py`
 
+客户端配置：默认使用 Android `7.0.45.1` 配套的版本头、User-Agent、SecBox v4 密钥及 `https://api2.mcd.cn` 业务基址。启动前设置 `MCD_APP_VERSION=7.0.41.0` 可回退旧配置；未知版本拒绝启动，不混用密钥。修改后须重启服务及 worker。接口原有登录要求保持不变。
+
+服务与 `captcha_login_worker.py` 应使用相同的 `MCD_APP_VERSION` 启动。`GET /health` 返回 `app_version` 和 `upstream_api_base`（不包含密钥），worker 启动日志显示 `app_version` 和 `sms_api_base`，可据此排查旧进程或环境变量覆盖。新生成设备载荷的 `a38` 同步当前 App 版本；历史模板及已注册设备凭证不重写。数美 SDK 版本、浏览器 User-Agent 和代理协议版本不是 App 版本，保持原值。
+
 统一响应格式（Flask 层）：
 ```json
 {
@@ -70,7 +74,7 @@
 ```
 
 ### 2.1 刷新登录会话
-`POST /api/mcd/login_session_refresh`
+`GET /api/login/session_refresh`（兼容原 POST JSON 调用）
 
 上游为 `POST https://api2.mcd.cn/bff/passport/login/session/refresh`，JSON 请求体只有
 `{"refreshToken":"..."}`。与空请求体的 `/bff/passport/login/refresh` 是不同接口。
@@ -78,14 +82,12 @@
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| phone | string | 是 | 凭证账号标识，服务端据此加载 token/sid/d/tid |
-| refresh_token | string | 是 | 登录或上次刷新返回的 refreshToken，需显式传入 |
-| d | string | 否 | 默认使用账号凭证中的设备指纹 |
+| phone | string | 是 | 凭证 Hash 的 field，沿用原有校验：长度为 11 或以 acc_ 开头；自动加载 token/sid/refresh_token/d/tid |
 | province / city / merchant_id / proxy_source | string | 否 | 见公共参数 |
 
 请求示例：
-```json
-{"phone":"acc_example","refresh_token":"<refreshToken>","merchant_id":"100001"}
+```python
+result = api_call('/api/login/session_refresh', params={'phone': 'acc_example', **_extra_params()})
 ```
 
 响应结构示例（凭证均为占位符）：
@@ -93,10 +95,19 @@
 {"success":true,"data":{"sid":"<sid>","refreshToken":"<refreshToken>"},"message":"请求成功"}
 ```
 
-Python 调用为 `login_session_refresh(token, sid, refresh_token, d='', proxies=None)`，
-返回 `(success, data, message)`。成功结果不自动写回 Redis/文件，调用方应保存返回的
-`sid` 和 `refreshToken`（凭证存储字段名为 `refresh_token`）。历史样本两者均未变化，
-不能假设必然轮换，也尚未验证已失效 sid 的恢复能力；此改动不接入自动保活任务。
+默认从 `mkt:prod:100001:credentials` 的 `phone` field 读取凭证；可用 `merchant_id` 选择其他商户。
+调用方不再需要传 `refresh_token`。成功且返回非空字符串 `sid`、`refreshToken` 后，自动更新
+Redis 账号记录的 `sid`、`refresh_token` 和当前账号对象；保留 token、设备、代理绑定及其他元数据。
+公共参数及代理选取规则与其他登录接口一致：客户端使用
+`api_call('/api/login/session_refresh', params={'phone': phone, **_extra_params()})`；
+服务端加载凭证后调用 `apply_location`，省市未传则沿用凭证绑定值，传入时按现有规则确定本次地域。
+业务失败或响应不完整时不回写会话字段；原会话已被并发登录/刷新替换时拒绝覆盖。保存异常返回失败，
+不把仅上游成功误报为整个流程成功。登录冻结期返回 HTTP 423，不自动登录、不发验证码。
+
+底层 Python 函数 `mcd_api.login_session_refresh(token, sid, refresh_token, d='', proxies=None)`
+仍只请求上游并返回 `(success, data, message)`，不自动保存。旧通用入口
+`/api/mcd/login_session_refresh` 保留原行为（显式传 refresh_token，不自动回写），不推荐用于账号续期。
+历史样本两者均未变化，不能假设必然轮换，也尚未验证已失效 sid 的恢复能力；此改动不接入自动保活任务。
 
 ### 3. 查询登录状态
 `GET /api/login/status`
@@ -271,12 +282,13 @@ Python 调用为 `login_session_refresh(token, sid, refresh_token, d='', proxies
 - 响应：验证信息（如门店营业状态、可下单校验结果）
 
 **get_order_promotion_info** — 结算第二步：促销/优惠券信息
-- 参数：`store_code`、`cart_items`（购物车商品列表）、`be_type`(默认'1')、`daypart_code`、`order_type`(默认'1')、`eat_type_code`(默认'eat-in')、`tableware_code`(默认'no')、`order_mode`(默认'0')、`pin_id`、`real_total_amount`(默认'0')
+- 参数：`store_code`、`cart_items`（购物车商品列表）、`be_type`(默认'1')、`daypart_code`、`order_type`(默认'1')、`eat_type_code`(默认'eat-in')、`tableware_code`(默认'no')、`order_mode`(默认'0')、`pin_id`、`real_total_amount`(默认'0')、`menu_card_list`（可选，菜单卡信息列表，默认空列表，透传为 `menuCardList`）
 - 对应上游：`POST /bff/order/confirmation/promotion`
 - 响应：可用促销/优惠券及计算后金额
 
 **submit_order** — 提交订单
 - 参数：`store_code`、`cart_items`、`be_type`(默认'1')、`daypart_code`、`order_type`(默认'1')、`eat_type_code`(默认'eat-in')、`tableware_code`(默认'no')、`order_mode`(默认'0')、`pin_id`、`latitude`、`longitude`、`date`、`time`、`menu_card_list`、`real_total_amount`
+- 经纬度：`latitude`、`longitude` 透传调用方入参并转换为 JSON 数值，默认均为 `0.0`。
 - 对应上游：`POST /bff/order/orders`
 - 签名说明：优先尝试通过 `v5_rpc_client`（若可用）获取 v5 签名（`x-mcd-sign` 头），失败则降级为 v4 签名（`authorization` + `x-hmac-digest`）
 - 响应：`{"orderId": "...", "payId": "...", ...}`

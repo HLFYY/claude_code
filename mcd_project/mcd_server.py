@@ -527,6 +527,27 @@ def login_status():
         })
 
 
+@app.route('/api/login/session_refresh', methods=['GET', 'POST'])
+def login_session_refresh():
+    """按账号标识读取刷新凭证，刷新成功后自动保存会话。"""
+    data = request.args.to_dict() if request.method == 'GET' else request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'data': {}, 'message': '请求体必须是 JSON 对象'}), 400
+    phone = data.get('phone')
+    if not isinstance(phone, str) or not phone.strip():
+        return jsonify({'success': False, 'data': {}, 'message': 'phone 必须是非空字符串账号标识'}), 400
+    if is_frozen(phone):
+        return jsonify({'success': False, 'data': {}, 'message': '账号正在登录处理中，请稍后刷新'}), 423
+    province, merchant_id, proxy_source = _biz_params(data)
+    try:
+        manager = get_login_manager(phone, data.get('city'), province, merchant_id, proxy_source)
+        success, result, message = manager.refresh_session(province=province, city=data.get('city'))
+        return jsonify({'success': success, 'data': result, 'message': message})
+    except Exception:
+        app.logger.error('[session_refresh] 会话刷新或凭证保存异常')
+        return jsonify({'success': False, 'data': {}, 'message': '会话刷新或凭证保存异常，请检查服务端存储及代理配置'}), 500
+
+
 @app.route('/api/login/bind_city', methods=['POST'])
 def login_bind_city():
     """绑定/修改账号省市(显式覆盖凭证里的 province/city)。
@@ -1353,7 +1374,12 @@ def proxy_stats_query():
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查"""
-    return jsonify({'status': 'ok', 'service': 'mcd-api-refactored'})
+    return jsonify({
+        'status': 'ok',
+        'service': 'mcd-api-refactored',
+        'app_version': mcd_api.CLIENT_PROFILE.version,
+        'upstream_api_base': mcd_api.API_BASE,
+    })
 
 
 def start_gunicorn():

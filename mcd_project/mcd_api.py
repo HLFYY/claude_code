@@ -18,7 +18,7 @@ import json
 import time
 import random
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from datetime import datetime
@@ -29,6 +29,7 @@ from Crypto.Util.Padding import pad
 # 导入配置
 from config import PROXY_REQUEST_TIMEOUT
 from utils import log_info, maybe_async_whitelist_refresh
+from mcd_profiles import get_client_profile
 
 # v5 RPC 客户端（可选）
 try:
@@ -44,9 +45,10 @@ except ImportError:
 # ========== 配置区域 ==========
 
 # 从 SecBox 提取的密钥 (通过 Frida hook 获取)
-AES_KEY = 'w8ZJ4wrUl7dDB1A7'    # SecBox.getAesKey() - 用于 AES 加密
-V4SK = 'JURCUMJRrQRI8gkB1mGrL9vexmkGgpLgxJ96Yovp'  # SecBox.getV4sk() - 用于 HMAC 签名
-V4AK = 'HJ7YLqOY06F61FPEhF7H'  # SecBox.getV4ak() - 访问密钥
+CLIENT_PROFILE = get_client_profile()
+AES_KEY = CLIENT_PROFILE.aes_key
+V4SK = CLIENT_PROFILE.v4sk
+V4AK = CLIENT_PROFILE.v4ak
 
 # 固定配置
 AUTH_VERSION = 'hmac-auth-v1'
@@ -54,7 +56,7 @@ ALGORITHM = 'hmac-sha256'
 SIGNED_HEADERS = ['ct', 'language', 'p', 'sid', 'sv', 'token', 'v', 'x-mcd-gw-v']
 
 # API 端点
-API_BASE = 'https://api.mcd.cn'
+API_BASE = CLIENT_PROFILE.api_base
 API2_BASE = 'https://api2.mcd.cn'
 
 # 各接口的 biz_scenario / biz_from（真机抓包实测，2026-10-21）。
@@ -72,11 +74,12 @@ BIZ_MAP = {
     '/bff/store/stores/hottags': ('103', '1014'),
     '/bff/store/stores/{id}': ('101', '1004'),
     '/bff/store/stores/getNearest/{id}': ('202', '1021'),
-    '/bff/spc/menu': ('101', '1009'),
+    '/bff/spc/menu': ('101', '1006'),
     '/bff/spc/menu/campaign': ('101', '1009'),
     '/bff/spc/frequent': ('101', '1009'),
     '/bff/spc/products/detail/{code}': ('101', '1001'),
     '/bff/cart/carts': ('101', '1007'),
+    '/bff/cart/carts/empty': ('200', '1003'),
     '/bff/promotion/coupons/card': ('101', '1007'),
     '/bff/promotion/price/calculate/product': ('101', '1001'),
     '/bff/order/confirmation/validationinfo': ('200', '1004'),
@@ -84,6 +87,7 @@ BIZ_MAP = {
     '/bff/order/confirmation/addon': ('202', '1012'),
     '/bff/order/confirmation/rightcard': ('202', '1019'),
     '/bff/order/orders': ('202', '1012'),
+    '/bff/order/orders/list': ('202', '1006'),
     '/bff/cashier/channels': ('501', '1001'),
     '/bff/cashier/preorder': ('501', '1002'),
     '/bff/member/device/collect': ('100', '1020'),
@@ -359,13 +363,13 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
 
     # 基础请求头
     headers = {
-        'ct': '102',
+        'ct': CLIENT_PROFILE.client_type,
         'language': 'cn',
-        'p': '102',
+        'p': CLIENT_PROFILE.platform,
         'sid': sid,
         'sv': 'v4',
         'token': token,
-        'v': '7.0.41.0',   # 必须与访问密钥 V4AK(HJ7..=7.0.41.0版) 匹配; 声明43.1会被网关拒(我们无5DLU密钥)
+        'v': CLIENT_PROFILE.version,
         'x-mcd-gw-v': '1',
     }
 
@@ -399,8 +403,8 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
 
     # 返回完整请求头
     result = {
-        'Host': 'api.mcd.cn',
-        'user-agent': 'mcdonald_Android/7.0.41.0 (Android)',
+        'Host': urlsplit(API_BASE).netloc,
+        'user-agent': CLIENT_PROFILE.user_agent,
         'ct': headers['ct'],
         'language': headers['language'],
         'p': headers['p'],
@@ -418,7 +422,7 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         'nonce': nonce_val,
         'routingid': '',
         'meddyid': '',
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json; charset=UTF-8' if body_str else 'application/json',
     }
     # tid / d 仅在有值时带上（真机登录场景）
     if tid:
@@ -1225,7 +1229,8 @@ def get_order_validation_info(token, sid, store_code, channel_code='03', order_t
 
 def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', daypart_code=None,
                              order_type='1', eat_type_code='eat-in', tableware_code='no',
-                             order_mode='0', pin_id='', real_total_amount='0', proxies=None):
+                             order_mode='0', pin_id='', real_total_amount='0', proxies=None,
+                             menu_card_list=None):
     """
     获取促销/优惠券信息 (对应 curl: /bff/order/confirmation/promotion)
     购物车点击去结算请求2
@@ -1244,6 +1249,7 @@ def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', da
         pin_id: Pin ID
         real_total_amount: 实际总金额
         proxies: 代理字典 {'http': '...', 'https': '...'}
+        menu_card_list: 菜单卡信息列表（默认空列表，透传调用方提供的卡信息）
 
     Returns:
         (success, promotion_data, message)
@@ -1266,7 +1272,7 @@ def get_order_promotion_info(token, sid, store_code, cart_items, be_type='1', da
         "expectDeliveryDateCode": "",
         "latitude": 0.0,
         "longitude": 0.0,
-        "menuCardList": [],
+        "menuCardList": menu_card_list if menu_card_list is not None else [],
         "orderMode": order_mode,
         "orderType": order_type,
         "pinId": pin_id,
@@ -1379,8 +1385,8 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
         "driveDurationNew": -1,
         "eatTypeCode": eat_type_code,
         "expectDeliveryDateCode": "",
-        "latitude": '0',
-        "longitude": '0',
+        "latitude": float(latitude),
+        "longitude": float(longitude),
         "menuCardList": menu_card_list,
         "orderMode": order_mode,
         "orderType": order_type,
@@ -1421,9 +1427,9 @@ def submit_order(token, sid, store_code, cart_items, be_type='1', daypart_code=N
             'x-mcd-sign': v5_signature,
             'token': token,
             'sid': sid,
-            'v': '7.0.41.0',
-            'p': '102',
-            'ct': '102',
+            'v': CLIENT_PROFILE.version,
+            'p': CLIENT_PROFILE.platform,
+            'ct': CLIENT_PROFILE.client_type,
             'language': 'en',
             'x-mcd-gw-v': '1',
             'Date': formatdate(timeval=None, localtime=False, usegmt=True),

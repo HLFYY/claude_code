@@ -62,6 +62,7 @@ def gen_shortbox():
     """模板 + 替换身份字段(每台不同) → 新设备 shortbox。返回 (box, model_dict)。"""
     m = random.choice(MODELS)
     box = json.loads(json.dumps(TEMPLATE))               # 深拷贝模板
+    box['a38'] = mcd_api.CLIENT_PROFILE.version
     # ── ① 每台必须唯一的身份字段:随机(否则多台被判同一设备) ──
     box['a24'] = os.urandom(8).hex()                     # android_id
     box['a46'] = {"model": m["model"], "serial": "", "brand": m["brand"],

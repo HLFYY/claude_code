@@ -39,7 +39,7 @@ from DrissionPage._units.actions import Actions
 from ddddocr import DdddOcr
 
 from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis, DATA_DIR
-from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, generate_token, activate_token, ectrade_order_create
+from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, CLIENT_PROFILE, generate_token, activate_token, ectrade_order_create
 from login_manager import LoginManager
 from utils import log_info, ensure_egress_whitelisted
 
@@ -894,7 +894,8 @@ def main():
         headless = False
     if '--headless' in sys.argv:
         headless = True
-    log_info(f"[worker] 启动，IS_LOCAL={IS_LOCAL} USE_PROXY={USE_PROXY} headless={headless}，监听 {CAPTCHA_LOGIN_CONFIG['queue_key']}")
+    log_info(f"[worker] 启动，app_version={CLIENT_PROFILE.version} sms_api_base={API2_BASE}，"
+             f"IS_LOCAL={IS_LOCAL} USE_PROXY={USE_PROXY} headless={headless}，监听 {CAPTCHA_LOGIN_CONFIG['queue_key']}")
     try:
         ensure_egress_whitelisted()  # 启动自动把本机出口IP加进 zdtps 白名单(多出口全加),免代理407
     except Exception as e:

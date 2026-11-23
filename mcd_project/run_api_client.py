@@ -1305,3 +1305,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # result = api_call('/api/login/session_refresh', params={'phone': '18019701277', **_extra_params()})
+    # print(result)
