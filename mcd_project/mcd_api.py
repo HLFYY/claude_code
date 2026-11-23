@@ -53,6 +53,8 @@ V4AK = CLIENT_PROFILE.v4ak
 # 固定配置
 AUTH_VERSION = 'hmac-auth-v1'
 ALGORITHM = 'hmac-sha256'
+# 真机抓包 2026-11-23：80 条 api2 业务请求 routingid 全部为 '17'
+ROUTING_ID = '17'
 SIGNED_HEADERS = ['ct', 'language', 'p', 'sid', 'sv', 'token', 'v', 'x-mcd-gw-v']
 
 # API 端点
@@ -115,6 +117,13 @@ import contextvars
 _active_d = contextvars.ContextVar('active_d', default='')
 # 当前请求使用的 tid（Token 激活返回；7天有效，由 LoginManager.ensure_tid 设置）
 _active_tid = contextvars.ContextVar('active_tid', default='')
+# 当前请求的 meddyId（账号级，真机 80/80 请求都带同一个值；从凭证加载后设置）
+_active_meddy = contextvars.ContextVar('active_meddy', default='')
+
+
+def set_active_meddy(meddy_id):
+    """设置当前请求的 meddyId；空则清除。服务端通用路由加载凭证后调用。"""
+    _active_meddy.set(str(meddy_id or ''))
 
 
 def set_active_d(d):
@@ -420,8 +429,10 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         'biz_from': biz_from,
         'st': st_val,
         'nonce': nonce_val,
-        'routingid': '',
-        'meddyid': '',
+        # 真机抓包 2026-11-23：routingid 恒为 '17'（80/80），meddyid 为账号级固定值（80/80）。
+        # 两者都不参与 HMAC 签名，可直接带上；meddyid 由服务端通用路由从凭证注入。
+        'routingid': ROUTING_ID,
+        'meddyid': _active_meddy.get(),
         'Content-Type': 'application/json; charset=UTF-8' if body_str else 'application/json',
     }
     # tid / d 仅在有值时带上（真机登录场景）
@@ -429,6 +440,11 @@ def build_headers(token, sid='', body=None, method='GET', path='/', query_params
         result['tid'] = tid
     if d:
         result['d'] = d
+    # 真机每请求都会生成新的交互 UUID 与链路追踪 ID（98/87 个不同值），
+    # 二者都不参与 HMAC 签名，随机生成无风险，可显著减少「固定头」指纹。
+    result['br_interactive_uuid'] = str(uuid.uuid4())
+    result['x-b3-traceid'] = uuid.uuid4().hex.upper()
+    result['x-b3-spanid'] = uuid.uuid4().hex[:16].upper()
 
     return result
 

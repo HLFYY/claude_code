@@ -29,6 +29,7 @@ from mcd_api import (
     build_headers,
     set_active_d,
     set_active_tid,
+    set_active_meddy,
     API2_BASE
 )
 from exceptions import (
@@ -877,6 +878,7 @@ class LoginManager:
                 self.vip_status = cred.get('vip_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
+                set_active_meddy(meddy_id)   # 真机 80/80 带账号级 meddyid
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id
@@ -920,6 +922,7 @@ class LoginManager:
                 self.vip_status = cred.get('vip_status', '') or ''
                 set_active_d(self.d)  # 设为当前请求使用的 d
                 set_active_tid(self.tid)
+                set_active_meddy(meddy_id)   # 真机 80/80 带账号级 meddyid
 
                 log_info(f"✓ 找到已保存的凭证 (手机号: {self.phone}, 保存时间: {saved_at})")
                 return token, sid, meddy_id

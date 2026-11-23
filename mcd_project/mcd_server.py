@@ -811,6 +811,8 @@ def universal_mcd_api(function_name):
 
     login_manager = get_login_manager(phone, city, province, merchant_id, proxy_source)
     token, sid, meddy_id_from_redis = login_manager.load_credentials()
+    # 真机 80/80 请求都带账号级 meddyid；不参与签名，从凭证注入到当前请求上下文
+    mcd_api.set_active_meddy(meddy_id_from_redis)
     login_manager.apply_location(province, city)  # 定生效省/市 + 未绑定则绑定(取代理按此省市)
     if sid and not token:
         token = login_manager.ensure_token()  # 只有 sid 无 token → 自动生成+激活+绑定
