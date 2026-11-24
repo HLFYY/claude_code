@@ -21,6 +21,7 @@
 """
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -59,6 +60,38 @@ KEEPALIVE_LAST_TTL = 86400  # 24 小时
 # 城市上下文缓存（city → code/lat/lng），get_all_cities 拉一次，缓存 24h
 _CITY_CTX = {'at': 0.0, 'map': {}}
 _CITY_CTX_TTL = 86400
+
+# ★ 静态城市码表（2026-11-24）：注册/保活必定带城市，city_code 不该依赖 get_all_cities
+#   这个网络接口（冷启动第一次拉失败 → city_code 空 → 主页/会员/设备三个动作被跳过，
+#   新号假启动只跑成 2/2）。city_codes.json 是从上游 /bff/store/cities/group 拉的
+#   323 个城市真实 code + 中心经纬度，命中即用、零网络、零延迟。
+#   lookup_city 优先查这里；查不到（新城市/表缺失）才回落 get_all_cities。
+_STATIC_CITY_CTX = None
+
+
+def _load_static_city_ctx():
+    global _STATIC_CITY_CTX
+    if _STATIC_CITY_CTX is not None:
+        return _STATIC_CITY_CTX
+    out = {}
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'city_codes.json')
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f) or {}
+        for name, entry in raw.items():
+            e = {'code': str(entry.get('code') or '').strip(),
+                 'lat': entry.get('lat'), 'lng': entry.get('lng')}
+            if not e['code']:
+                continue
+            out[name] = e
+            short = _normalize_city(name)
+            if short and short not in out:
+                out[short] = e
+    except Exception:
+        pass
+    _STATIC_CITY_CTX = out
+    return out
+
 
 _redis = None
 
@@ -127,10 +160,20 @@ def _add_city(out, ct):
 
 
 def lookup_city(city_name, token=None, sid=None, proxies=None):
-    """按城市名取 {code, lat, lng}；取不到返回 None（该号就跳过需要城市参数的请求）。"""
+    """按城市名取 {code, lat, lng}；取不到返回 None（该号就跳过需要城市参数的请求）。
+
+    2026-11-24：先查静态码表（323 城、零网络）—— 注册/保活的城市是确定的，
+    city_code 不该因 get_all_cities 冷启动抖动而拿不到。静态表命中就直接用；
+    只有表里没有（新城市/文件缺失）才回落网络接口。
+    """
     name = (city_name or '').strip()
     if not name:
         return None
+    static = _load_static_city_ctx()
+    for cand in (name, _normalize_city(name), name + '市'):
+        if cand and cand in static:
+            return static[cand]
+    # 静态表没命中，回落在线接口
     ctx = get_city_context(token, sid, proxies) if (token and sid) else _CITY_CTX['map']
     if not ctx:
         return None
