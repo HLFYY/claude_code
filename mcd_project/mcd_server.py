@@ -365,9 +365,17 @@ def maintenance_keepalive():
     only_merchant = str(body.get('merchant_id') or '').strip()
     try:
         limit = int(body.get('limit') or 0)
-        min_hours = float(body.get('min_interval_hours') or 20)
     except Exception:
-        limit, min_hours = 0, 20
+        limit = 0
+    # ⚠️ 不能用 `body.get(...) or 20`：显式传 0（=不去重，本次全跑）会被当成「没传」变成 20，
+    #    导致「立即执行一次」看起来跑了、实际把号全 skip 掉（2026-11-24 实测踩到）。
+    if body.get('min_interval_hours') is None:
+        min_hours = 20.0
+    else:
+        try:
+            min_hours = float(body.get('min_interval_hours'))
+        except Exception:
+            min_hours = 20.0
     do_launch = body.get('do_launch')
     do_launch = True if do_launch is None else bool(do_launch)
     only_with_rt = body.get('only_with_rt')
