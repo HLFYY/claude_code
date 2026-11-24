@@ -440,10 +440,13 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
     结果写回 Redis mkt:prod:{商户}:keepalive:last（24h 过期），后台弹窗读它。
     """
     r = redis_client or _r()
+    t_start = time.time()  # 结果写回 Redis 时要带上耗时，后台弹窗显示「用时 Xs」
     stats = {'total': 0, 'alive': 0, 'dead': 0, 'unknown': 0,
              'launch_ok': 0, 'launch_total': 0}
     details = []
     errors = []
+    total_creds = 0
+    with_rt = 0
     pattern = CREDENTIALS_KEY_TMPL.format(merchant_id='*')
 
     # 预热城市上下文（get_all_cities 一次 2~3 秒，批量时只拉一次，后面命中缓存）
@@ -474,7 +477,11 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
                 cred = json.loads(raw)
             except Exception:
                 continue
-            if only_with_rt and not str(cred.get('refresh_token') or '').strip():
+            total_creds += 1
+            has_rt = bool(str(cred.get('refresh_token') or '').strip())
+            if has_rt:
+                with_rt += 1
+            if only_with_rt and not has_rt:
                 continue
             token = str(cred.get('token') or '')
             sid = str(cred.get('sid') or '')
@@ -495,6 +502,19 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             targets.append((key, mid, phone, city, province, cred))
         if limit and len(targets) >= limit:
             break
+
+    # 没挑到号时给后台一个明确说明，否则弹窗只显示「共 0 个 / 成功 0 / 失败 0」像坏了。
+    if not targets:
+        msg = ('本次没有可保活的账号：该商户凭据 %d 个，带 refreshToken 的 %d 个'
+               % (total_creds, with_rt))
+        if only_with_rt:
+            msg += '；保活只做带 refreshToken 的号（无 RT 无法走 session/refresh）'
+        errors.append(msg)
+        details.append({
+            'phone': '—', 'state': 'unknown', 'msg': msg[:100],
+            'refresh_kind': '', 'launch_ok': 0, 'launch_total': 0,
+            'launch_detail': '',
+        })
 
     # ---- 2) 号级并发保活 ----
     def _one(t):
@@ -554,6 +574,10 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
         'details': details,
         'errors': errors[:10],
     }
+    # ⚠️ 必须在写 Redis 之前算好：mcd_server.py 是在 run_keepalive() 返回后才补
+    # payload['elapsed_ms']，那份只进 HTTP 响应；后台读的是 Redis 里的这一份。
+    # 之前漏了这段，所以弹窗「用时」一直是 "-"。
+    payload['elapsed_ms'] = int((time.time() - t_start) * 1000)
     try:
         r.set(KEEPALIVE_LAST_KEY_TMPL.format(merchant_id=merchant_id or '*'),
               json.dumps(payload, ensure_ascii=False), ex=KEEPALIVE_LAST_TTL)
