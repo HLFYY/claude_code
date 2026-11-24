@@ -72,17 +72,17 @@ BIZ_MAP = {
     '/bff/store/cities': ('100', '1002'),
     '/bff/store/cities/group': ('103', '1007'),
     '/bff/store/stores': ('103', '1013'),
-    '/bff/store/stores/vicinity': ('103', '1012'),
+    '/bff/store/stores/vicinity': ('100', '1005'),   # 抓包实测 100/1005（原 103/1012 是首页入口的）
     '/bff/store/stores/hottags': ('103', '1014'),
     '/bff/store/stores/{id}': ('101', '1004'),
     '/bff/store/stores/getNearest/{id}': ('202', '1021'),
     '/bff/spc/menu': ('101', '1006'),
-    '/bff/spc/menu/campaign': ('101', '1009'),
+    '/bff/spc/menu/campaign': ('', ''),               # 抓包实测不带场景头
     '/bff/spc/frequent': ('101', '1009'),
     '/bff/spc/products/detail/{code}': ('101', '1001'),
     '/bff/cart/carts': ('101', '1007'),
     '/bff/cart/carts/empty': ('200', '1003'),
-    '/bff/promotion/coupons/card': ('101', '1007'),
+    '/bff/promotion/coupons/card': ('', ''),          # 抓包实测不带场景头
     '/bff/promotion/price/calculate/product': ('101', '1001'),
     '/bff/order/confirmation/validationinfo': ('200', '1004'),
     '/bff/order/confirmation/promotion': ('202', '1020'),
@@ -95,6 +95,11 @@ BIZ_MAP = {
     '/bff/member/device/collect': ('100', '1020'),
     '/bff/member/user/portal/v2': ('100', '1027'),
     '/bff/common/proxy/tid': ('100', '1002'),
+    # ---- 2026-11-24 启动/进店动作（真机抓包 16:42:01-16:42:18）----
+    '/bff/common/normal/config': ('500', '1002'),
+    '/bff/portal/home/index': ('100', '1003'),
+    '/bff/common/normal/ab/experiments': ('', ''),
+    '/bff/mc/remind/login/submit': ('', ''),
 }
 _BIZ_DEFAULT = ('102', '1006')
 
@@ -1689,4 +1694,129 @@ def get_order_detail(token, sid, order_id, proxies=None):
         return True, data, "获取订单详情成功"
     else:
         return False, {}, message
-        return False, {}, f"请求异常: {str(e)}"
+
+
+# ==================== App 启动 / 进店 动作（2026-11-24 真机抓包对照新增） ====================
+# 背景：真机从打开 APP 到进店有一整套动作（本次抓包 16:42:01–16:42:18），
+# 我们此前直接「清车→加购→提单」，行为链上缺了「打开 APP / 进店看车看券」这两段。
+# 以下接口全部为只读（device_collect/remind 为上报），失败不阻断下单。
+
+def get_normal_config(token, sid='', proxies=None):
+    """GET /bff/common/normal/config —— App 启动拉全局配置（无参数，场景头 500/1002）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/common/normal/config')
+    url = f'{API_BASE}/bff/common/normal/config'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def get_home_index(token, sid, city_code, store_code, home_version=2, proxies=None):
+    """GET /bff/portal/home/index —— 首页（真机必带 cityCode+storeCode+homeVersion=2）"""
+    params = {'cityCode': str(city_code), 'storeCode': str(store_code),
+              'homeVersion': str(home_version)}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/portal/home/index', query_params=params)
+    url = f'{API_BASE}/bff/portal/home/index'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def get_member_portal(token, sid, city_code, proxies=None):
+    """GET /bff/member/user/portal/v2 —— 会员信息（体现「登录用户在用」）"""
+    params = {'cityCode': str(city_code)}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/member/user/portal/v2', query_params=params)
+    url = f'{API_BASE}/bff/member/user/portal/v2'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def get_ab_experiments(token, sid, proxies=None):
+    """GET /bff/common/normal/ab/experiments —— AB 实验分组（无参数、无场景头）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/common/normal/ab/experiments')
+    url = f'{API_BASE}/bff/common/normal/ab/experiments'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def post_remind_login_submit(token, sid, proxies=None):
+    """POST /bff/mc/remind/login/submit —— 启动时上报通知/弹窗状态（与登录无关）"""
+    body = json.dumps({'noticeStatus': 1, 'noticeStatusChange': 0, 'startupState': 1},
+                      separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/mc/remind/login/submit')
+    url = f'{API_BASE}/bff/mc/remind/login/submit'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def post_device_collect(token, sid, city_code, latitude, longitude,
+                        um_token='', sys_version='10', proxies=None):
+    """POST /bff/member/device/collect —— 设备信息上报。
+
+    真机实测 imei/oaid/mcdToken 三个字段填的都是同一个 token 值（不校验真实性），
+    umToken 是友盟设备级 token（同设备固定，非账号级），拿不到真值时可留空。
+    """
+    body = json.dumps({
+        'allowNotice': 1, 'cityCode': str(city_code), 'collectType': 0,
+        'imei': token, 'latitude': latitude, 'longitude': longitude,
+        'mcdToken': token, 'oaid': token, 'pushType': 2,
+        'sysVersion': str(sys_version), 'umToken': um_token or '',
+    }, separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/member/device/collect')
+    url = f'{API_BASE}/bff/member/device/collect'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def get_coupons_card(token, sid, store_code, city_code, daypart_code=None,
+                     order_type=1, proxies=None):
+    """GET /bff/promotion/coupons/card —— 进店看券卡包（真机无场景头）"""
+    if daypart_code is None:
+        daypart_code = get_current_daypart_code()
+    params = {'beCode': '', 'beType': '1', 'cityCode': str(city_code),
+              'orderType': str(order_type), 'storeCode': str(store_code),
+              'daypartCode': str(daypart_code), 'orderMode': '0',
+              'isPromoter': '0', 'themeId': '', 'uniCode': '', 'scene': '3',
+              'date': '', 'time': ''}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/promotion/coupons/card', query_params=params)
+    url = f'{API_BASE}/bff/promotion/coupons/card'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def get_spc_frequent(token, sid, store_code, daypart_code=None, order_type=1, proxies=None):
+    """GET /bff/spc/frequent —— 常点列表（进店第二批，场景头 101/1009）"""
+    if daypart_code is None:
+        daypart_code = get_current_daypart_code()
+    params = {'storeCode': str(store_code), 'orderType': str(order_type),
+              'dayPartCode': str(daypart_code), 'beType': '1',
+              'beCode': '', 'orderMode': '0'}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/spc/frequent', query_params=params)
+    url = f'{API_BASE}/bff/spc/frequent'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def get_menu_campaign(token, sid, store_code, daypart_code=None, order_type=1, proxies=None):
+    """GET /bff/spc/menu/campaign —— 店内活动（真机无场景头）"""
+    if daypart_code is None:
+        daypart_code = get_current_daypart_code()
+    params = {'beCode': '', 'beType': '1', 'orderType': str(order_type),
+              'storeCode': str(store_code), 'dayPartCode': str(daypart_code),
+              'orderMode': '0', 'uniCode': '', 'hasStoreAnnounce': '0',
+              'date': '', 'time': '', 'pinId': ''}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/spc/menu/campaign', query_params=params)
+    url = f'{API_BASE}/bff/spc/menu/campaign'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def get_store_info(token, sid, store_code, be_type='1', order_type=1, proxies=None):
+    """GET /bff/store/stores/{storeCode} —— 进店门票（看门店详情）。
+
+    真机参数：beType=1&date=&dayPartCodes=&time=&simulationTest=0（场景头 101/1004）
+    """
+    params = {'beType': str(be_type), 'date': '', 'dayPartCodes': '',
+              'time': '', 'simulationTest': '0'}
+    path = f'/bff/store/stores/{store_code}'
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path=path, query_params=params)
+    url = f'{API_BASE}{path}'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
