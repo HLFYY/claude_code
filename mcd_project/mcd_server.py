@@ -850,6 +850,14 @@ def universal_mcd_api(function_name):
         if proxy_dict:
             params['proxies'] = proxy_dict
             proxy_used = proxy_dict
+        else:
+            # 代理提取失败（该城市短效池空 / 神龙 206 暂无可用IP）→ 明确报错，**绝不静默直连**。
+            # 直连走的是本机（94）机房出口 IP，与真机住宅 IP 差异极大，是明显的风控特征；
+            # 静默直连还会让「代理分配失败」在订单轨迹里看不出来（轨迹只显示「使用当前代理 - -」）。
+            # 用户 2026-11-24 定：池空时直接报错，让本次请求失败（换号/换城市重试），不要偷偷直连。
+            app.logger.error(f"[{function_name}] {phone} 无可用代理（城市={city}），已中止本次请求（不直连）")
+            return jsonify({'success': False,
+                            'message': f'无可用代理（{city or "未知城市"} 代理池为空），本次请求已中止，请稍后重试'}), 503
 
     # 记录本次实际用的代理，供响应头回传（见 _inject_proxy_headers）
     g.proxy_meta = getattr(login_manager, 'last_proxy_meta', None)
