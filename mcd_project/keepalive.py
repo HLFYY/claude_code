@@ -34,6 +34,10 @@ WARMUP_CONCURRENT_TIMEOUT = 2.5  # 并发段每个动作最多等这么久
 WARMUP_HARD_CAP = 6.0            # 整段硬上限（兜底，防止线程卡死拖垮批处理）
 WARMUP_SLEEP = 0.2               # 每个号之间的间隔，别把麦当劳打太急
 
+# 号级并发数（2026-11-24）：各号互相独立，并发跑。
+# 4 是保守值 —— 够把「最慢那个号」决定总耗时，又不会把麦当劳/代理打太急。
+KEEPALIVE_WORKERS = 4
+
 # 友盟设备级 token（与下单客户端 UMENG_DEVICE_TOKEN 同值；设备级、非账号级）
 UMENG_DEVICE_TOKEN = 'AmbPB-Ggfah3sGoPm8Eb3F7sj40My522jpZEuI6VjoGt'
 
@@ -44,8 +48,9 @@ UMENG_DEVICE_TOKEN = 'AmbPB-Ggfah3sGoPm8Eb3F7sj40My522jpZEuI6VjoGt'
 #   会员     /bff/member/user/portal/v2      真机 16:42:09.962
 #   通知上报 /bff/mc/remind/login/submit     真机 16:42:06.797
 #   设备上报 /bff/member/device/collect      真机 16:42:10.870
-#   附近门店 /bff/store/stores/vicinity      真机 16:42:08.982
-BOOT_ACTIONS = ('拉配置', '主页', '会员', '通知', '设备', '附近门店')
+#   （附近门店 /bff/store/stores/vicinity 用户 2026-11-24 要求去掉：保活只需要
+#     「这个号今天打开过 App」的痕迹，附近门店既慢又和账号无关）
+BOOT_ACTIONS = ('拉配置', '主页', '会员', '通知', '设备')
 
 # 结果在 Redis 里的 key（24 小时过期，后台「保活设置」弹窗读它展示上次结果）
 KEEPALIVE_LAST_KEY_TMPL = 'mkt:prod:{merchant_id}:keepalive:last'
@@ -202,9 +207,6 @@ def fake_launch(token, sid, d='', city='', province='', store_code='', city_code
             specs.append(('设备', mcd_api.post_device_collect,
                           {'city_code': city_code, 'latitude': lat, 'longitude': lng,
                            'um_token': UMENG_DEVICE_TOKEN}))
-        if lat is not None and lng is not None:
-            specs.append(('附近门店', mcd_api.get_nearby_stores,
-                          {'latitude': lat, 'longitude': lng, 'show_type': '4'}))
 
         with ThreadPoolExecutor(max_workers=max(len(specs), 1)) as ex:
             futs = {ex.submit(_call, n, f, **kw): (n, f, kw) for n, f, kw in specs}
@@ -280,32 +282,53 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
         mgr.apply_location(province or None, city or None)
     except Exception:
         pass
-    try:
-        if proxies is None:
-            proxies = mgr.get_login_proxy(is_send_code=False)
-    except Exception as e:
-        proxies = None
-        proxy_err = str(e)[:60]
-    else:
-        proxy_err = ''
 
-    # ---- 1) 续期 ----
-    if rt:
-        ok, data, msg = mcd_api.login_session_refresh(token, sid, rt, d=d, proxies=proxies)
-        if ok and isinstance(data, dict):
-            # 上游可能返回新 sid/rt（真机样本是不轮换，但要真拿到才写回）
-            new_sid = str(data.get('sid') or '').strip()
-            new_rt = str(data.get('refreshToken') or '').strip()
-            if new_sid and new_sid != sid:
-                try:
-                    mgr.sid = new_sid
-                    mgr.save_credentials(token, new_sid, meddy, refresh_token=new_rt or rt)
-                except Exception:
-                    pass
-        refresh_kind = 'session/refresh'
-    else:
-        ok, msg = mcd_api.login_refresh(token, sid, d=d, proxies=proxies)
-        refresh_kind = 'login/refresh'
+    # ---- 1) 续期（不走代理探活）----
+    #
+    # 为什么跳过探活：探活打的 URL 就是 /bff/common/normal/config，和保活「模拟启动」
+    # 的第一个请求（拉配置）完全一样 —— 探活等于把同一个请求发两遍，每号白等 1~7 秒
+    # （实测 4 个号光探活就占了 10 秒）。
+    # 改成「直接用这个代理发真实请求；失败且是代理层故障才换新代理重试一次」。
+    #
+    # 最多试 2 个代理（每次失败换新），避免坏代理把整批拖死。
+    last_proxy_err = ''
+    ok = False
+    msg = ''
+    data = {}
+    refresh_kind = 'session/refresh'
+    for attempt in range(2):
+        try:
+            if proxies is None:
+                proxies = mgr.get_login_proxy(is_send_code=False,
+                                             force_new=(attempt > 0), probe=False)
+        except Exception as e:
+            proxies = None
+            last_proxy_err = str(e)[:60]
+        if rt:
+            ok, data, msg = mcd_api.login_session_refresh(token, sid, rt, d=d, proxies=proxies)
+        else:
+            ok, msg = mcd_api.login_refresh(token, sid, d=d, proxies=proxies)
+            refresh_kind = 'login/refresh'
+        if ok:
+            break
+        # 代理层故障 → 换新代理再试一次；其它错误（如 401）直接定性，不浪费代理
+        low = str(msg or '')
+        is_proxy_fail = any(x in low for x in ('代理连接失败', '请求超时', '网络连接失败',
+                                                'ProxyError', 'ConnectionError', '隧道连接失败'))
+        if not is_proxy_fail or attempt >= 1:
+            break
+        proxies = None  # 强制重新取代理
+
+    if ok and rt and isinstance(data, dict):
+        # 上游可能返回新 sid/rt（真机样本是不轮换，但要真拿到才写回）
+        new_sid = str(data.get('sid') or '').strip()
+        new_rt = str(data.get('refreshToken') or '').strip()
+        if new_sid and new_sid != sid:
+            try:
+                mgr.sid = new_sid
+                mgr.save_credentials(token, new_sid, meddy, refresh_token=new_rt or rt)
+            except Exception:
+                pass
 
     low = str(msg or '').lower()
     dead = (not ok) and any(x in low for x in ['401', '登录失效', '其他设备登录', '重新登录'])
@@ -314,28 +337,46 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
     state = 'alive' if ok else ('dead' if dead else 'unknown')
     res = {'phone': phone, 'ok': bool(ok), 'state': state, 'msg': str(msg)[:120],
            'refresh_kind': refresh_kind, 'has_rt': bool(rt), 'launch': None}
-    if proxy_err:
-        res['msg'] = (res['msg'] + ' | 代理: ' + proxy_err)[:160]
+    if last_proxy_err:
+        res['msg'] = (res['msg'] + ' | 代理: ' + last_proxy_err)[:160]
 
     if not ok:
         # 续期就失败了 → 假启动没意义（会话本身就不被接受），直接返回
         return res
 
     # ---- 2) 假启动（模拟打开 APP）----
-    try:
-        ctx = lookup_city(city, token, sid, proxies)
-        store = lookup_store(city)
-        store_code = store[0] if store else ''
-        be_code = store[1] if store else ''
-        launch = fake_launch(
-            token, sid, d=d, city=city, province=province,
-            store_code=store_code, city_code=(ctx or {}).get('code', ''),
-            lat=(ctx or {}).get('lat'), lng=(ctx or {}).get('lng'), proxies=proxies)
-        if be_code:
-            launch['be_code'] = be_code
-        res['launch'] = launch
-    except Exception as e:
-        res['launch'] = {'ok': 0, 'total': 0, 'elapsed': 0, 'detail': '假启动异常: ' + str(e)[:60]}
+    #
+    # 代理是「刚拿到没探活」的（见上面为什么跳过探活），可能第一个请求就撞上
+    # 代理层故障 → 换新代理整段重跑一次。所以这里最多试 2 个代理。
+    launch = None
+    for attempt in range(2):
+        try:
+            if proxies is None:
+                proxies = mgr.get_login_proxy(is_send_code=False,
+                                             force_new=(attempt > 0), probe=False)
+            ctx = lookup_city(city, token, sid, proxies)
+            store = lookup_store(city)
+            store_code = store[0] if store else ''
+            be_code = store[1] if store else ''
+            launch = fake_launch(
+                token, sid, d=d, city=city, province=province,
+                store_code=store_code, city_code=(ctx or {}).get('code', ''),
+                lat=(ctx or {}).get('lat'), lng=(ctx or {}).get('lng'), proxies=proxies)
+            if be_code:
+                launch['be_code'] = be_code
+            # 预热（拉配置）失败且是代理层故障 → 换新代理重跑
+            detail = launch.get('detail') or ''
+            if attempt < 1 and launch.get('ok', 0) == 0 and any(
+                    x in detail for x in ('代理连接失败', '请求超时', '网络连接失败',
+                                          'ProxyError', 'ConnectionError')):
+                proxies = None
+                continue
+            break
+        except Exception as e:
+            launch = {'ok': 0, 'total': 0, 'elapsed': 0,
+                      'detail': '假启动异常: ' + str(e)[:60]}
+            break
+    res['launch'] = launch
 
     return res
 
@@ -383,13 +424,20 @@ def _prewarm_city_ctx(r, merchant_id=''):
 
 
 def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True,
-                  only_with_rt=False, redis_client=None):
+                  only_with_rt=False, redis_client=None, workers=0):
     """批量保活。
 
     只做有 refreshToken 的号（用户 2026-11-24 定）：有 rt 才走真机那条 session/refresh 链路；
     没有 rt 的号 session/refresh 调不了，留给验活链路处理。
 
-    结果写回 Redis mkt:prod:{merchant}:keepalive:last（24h 过期），后台弹窗读它。
+    ★ 号级并发（用户 2026-11-24 要求「整体就是较快的，完成每个号的保活请求」）：
+      各号之间完全独立（不同号、不同凭据、不同代理），所以号级并发而不是号级串行。
+      单号内部已经是「预热串行 + 其余并发」，号级再并发就是两层并发。
+      保守取 workers=4：既能压掉串行等待，又不会把麦当劳/代理打太急。
+      94 的 gunicorn --timeout 100：并发后总耗时 ≈ 最慢的那个号（而不是 N 个号之和），
+      15 个号实测 17.2s → 并发后约 5~8s，完全不撞超时。
+
+    结果写回 Redis mkt:prod:{商户}:keepalive:last（24h 过期），后台弹窗读它。
     """
     r = redis_client or _r()
     stats = {'total': 0, 'alive': 0, 'dead': 0, 'unknown': 0,
@@ -405,6 +453,8 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
         except Exception as e:
             errors.append('城市上下文预热失败: %s' % str(e)[:80])
 
+    # ---- 1) 先把要保活的号收齐（读 Redis 很快，这步不占时间）----
+    targets = []
     for key in r.scan_iter(match=pattern, count=200):
         parts = str(key).split(':')
         if len(parts) < 3:
@@ -418,7 +468,7 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             errors.append('读 %s 失败: %s' % (key, e))
             continue
         for phone, raw in creds.items():
-            if limit and stats['total'] >= limit:
+            if limit and len(targets) >= limit:
                 break
             try:
                 cred = json.loads(raw)
@@ -442,41 +492,60 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
                         continue
                 except Exception:
                     pass
+            targets.append((key, mid, phone, city, province, cred))
+        if limit and len(targets) >= limit:
+            break
 
-            stats['total'] += 1
-            try:
-                res = keepalive_account(phone, mid, city=city, province=province)
-            except Exception as e:
-                res = {'phone': phone, 'ok': False, 'state': 'unknown',
-                       'msg': '%s: %s' % (type(e).__name__, str(e)[:80]), 'launch': None}
-            st = res.get('state')
-            if st == 'alive':
-                stats['alive'] += 1
-            elif st == 'dead':
-                stats['dead'] += 1
-            else:
-                stats['unknown'] += 1
-            lz = res.get('launch') or {}
-            if lz:
-                stats['launch_ok'] += lz.get('ok', 0)
-                stats['launch_total'] += lz.get('total', 0)
-            if len(details) < 200:
-                details.append({
-                    'phone': phone, 'state': st, 'msg': res.get('msg', '')[:100],
-                    'refresh_kind': res.get('refresh_kind', ''),
-                    'launch_ok': lz.get('ok', 0), 'launch_total': lz.get('total', 0),
-                    'launch_detail': lz.get('detail', '')[:300],
-                })
-            # 回写凭据的保活标记
-            try:
-                from datetime import datetime
-                cred['keepalive_at'] = datetime.now().isoformat()
-                cred['keepalive_ok'] = bool(res.get('ok'))
-                cred['keepalive_state'] = st
-                r.hset(key, phone, json.dumps(cred, ensure_ascii=False))
-            except Exception:
-                pass
-            time.sleep(WARMUP_SLEEP)
+    # ---- 2) 号级并发保活 ----
+    def _one(t):
+        key, mid, phone, city, province, cred = t
+        try:
+            res = keepalive_account(phone, mid, city=city, province=province)
+        except Exception as e:
+            res = {'phone': phone, 'ok': False, 'state': 'unknown',
+                   'msg': '%s: %s' % (type(e).__name__, str(e)[:80]), 'launch': None}
+        # 回写凭据的保活标记
+        try:
+            from datetime import datetime
+            cred['keepalive_at'] = datetime.now().isoformat()
+            cred['keepalive_ok'] = bool(res.get('ok'))
+            cred['keepalive_state'] = res.get('state')
+            r.hset(key, phone, json.dumps(cred, ensure_ascii=False))
+        except Exception:
+            pass
+        return res
+
+    n_workers = workers if workers and workers > 0 else KEEPALIVE_WORKERS
+    results = []
+    if n_workers > 1 and len(targets) > 1:
+        with ThreadPoolExecutor(max_workers=min(n_workers, len(targets))) as ex:
+            for res in ex.map(_one, targets):
+                results.append(res)
+    else:
+        for t in targets:
+            results.append(_one(t))
+
+    # ---- 3) 汇总 ----
+    for res in results:
+        st = res.get('state')
+        stats['total'] += 1
+        if st == 'alive':
+            stats['alive'] += 1
+        elif st == 'dead':
+            stats['dead'] += 1
+        else:
+            stats['unknown'] += 1
+        lz = res.get('launch') or {}
+        if lz:
+            stats['launch_ok'] += lz.get('ok', 0)
+            stats['launch_total'] += lz.get('total', 0)
+        if len(details) < 200:
+            details.append({
+                'phone': res.get('phone', ''), 'state': st, 'msg': res.get('msg', '')[:100],
+                'refresh_kind': res.get('refresh_kind', ''),
+                'launch_ok': lz.get('ok', 0), 'launch_total': lz.get('total', 0),
+                'launch_detail': lz.get('detail', '')[:300],
+            })
 
     payload = {
         'ran_at': time.strftime('%Y-%m-%d %H:%M:%S'),

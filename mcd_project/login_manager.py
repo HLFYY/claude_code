@@ -334,7 +334,8 @@ class LoginManager:
             log_info(f'⚠️  写麦金卡状态失败 {self.phone}: {e}')
 
     def get_login_proxy(self, is_send_code: bool = False,
-                        force_new: bool = False) -> Optional[Dict[str, str]]:
+                        force_new: bool = False,
+                        probe: bool = True) -> Optional[Dict[str, str]]:
         """统一入口 + 代理探活（2026-11-23）。
 
         取到代理先发一个轻量请求验连通性，坏的立刻换新重取（最多 PROXY_PROBE_MAX 次）。
@@ -344,15 +345,20 @@ class LoginManager:
         探活判定：**只要能收到 HTTP 响应就算通**——麦当劳对无签名请求返回 403，
         那恰好证明隧道是通的；只有 ProxyError / 连接超时 / 握手失败才算坏。
         换不出新代理（如静态代理）时直接返回，不做无意义重试。
+
+        probe=False 时跳过探活（2026-11-24 保活用）：
+          探活打的 URL 就是 /bff/common/normal/config，和保活「模拟启动」的第一个请求
+          （拉配置）完全相同 —— 探活纯属把同一个请求发两遍，每号白等 1~7 秒。
+          保活场景改成「直接用这个代理发真实请求，失败再换」即可（见 keepalive.py）。
         """
         attempts = (getattr(config, 'PROXY_PROBE_MAX', 3)
-                    if getattr(config, 'PROXY_PROBE_ENABLED', True) else 1)
+                    if (getattr(config, 'PROXY_PROBE_ENABLED', True) and probe) else 1)
         last = None
         same = 0
         px = None
         for i in range(max(1, attempts)):
             px = self._get_login_proxy_raw(is_send_code, force_new or i > 0)
-            if not px or not getattr(config, 'PROXY_PROBE_ENABLED', True):
+            if not px or not probe or not getattr(config, 'PROXY_PROBE_ENABLED', True):
                 return px
             # 连续两次都换不出别的代理（静态代理、或池里只剩它）→ 认命返回，
             # 只重复 1 次不直接放弃：短效池偶发重复时仍能走到下一次 force_new
