@@ -381,6 +381,77 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
     return res
 
 
+def launch_account(phone, merchant_id, city='', province='', proxies=None):
+    """单号**只做假启动**（新号注册成功后养号用，2026-11-24 用户定）。
+
+    与 keepalive_account() 的区别：
+      - 不做续期：注册流程已调过 /api/login/session_refresh（register_worker 4.5 步），
+        这里只补「打开 APP」那一段，避免二次刷新。
+      - 入参极简：只要 phone + merchant_id；city/province/d/token/sid 全部从 Redis 凭据读。
+
+    返回 {'phone', 'merchant_id', 'city', 'province', 'ok', 'total', 'detail', 'elapsed'}
+    任一动作失败只记录、不抛异常 —— 养号增强不该阻断注册。
+    """
+    from login_manager import LoginManager
+
+    cred = {}
+    try:
+        raw = _r().hget(CREDENTIALS_KEY_TMPL.format(merchant_id=merchant_id), phone)
+        if raw:
+            cred = json.loads(raw) or {}
+    except Exception:
+        pass
+    city = (city or str(cred.get('city') or '')).strip()
+    province = (province or str(cred.get('province') or '')).strip()
+
+    mgr = LoginManager(phone, None, True, city or None, None, None, None,
+                       merchant_id, province or None, None)
+    token, sid, _meddy = mgr.load_credentials()
+    d = str(cred.get('d') or '') or (mgr.d or '')
+    if not (token and sid):
+        return {'phone': phone, 'merchant_id': merchant_id, 'city': city,
+                'province': province, 'ok': 0, 'total': 0,
+                'detail': '缺少 token 或 sid（凭据未写入）', 'elapsed': 0}
+    try:
+        mgr.apply_location(province or None, city or None)
+    except Exception:
+        pass
+
+    # 代理最多试 2 个：第一个请求撞代理层故障就换代理整段重跑
+    launch = {'ok': 0, 'total': 0, 'elapsed': 0, 'detail': ''}
+    for attempt in range(2):
+        try:
+            if proxies is None:
+                proxies = mgr.get_login_proxy(is_send_code=False,
+                                             force_new=(attempt > 0), probe=False)
+            ctx = lookup_city(city, token, sid, proxies)
+            store = lookup_store(city)
+            store_code = store[0] if store else ''
+            be_code = store[1] if store else ''
+            launch = fake_launch(
+                token, sid, d=d, city=city, province=province,
+                store_code=store_code, city_code=(ctx or {}).get('code', ''),
+                lat=(ctx or {}).get('lat'), lng=(ctx or {}).get('lng'), proxies=proxies)
+            if be_code:
+                launch['be_code'] = be_code
+            detail = launch.get('detail') or ''
+            if attempt < 1 and launch.get('ok', 0) == 0 and any(
+                    x in detail for x in ('代理连接失败', '请求超时', '网络连接失败',
+                                          'ProxyError', 'ConnectionError')):
+                proxies = None
+                continue
+            break
+        except Exception as e:
+            launch = {'ok': 0, 'total': 0, 'elapsed': 0,
+                      'detail': '假启动异常: ' + str(e)[:60]}
+            break
+    launch['phone'] = phone
+    launch['merchant_id'] = merchant_id
+    launch['city'] = city
+    launch['province'] = province
+    return launch
+
+
 # ========== 批量保活 ==========
 
 def _prewarm_city_ctx(r, merchant_id=''):

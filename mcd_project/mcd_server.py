@@ -415,6 +415,36 @@ def maintenance_keepalive_last():
     return jsonify({'success': True, 'data': data})
 
 
+@app.route('/api/maintenance/launch', methods=['POST'])
+def maintenance_launch():
+    """单号假启动（新号注册成功后养号，2026-11-24 用户定）。
+
+    入参极简：{"phone":"17375788810","merchant_id":"100014"}
+    city/province 可选，不传则从 Redis 凭据读；token/sid/d/rt 全部服务端读凭据。
+    只做「打开 APP」5 个动作（拉配置/主页/会员/通知/设备），不做续期
+    —— 注册流程已调过 session/refresh，避免二次刷新。
+
+    单号测试：curl -X POST http://127.0.0.1:5001/api/maintenance/launch \
+      -H 'Content-Type: application/json' -d '{"phone":"17375788810","merchant_id":"100014"}'
+    """
+    import keepalive as ka
+    body = request.get_json(silent=True) or {}
+    phone = str(body.get('phone') or '').strip()
+    merchant_id = str(body.get('merchant_id') or '').strip()
+    city = str(body.get('city') or '').strip()
+    province = str(body.get('province') or '').strip()
+    if not phone or not merchant_id:
+        return jsonify({'success': False, 'message': '缺少 phone 或 merchant_id'}), 400
+    try:
+        res = ka.launch_account(phone, merchant_id, city=city, province=province)
+    except Exception as e:
+        app.logger.error('[launch] 执行失败 phone=%s: %s' % (phone, e))
+        return jsonify({'success': False, 'message': '假启动失败: %s' % e}), 500
+    app.logger.info('[launch] phone=%s ok=%s/%s 用时 %ss' % (
+        phone, res.get('ok'), res.get('total'), res.get('elapsed')))
+    return jsonify({'success': True, 'data': res})
+
+
 @app.route('/api/login/status', methods=['GET'])
 def login_status():
     """检测登录状态"""
