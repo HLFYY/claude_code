@@ -346,17 +346,21 @@ def login_captcha_status():
 
 @app.route('/api/maintenance/keepalive', methods=['POST'])
 def maintenance_keepalive():
-    """账号保活：对已登录号调 /bff/passport/login/refresh 续期 sid。
+    """账号保活：续期 SID + 模拟启动（打开 APP）。
 
-    2026-11-21 麦当劳方说明：会话每天需要用 refresh(rfk) 接口激活一次，
-    真机 APP 后台进程每天自动做，不做就会掉登录。实测行为：
-      · sid 仍有效 → 200，返回同一 sid（等效续期）
-      · sid 已失效 → 401「登录失效或账号在其他设备登录」（救不活，只能重登）
-    所以按天跑一次能显著降低「号放着放着就 401」。
+    2026-11-24 重写。原来只调空体 /bff/passport/login/refresh 做续期；
+    现在改成：
+      1) 续期优先走 **session/refresh + refreshToken**（真机链路，11-23 抓包实测真机在用这条）
+      2) 续期成功后按该号属地做一次「模拟启动」：拉配置/主页/会员/通知/设备上报/附近门店，
+         并发发，整段 ≤ 2~3 秒（真机启动日志 16:42:01~16:42:10 的启动段）
+      3) 只处理有 refreshToken 的号（没 rt 的号 session/refresh 调不了）
+    结果写 Redis mkt:prod:{商户}:keepalive:last（24h 过期），后台「保活设置」弹窗读它。
 
-    入参（均可选）：merchant_id / limit(0=不限) / min_interval_hours(默认20)
-    返回：total/ok/invalid/skipped/failed/elapsed_ms/details
+    入参（均可选）：merchant_id / limit(0=不限) / min_interval_hours(默认20) /
+                   do_launch(默认 true，是否做模拟启动) / only_with_rt(默认 true)
+    返回：stats + details
     """
+    import keepalive as ka
     body = request.get_json(silent=True) or {}
     only_merchant = str(body.get('merchant_id') or '').strip()
     try:
@@ -364,92 +368,42 @@ def maintenance_keepalive():
         min_hours = float(body.get('min_interval_hours') or 20)
     except Exception:
         limit, min_hours = 0, 20
+    do_launch = body.get('do_launch')
+    do_launch = True if do_launch is None else bool(do_launch)
+    only_with_rt = body.get('only_with_rt')
+    only_with_rt = True if only_with_rt is None else bool(only_with_rt)
 
     t0 = time.time()
-    stats = {'total': 0, 'ok': 0, 'invalid': 0, 'skipped': 0, 'failed': 0}
-    details, errors = [], []
-    pattern = CREDENTIALS_KEY_TMPL.format(merchant_id='*')
+    try:
+        payload = ka.run_keepalive(merchant_id=only_merchant, limit=limit,
+                                   min_interval_hours=min_hours, do_launch=do_launch,
+                                   only_with_rt=only_with_rt)
+    except Exception as e:
+        app.logger.error('[keepalive] 执行失败: %s' % e)
+        return jsonify({'success': False, 'message': '保活执行失败: %s' % e}), 500
 
-    for key in _cap_redis.scan_iter(match=pattern, count=200):
-        parts = str(key).split(':')
-        if len(parts) < 3:
-            continue
-        merchant_id = parts[2]
-        if only_merchant and merchant_id != only_merchant:
-            continue
-        try:
-            creds = _cap_redis.hgetall(key)
-        except Exception as e:
-            errors.append('读 %s 失败: %s' % (key, e))
-            continue
-        for phone, raw in creds.items():
-            if limit and stats['total'] >= limit:
-                break
-            try:
-                cred = json.loads(raw)
-            except Exception:
-                continue
-            token = str(cred.get('token') or '')
-            sid = str(cred.get('sid') or '')
-            if not (token and sid):
-                stats['skipped'] += 1
-                continue
-            # 距上次保活不足 min_hours 就跳过（每天一次足够）
-            last = str(cred.get('keepalive_at') or '')
-            if last:
-                try:
-                    if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < min_hours * 3600:
-                        stats['skipped'] += 1
-                        continue
-                except Exception:
-                    pass
-            stats['total'] += 1
-            city = str(cred.get('city') or '')
-            province = str(cred.get('province') or '')
-            pxy_src = str(cred.get('proxy_source') or '') or None
-            mgr = None
-            try:
-                mgr = get_login_manager(phone, city or None, province or None, merchant_id, pxy_src)
-                mgr.load_credentials()
-                mgr.apply_location(province, city)
-                try:
-                    proxies = mgr.get_login_proxy(is_send_code=False)
-                except Exception:
-                    proxies = None
-                ok, msg = login_refresh(mgr.token, mgr.sid, d=mgr.d or '', proxies=proxies)
-            except Exception as e:
-                ok, msg = False, '%s: %s' % (type(e).__name__, str(e)[:120])
-            if mgr is not None:
-                # 区分「真失效(401)」和「网络/代理异常」：后者记 error(不确定)，不能当掉线——
-                # 否则一次代理抖动就把好号标成 invalid，平台据此停派就误伤了。
-                low_msg = str(msg or '')
-                is_auth_dead = ('401' in low_msg) or ('登录失效' in low_msg) or ('重新登录' in low_msg)
-                try:
-                    mgr.record_check('valid' if ok else ('invalid' if is_auth_dead else 'error'))
-                    mgr._merge_cred_fields({'keepalive_at': datetime.now().isoformat(),
-                                            'keepalive_ok': bool(ok)})
-                except Exception:
-                    pass
-            low_msg = str(msg or '')
-            is_auth_dead = ('401' in low_msg) or ('登录失效' in low_msg) or ('重新登录' in low_msg)
-            if ok:
-                stats['ok'] += 1
-            elif is_auth_dead:
-                stats['invalid'] += 1
-            else:
-                stats['failed'] += 1
-            if len(details) < 50:
-                details.append({'merchant_id': merchant_id, 'phone': phone,
-                                'ok': bool(ok), 'msg': str(msg)[:100]})
-            time.sleep(0.2)  # 别把代理和麦当劳打太急
+    st = payload.get('stats') or {}
+    app.logger.info(
+        '[keepalive] 完成 total=%d alive=%d dead=%d unknown=%d skipped=%d '
+        '模拟启动 %d/%d 用时 %dms'
+        % (st.get('total', 0), st.get('alive', 0), st.get('dead', 0), st.get('unknown', 0),
+           st.get('skipped', 0), st.get('launch_ok', 0), st.get('launch_total', 0),
+           int((time.time() - t0) * 1000)))
+    payload['elapsed_ms'] = int((time.time() - t0) * 1000)
+    return jsonify({'success': True, 'data': payload})
 
-    stats['elapsed_ms'] = int((time.time() - t0) * 1000)
-    app.logger.info('[keepalive] 完成 total=%d ok=%d invalid=%d skipped=%d failed=%d 用时 %dms'
-                    % (stats['total'], stats['ok'], stats['invalid'], stats['skipped'],
-                       stats['failed'], stats['elapsed_ms']))
-    data = dict(stats)
-    data['details'] = details
-    data['errors'] = errors[:10]
+
+@app.route('/api/maintenance/keepalive/last', methods=['GET'])
+def maintenance_keepalive_last():
+    """读上一次保活结果（后台弹窗展示用）。
+
+    GET /api/maintenance/keepalive/last?merchant_id=100014
+    """
+    import keepalive as ka
+    mid = str(request.args.get('merchant_id') or '').strip()
+    data = ka.read_last_result(mid)
+    if not data:
+        return jsonify({'success': True, 'data': None, 'message': '暂无保活记录'})
     return jsonify({'success': True, 'data': data})
 
 
