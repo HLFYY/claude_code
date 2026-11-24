@@ -41,7 +41,27 @@ from ddddocr import DdddOcr
 from config import REDIS_SET_URL, USE_PROXY, IS_LOCAL, CAPTCHA_LOGIN_CONFIG, PROXY_BROWSER_AUTH, make_redis, DATA_DIR
 from mcd_api import aes_encrypt, build_headers, AES_KEY, API2_BASE, CLIENT_PROFILE, generate_token, activate_token, ectrade_order_create
 from login_manager import LoginManager
-from utils import log_info, ensure_egress_whitelisted
+from utils import log_info as _raw_log_info, ensure_egress_whitelisted
+
+# ---------------- 日志落盘（2026-11-24 用户要求） ----------------
+# win 上用 run_worker.bat 启动没有重定向，日志只在 cmd 窗口，
+# 缓冲一滚就没了 —— 排查「代理连不上」时连有没有重试都查不到。
+# 这里在打印的同时再写一份文件，20MB 轮转一次，避免长期跑把盘占满。
+LOG_FILE = os.getenv('MCD_CAPTCHA_LOG') or (r'C:\captcha_worker.log' if os.name == 'nt' else '')
+
+
+def log_info(content):
+    """统一日志：先打印（保持原行为），再追加到文件（失败不影响主流程）"""
+    _raw_log_info(content)
+    if not LOG_FILE:
+        return
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 20 * 1024 * 1024:
+            os.replace(LOG_FILE, LOG_FILE + '.1')
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write('%s, %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), content))
+    except Exception:
+        pass
 
 SM_URL = 'https://castatic.fengkongcloud.com/pr/v1.0.4/index.html'
 SM_ORG = 'qvdTr7A9k1DIU04ha4eP'
