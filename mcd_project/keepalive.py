@@ -105,6 +105,34 @@ def _r():
 
 # ========== 城市上下文 ==========
 
+# 省 → 代表城市（短名）。注册任务常只给省、city 为空，用它兜底出 city_code。
+# 这里的城市都已确认在 city_codes.json(323城) 和 mkt:prod:verify_store 门店表里。
+_PROVINCE_CITY = {
+    '北京': '北京', '天津': '天津', '上海': '上海', '重庆': '重庆',
+    '河北': '石家庄', '山西': '太原', '内蒙古': '呼和浩特', '辽宁': '沈阳',
+    '吉林': '长春', '黑龙江': '哈尔滨', '江苏': '南京', '浙江': '杭州',
+    '安徽': '合肥', '福建': '厦门', '江西': '南昌', '山东': '青岛',
+    '河南': '郑州', '湖北': '武汉', '湖南': '长沙', '广东': '深圳',
+    '广西': '南宁', '海南': '海口', '四川': '成都', '贵州': '贵阳',
+    '云南': '昆明', '西藏': '拉萨', '陕西': '西安', '甘肃': '兰州',
+    '青海': '西宁', '宁夏': '银川', '新疆': '乌鲁木齐',
+    '香港': '香港', '澳门': '澳门', '台湾': '台北',
+}
+
+
+def _city_by_province(province):
+    """省名 → 代表城市短名；兼容「广东」「广东省」「广东省XX」写法。取不到返回 ''。"""
+    p = (province or '').strip()
+    if not p:
+        return ''
+    if p in _PROVINCE_CITY:
+        return _PROVINCE_CITY[p]
+    for k, v in _PROVINCE_CITY.items():
+        if p.startswith(k):
+            return v
+    return ''
+
+
 def _normalize_city(name):
     """账号属地写「深圳」，上游返回「深圳市」/「深圳市XX区」→ 统一成短名做匹配。"""
     n = (name or '').strip()
@@ -446,6 +474,11 @@ def launch_account(phone, merchant_id, city='', province='', proxies=None):
         pass
     city = (city or str(cred.get('city') or '')).strip()
     province = (province or str(cred.get('province') or '')).strip()
+    # 注册任务常下发「省有市空」（如 province=广东、city=''）。city 空会导致
+    # lookup_city/lookup_store 查不到 → 主页/会员/设备三个动作被跳过（只剩拉配置+通知=2/2）。
+    # 用省名兜底出一个代表城市，保证新号第一次假启动也能跑全 5 个动作。
+    if not city and province:
+        city = _city_by_province(province) or city
 
     mgr = LoginManager(phone, None, True, city or None, None, None, None,
                        merchant_id, province or None, None)
