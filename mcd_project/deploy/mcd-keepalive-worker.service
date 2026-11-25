@@ -8,7 +8,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/work/claude_code/mcd_project
 Environment=MCD_REGISTER_ENV=prod
-ExecStart=/usr/bin/python3 /home/pi/work/claude_code/mcd_project/keepalive_worker.py
+ExecStart=/home/pi/venv/python3-forcrawl/bin/python /home/pi/work/claude_code/mcd_project/keepalive_worker.py
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/pi/work/logs/keepalive_worker.log
