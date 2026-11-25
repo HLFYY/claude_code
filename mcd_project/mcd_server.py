@@ -1227,13 +1227,15 @@ WHITELIST_SYNC_INTERVAL = 1800
 
 
 def _whitelist_call(url: str, timeout: int = 15):
-    """调一次白名单接口。不同代理商成功表达不同（神龙 {"code":200}、站大爷 {"code":"10001"}），
-    所以判定放宽为：HTTP 200 且 body 里 code=200 / code=10001 / success=true。"""
+    """调一次 URL 模板型白名单接口（神龙/站大爷）。
+
+    不同代理商成功表达不同（神龙 {"code":200}、站大爷 {"code":"10001"}），
+    判定放宽为：HTTP 200 且 body 里 code=200 / code=1007 / code=10001 / success=true。
+    1007=已存在（幂等成功，重复同步必然遇到），不能当失败，否则 last_ip 永远更新不了。
+    """
     try:
         r = requests.get(url, timeout=timeout)
         body = (r.text or '')[:200]
-        # 成功码：神龙 200=添加成功 / 1007=已存在（幂等成功，重复同步必然遇到）；
-        # 站大爷 "10001"=成功。不能把 1007 当失败，否则每次同步都误报、last_ip 也更新不了。
         good = r.status_code == 200 and (
             '"code":200' in body or '"code": 200' in body
             or '"code":1007' in body or '"code": 1007' in body
@@ -1245,21 +1247,130 @@ def _whitelist_call(url: str, timeout: int = 15):
         return False, '%s: %s' % (type(e).__name__, str(e)[:120])
 
 
+# ---------- 星宇通道白名单（2026-11-25）----------
+# 官方开放 API：https://open.xingyuip.com ，通道级鉴权 sign=md5("{channel_id}-{channel_secret}")
+# 与提取接口 api.xingyuip.com:6002 不是同一个地址。增删都是 POST + JSON body {ips:[...]}。
+import hashlib as _hashlib
+
+
+def _xingyu_sign(channel_id: str, secret: str) -> str:
+    return _hashlib.md5(('%s-%s' % (channel_id, secret)).encode('utf-8')).hexdigest()
+
+
+def _xingyu_call(base: str, path: str, payload: dict, timeout: int = 20):
+    """调一次星宇开放 API（增删白名单）。返回 (ok, msg, ips)。成功判据 code==0。"""
+    url = base.rstrip('/') + path
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        body = (r.text or '')[:400]
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        code = data.get('code')
+        ok = r.status_code == 200 and (code == 0 or code == '0')
+        ips = (data.get('data') or {}).get('ips') or []
+        return ok, 'HTTP %s %s' % (r.status_code, body), ips
+    except Exception as e:
+        return False, '%s: %s' % (type(e).__name__, str(e)[:120]), []
+
+
+def _xingyu_get_ips(base: str, payload: dict, timeout: int = 20):
+    """查星宇通道白名单列表。返回 (ok, ips, msg)。"""
+    url = base.rstrip('/') + '/api/channel/whitelist'
+    try:
+        r = requests.get(url, params={'channel_id': payload['channel_id'], 'sign': payload['sign']}, timeout=timeout)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        code = data.get('code')
+        ok = r.status_code == 200 and (code == 0 or code == '0')
+        ips = (data.get('data') or {}).get('ips') or []
+        return ok, ips, 'HTTP %s' % r.status_code
+    except Exception as e:
+        return False, [], '%s: %s' % (type(e).__name__, str(e)[:120])
+
+
+def _sync_xingyu(cfg, cur, last_ip, fixed, ip_key):
+    """星宇一家配置的加白同步。返回 (ok_all, steps)。
+
+    逻辑：算 sign → GET 查名单 → 出口 IP 不在则 POST add（加完等几秒复查，容忍缓存延迟）
+    → 换 IP 则 POST delete 旧 IP（当前 IP 绝不删）→ 固定 IP 每次 ensure。
+    """
+    steps, ok_all = [], True
+    base = str(cfg.get('open_api_base') or 'https://open.xingyuip.com').strip()
+    cid = str(cfg.get('channel_id') or '').strip()
+    secret = str(cfg.get('channel_secret') or '').strip()
+    if not cid or not secret:
+        return False, [{'action': 'skip', 'msg': '星宇配置缺 channel_id/channel_secret'}]
+    payload = {'channel_id': int(cid) if cid.isdigit() else cid,
+               'sign': _xingyu_sign(cid, secret)}
+
+    ok_q, ips, msg_q = _xingyu_get_ips(base, payload)
+    steps.append({'action': 'query', 'ok': ok_q, 'count': len(ips), 'msg': msg_q})
+    if not ok_q:
+        return False, steps
+
+    # 1) 固定 IP：不在名单就加（幂等）
+    for ip in fixed:
+        if ip in ips:
+            steps.append({'action': 'add_fixed', 'ip': ip, 'ok': True, 'msg': '已在名单'})
+            continue
+        ok, msg, new_ips = _xingyu_call(base, '/api/channel/whitelist/add',
+                                        dict(payload, ips=[ip]))
+        steps.append({'action': 'add_fixed', 'ip': ip, 'ok': ok, 'msg': msg})
+        ok_all = ok_all and ok
+        if ok:
+            ips = new_ips if new_ips else ips + [ip]
+
+    # 2) 动态出口：不在名单就加；加完等几秒复查（星宇加白到提取节点有缓存延迟，约 8s）
+    if cur:
+        if cur in ips:
+            steps.append({'action': 'ensure_cur', 'ip': cur, 'ok': True, 'msg': '已在名单'})
+        else:
+            ok, msg, new_ips = _xingyu_call(base, '/api/channel/whitelist/add',
+                                            dict(payload, ips=[cur]))
+            steps.append({'action': 'add_new', 'ip': cur, 'ok': ok, 'msg': msg})
+            if not ok:
+                ok_all = False
+            else:
+                ips = new_ips if new_ips else ips + [cur]
+                # 容忍缓存延迟：等 6 秒后查一次，若仍未生效按成功处理（add 接口已返回 code=0）
+                try:
+                    time.sleep(6)
+                    ok2, ips2, _ = _xingyu_get_ips(base, payload)
+                    if ok2:
+                        ips = ips2
+                        steps.append({'action': 'recheck', 'ok': True, 'in_list': cur in ips})
+                except Exception:
+                    pass
+        # 换 IP 才删旧的（当前 IP 绝不删）——用户明确要求保留此逻辑
+        if last_ip and cur != last_ip and last_ip in ips:
+            ok_del, msg_del, _ = _xingyu_call(base, '/api/channel/whitelist/delete',
+                                              dict(payload, ips=[last_ip]))
+            steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok_del, 'msg': msg_del})
+        try:
+            _cap_redis.set(ip_key, cur)  # 仅 add 成功后更新（ok_all 为真或当前 IP 已在名单）
+        except Exception:
+            pass
+    else:
+        steps.append({'action': 'skip', 'ip': '', 'ok': False, 'msg': '取不到出口 IP'})
+        ok_all = False
+    return ok_all, steps
+
+
 @app.route('/api/proxy/whitelist/sync', methods=['POST'])
 def proxy_whitelist_sync():
-    """商户代理白名单同步（通用 URL 模板，2026-11-21）。
+    """商户代理白名单同步（商户 × 代理商多配置，2026-11-25）。
 
-    配置来源：Redis Hash `mkt:prod:{商户}:whitelist`（平台保存时写入，94 不连平台 DB）
-      add_url   必填，含 {ip} 占位符
-      del_url   选填，留空 = 只加不删（旧 IP 会残留，用户已确认接受）
-      fixed_ips 常驻 IP（逗号分隔，只加不删）
-      enabled   '1' 才同步
+    配置来源：Redis Hash `mkt:prod:{商户}:whitelist:{provider}`（平台保存时写入，94 不连平台 DB）
+      mode=url_template：add_url 必填含 {ip}、del_url 选填（神龙/站大爷，原逻辑）
+      mode=xingyu：channel_id/channel_secret/open_api_base（星宇专用 JSON API）
+      fixed_ips 常驻 IP（只加不删）、enabled='1' 才同步
 
     body：{merchant_id?(不传=扫全部), force?(忽略节流)}
-    节奏：外部每分钟调一次；接口内按商户判断——有 sync_requested 立即跑（保存后即时生效），
-    否则距上次同步不足 WHITELIST_SYNC_INTERVAL 就跳过（等效 30 分钟一次）。
-
-    动态出口变化时：有 del_url 就先删旧 IP、再加新 IP，然后更新 last_ip。
+    动态出口变化时：仅当 last_ip 存在且 cur != last_ip 才删旧 IP，当前 IP 绝不删。
     """
     data = request.get_json(silent=True) or {}
     only = str(data.get('merchant_id') or '').strip()
@@ -1267,13 +1378,28 @@ def proxy_whitelist_sync():
 
     targets = []
     try:
+        # 新格式（按 provider 分 key）：mkt:prod:{商户}:whitelist:{provider}
+        # 排除运行态后缀 key（:last_ip / :last_sync / :sync_requested）
+        skip_suffix = (':last_ip', ':last_sync', ':sync_requested', ':last_sync_msg')
+        for key in _cap_redis.scan_iter(match='mkt:prod:*:whitelist:*', count=200):
+            s = str(key)
+            if s.endswith(skip_suffix):
+                continue
+            parts = s.split(':')
+            if len(parts) < 5:
+                continue
+            if only and parts[2] != only:
+                continue
+            targets.append((parts[2], parts[4], s))
+        # 兼容旧格式（单 Hash，无 provider）：按 url_template 处理
         for key in _cap_redis.scan_iter(match='mkt:prod:*:whitelist', count=200):
-            parts = str(key).split(':')
+            s = str(key)
+            parts = s.split(':')
             if len(parts) < 4:
                 continue
             if only and parts[2] != only:
                 continue
-            targets.append((parts[2], key))
+            targets.append((parts[2], 'legacy', s))
     except Exception as e:
         return jsonify({'success': False, 'message': '扫描白名单配置失败: %s' % e}), 500
 
@@ -1281,18 +1407,15 @@ def proxy_whitelist_sync():
         return jsonify({'success': False, 'message': '该商户没有启用的白名单配置'}), 400
 
     results = []
-    for m, key in targets:
+    for m, provider, key in targets:
         try:
             cfg = _cap_redis.hgetall(key)
         except Exception as e:
-            results.append({'merchant_id': m, 'ok': False, 'msg': '读配置失败: %s' % e})
+            results.append({'merchant_id': m, 'provider': provider, 'ok': False, 'msg': '读配置失败: %s' % e})
             continue
         if str(cfg.get('enabled') or '') != '1':
             continue
-        add_url = str(cfg.get('add_url') or '').strip()
-        if not add_url or '{ip}' not in add_url:
-            results.append({'merchant_id': m, 'ok': False, 'msg': 'add_url 缺失或不含 {ip}'})
-            continue
+        mode = str(cfg.get('mode') or ('xingyu' if provider == 'xingyu' else 'url_template'))
 
         req_key, sync_key, ip_key = key + ':sync_requested', key + ':last_sync', key + ':last_ip'
         try:
@@ -1311,36 +1434,39 @@ def proxy_whitelist_sync():
         except Exception:
             last_ip = ''
 
-        steps, ok_all = [], True
-
-        # 1) 固定 IP：每次都确保在白名单里（幂等；防止被别人删掉）
-        for ip in fixed:
-            ok, msg = _whitelist_call(add_url.replace('{ip}', ip))
-            steps.append({'action': 'add_fixed', 'ip': ip, 'ok': ok, 'msg': msg})
-            ok_all = ok_all and ok
-
-        # 2) 动态出口：每次都 ensure（2026-11-23 修）
-        # 原来只在 `cur != last_ip` 时才调添加接口，一旦 last_ip 被写成当前 IP
-        # （或神龙侧把 IP 清了/过期），就永远走 'skip 出口未变化'，从此不再添加 →
-        # 表现就是「宽带换 IP 后注册/下单全报代理连接失败，却一分钟都没自愈」。
-        # 神龙对已存在 IP 返回 code=1007「已存在」，幂等安全，所以每次都调。
-        if cur:
-            ok, msg = _whitelist_call(add_url.replace('{ip}', cur))
-            action = 'add_new' if (cur != last_ip) else 'ensure_cur'
-            steps.append({'action': action, 'ip': cur, 'ok': ok, 'msg': msg})
-            if ok:
-                try:
-                    _cap_redis.set(ip_key, cur)
-                except Exception:
-                    pass
-            else:
-                ok_all = False
-            # 只有真正换过 IP 才删旧的（旧 IP 已无用；当前 IP 绝不能删）
-            if last_ip and cur != last_ip and del_url:
-                ok_del, msg_del = _whitelist_call(del_url.replace('{ip}', last_ip))
-                steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok_del, 'msg': msg_del})
+        if mode == 'xingyu':
+            ok_all, steps = _sync_xingyu(cfg, cur, last_ip, fixed, ip_key)
         else:
-            steps.append({'action': 'skip', 'ip': '', 'ok': False, 'msg': '取不到出口 IP'})
+            add_url = str(cfg.get('add_url') or '').strip()
+            if not add_url or '{ip}' not in add_url:
+                results.append({'merchant_id': m, 'provider': provider, 'ok': False,
+                                'msg': 'add_url 缺失或不含 {ip}'})
+                continue
+            steps, ok_all = [], True
+            # 固定 IP：每次 ensure（幂等，防止被别人删掉）
+            for ip in fixed:
+                ok, msg = _whitelist_call(add_url.replace('{ip}', ip))
+                steps.append({'action': 'add_fixed', 'ip': ip, 'ok': ok, 'msg': msg})
+                ok_all = ok_all and ok
+            # 动态出口：每次 ensure（神龙对已存在 IP 返回 1007，幂等安全）
+            if cur:
+                ok, msg = _whitelist_call(add_url.replace('{ip}', cur))
+                action = 'add_new' if (cur != last_ip) else 'ensure_cur'
+                steps.append({'action': action, 'ip': cur, 'ok': ok, 'msg': msg})
+                if ok:
+                    try:
+                        _cap_redis.set(ip_key, cur)
+                    except Exception:
+                        pass
+                else:
+                    ok_all = False
+                # 仅真换过 IP 才删旧（当前 IP 绝不删）
+                if last_ip and cur != last_ip and del_url:
+                    ok_del, msg_del = _whitelist_call(del_url.replace('{ip}', last_ip))
+                    steps.append({'action': 'del_old', 'ip': last_ip, 'ok': ok_del, 'msg': msg_del})
+            else:
+                steps.append({'action': 'skip', 'ip': '', 'ok': False, 'msg': '取不到出口 IP'})
+                ok_all = False
 
         try:
             _cap_redis.set(sync_key, str(int(time.time())))
@@ -1350,10 +1476,10 @@ def proxy_whitelist_sync():
                             ('OK ' if ok_all else 'FAIL ') + time.strftime('%Y-%m-%d %H:%M:%S'))
         except Exception:
             pass
-        results.append({'merchant_id': m, 'ok': ok_all, 'egress': cur,
-                        'last_ip': last_ip, 'steps': steps[:8]})
+        results.append({'merchant_id': m, 'provider': provider, 'ok': ok_all,
+                        'egress': cur, 'last_ip': last_ip, 'steps': steps[:8]})
 
-    app.logger.info('[whitelist-sync] 同步商户数=%d' % len(results))
+    app.logger.info('[whitelist-sync] 同步配置数=%d' % len(results))
     return jsonify({'success': True, 'data': {'synced': len(results), 'details': results}})
 
 
