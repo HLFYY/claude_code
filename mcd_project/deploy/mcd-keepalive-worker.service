@@ -1,0 +1,18 @@
+[Unit]
+Description=MCD 账号保活 worker（消费平台队列 → 串行续期 SID + 模拟启动）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/work/claude_code/mcd_project
+Environment=MCD_REGISTER_ENV=prod
+ExecStart=/usr/bin/python3 /home/pi/work/claude_code/mcd_project/keepalive_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/pi/work/logs/keepalive_worker.log
+StandardError=append:/home/pi/work/logs/keepalive_worker.log
+
+[Install]
+WantedBy=multi-user.target
