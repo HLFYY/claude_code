@@ -278,6 +278,24 @@ def fake_launch(token, sid, d='', city='', province='', store_code='', city_code
             specs.append(('设备', mcd_api.post_device_collect,
                           {'city_code': city_code, 'latitude': lat, 'longitude': lng,
                            'um_token': UMENG_DEVICE_TOKEN}))
+        if lat is not None and lng is not None:
+            specs.append(('附近门店', mcd_api.get_nearby_stores,
+                          {'latitude': lat, 'longitude': lng, 'show_type': '4'}))
+        # ---- 2026-11-26：与下单 warmup 对齐，补进店批 + 画像批 ----
+        if store_code:
+            specs.append(('门店', mcd_api.get_store_info, {'store_code': store_code}))
+            specs.append(('菜单', mcd_api.get_store_menu, {'store_code': store_code}))
+            specs.append(('购物车', mcd_api.get_cart, {'store_code': store_code}))
+            specs.append(('券卡', mcd_api.get_coupons_card,
+                          {'store_code': store_code, 'city_code': city_code or ''}))
+            specs.append(('店内活动', mcd_api.post_campaign_materials,
+                          {'store_code': store_code}))
+        specs.append(('模块上报1', mcd_api.post_version_mdl, {}))
+        specs.append(('模块上报2', mcd_api.post_version_mdl, {}))
+        specs.append(('实验分组', mcd_api.get_ab_experiments, {}))
+        specs.append(('订单摘要', mcd_api.get_home_orderinfo, {}))
+        specs.append(('热门活动', mcd_api.get_hot_activity, {}))
+        # 会话刷新不在这里做——主流程已按 rt 有无选 login_session_refresh/login_refresh
 
         with ThreadPoolExecutor(max_workers=max(len(specs), 1)) as ex:
             futs = {ex.submit(_call, n, f, **kw): (n, f, kw) for n, f, kw in specs}
