@@ -341,6 +341,67 @@ def fake_launch(token, sid, d='', city='', province='', store_code='', city_code
     }
 
 
+# ---- pulse WebSocket 心跳会话（2026-11-26，与下单客户端 PULSE_* 常量同源）----
+# 真机打开 APP 即建 pulse 长连接（15s 心跳，固定 39B gzip 包）——保活假启动成功后
+# 模拟「用户打开 APP 停留几分钟」，daemon 线程到点自动断开，不阻塞保活主流程。
+PULSE_WS_URL = 'wss://ws.mcd.cn/bff/pulse/ws'
+PULSE_HEARTBEAT = bytes.fromhex(
+    '1f8b08000000000000007312f470750c0a7172750c890f720d0c750d0e01003c955b8113000000')
+PULSE_INTERVAL = 15
+PULSE_KEEP_SECONDS = 180   # 保活场景：打开 APP 停留约 3 分钟
+PULSE_APP_VERSION = '7.0.45.1'
+
+
+def _pulse_keepalive_loop(phone, token, sid, meddy, proxy_ip, close_at):
+    """保活专属 pulse 心跳线程：到点自动断开，全程失败静默。"""
+    try:
+        import websocket
+    except ImportError:
+        log_info('💓 保活pulse跳过(无websocket库) %s' % phone)
+        return
+    import base64 as _b64
+    import hashlib as _hashlib
+    import hmac as _hmac
+    st = str(int(time.time() * 1000))
+    headers = {
+        'sid': sid, 'ct': '102', 'v': PULSE_APP_VERSION, 'meddyId': meddy or '',
+        'scene': '', 'sv': 'v4', 'st': st,
+        'sign': _b64.b64encode(_hmac.new((token or '').encode(), st.encode(),
+                                         _hashlib.sha256).digest()).decode() if token else '',
+        'User-Agent': 'okhttp/4.9.2', 'Accept-Encoding': 'gzip',
+    }
+    kw = {'header': headers, 'timeout': 20}
+    if proxy_ip:
+        _host = proxy_ip.split('://')[-1].rsplit(':', 1)
+        if len(_host) == 2 and _host[1].isdigit():
+            kw['http_proxy_host'], kw['http_proxy_port'] = _host[0], int(_host[1])
+    try:
+        ws = websocket.create_connection(PULSE_WS_URL, **kw)
+        ws.settimeout(PULSE_INTERVAL + 5)
+        log_info('💓 保活pulse连接建立 %s（保持%ds）' % (phone, PULSE_KEEP_SECONDS))
+        while time.time() < close_at:
+            t0 = time.time()
+            try:
+                ws.send(PULSE_HEARTBEAT, opcode=websocket.ABNF.OPCODE_BINARY)
+            except Exception:
+                log_info('💓 保活pulse发送断开 %s' % phone)
+                return
+            try:
+                ws.recv()
+            except Exception:
+                pass
+            wait = PULSE_INTERVAL - (time.time() - t0)
+            if wait > 0:
+                time.sleep(wait)
+        try:
+            ws.close()
+        except Exception:
+            pass
+        log_info('💓 保活pulse会话结束 %s' % phone)
+    except Exception as e:
+        log_info('💓 保活pulse异常(静默) %s: %s' % (phone, str(e)[:80]))
+
+
 # ========== 单号保活 ==========
 
 def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
@@ -466,6 +527,19 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
                       'detail': '假启动异常: ' + str(e)[:60]}
             break
     res['launch'] = launch
+    # ---- 3) pulse 心跳会话（假启动成功才建；daemon 到点自动断）----
+    try:
+        if launch and launch.get('ok', 0) > 0 and PULSE_KEEP_SECONDS > 0:
+            _px = ''
+            if proxies:
+                _px = (proxies.get('http') or proxies.get('https') or '').replace('http://', '')
+            threading.Thread(target=_pulse_keepalive_loop, daemon=True,
+                             args=(phone, token, mgr.sid, mgr.meddy_id, _px,
+                                   time.time() + PULSE_KEEP_SECONDS),
+                             name='pulse-ka-%s' % phone).start()
+    except Exception as e:
+        log_info('💓 保活pulse启动失败(静默) %s: %s' % (phone, str(e)[:80]))
+
 
     return res
 
