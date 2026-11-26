@@ -525,7 +525,7 @@ def login_refresh(token, sid, d='', proxies=None):
     return False, message
 
 
-def login_session_refresh(token, sid, refresh_token, d='', proxies=None):
+def login_session_refresh(token, sid, refresh_token=None, d='', proxies=None):
     """
     刷新登录会话: POST /bff/passport/login/session/refresh。
 
