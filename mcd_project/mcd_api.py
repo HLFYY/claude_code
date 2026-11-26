@@ -1923,12 +1923,13 @@ def post_badge_collect(token, sid, material_code_list, proxies=None):
     return make_request('POST', url, headers, data=body, proxies=proxies)
 
 
-def get_store_community(token, sid, proxies=None):
-    """GET /bff/store/stores/community —— 门店社群页（真机付款后每轮详情轮询伴随，无场景头）"""
+def get_store_community(token, sid, store_code='', proxies=None):
+    """GET /bff/store/stores/community?storeCode=… —— 门店社群页（付款后详情轮询伴随，无场景头）"""
+    params = {'storeCode': str(store_code or '')}
     headers = build_headers(token, sid=sid, body='', method='GET',
-                            path='/bff/store/stores/community')
+                            path='/bff/store/stores/community', query_params=params)
     url = f'{API_BASE}/bff/store/stores/community'
-    return make_request('GET', url, headers, proxies=proxies)
+    return make_request('GET', url, headers, params=params, proxies=proxies)
 
 
 def get_loyalty_reward_precalc(token, sid, proxies=None):
