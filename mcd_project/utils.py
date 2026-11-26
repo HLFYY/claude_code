@@ -370,27 +370,67 @@ def _parse_route_proxy_response(text: str, fmt: str = 'txt') -> List[str]:
     return from_json() if text.startswith(('{', '[')) else (from_lines() or from_json())
 
 
-def _extract_by_final_url(entry: Dict, count: int = 1, timeout: int = 12) -> List[str]:
-    """v2 直通：GET 路由表里那条【最终 URL】，解析线路。零地域转换。"""
+def _apply_region_params(url, province, city):
+    """按渠道把地域参数注入提取 URL（2026-11-26 用户确认渠道格式后新增）。
+
+    星宇（xingyuip.com）：province=<省拼音>&city=<市拼音>
+    神龙（shenlongip.com）：area=<市国标code>（无市则 <省code>）
+    渠道需开通「地区定向」才生效；未开通时参数被忽略（返回全国池，无副作用）。
+    """
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    try:
+        host = (urlparse(url).hostname or '').lower()
+        prov, city = (province or '').strip(), (city or '').strip()
+        params_map = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        if 'xingyuip' in host:
+            pv = config.REGION_PINYIN.get(prov) or config.REGION_PINYIN.get(city)
+            cv = config.REGION_PINYIN.get(city) or ''
+            if not pv:
+                return url
+            params_map['province'] = pv
+            params_map['city'] = cv
+        elif 'shenlongip' in host:
+            code = config.REGION_CODE.get(city) or config.REGION_CODE.get(prov)
+            if not code:
+                return url
+            params_map['area'] = code
+        else:
+            return url
+        parts = urlparse(url)
+        return urlunparse(parts._replace(query=urlencode(params_map)))
+    except Exception as e:
+        log_info('⚠️  地域参数注入失败(原样返回): %s' % str(e)[:80])
+        return url
+
+
+def _extract_by_final_url(entry, count=1, timeout=12,
+                          province=None, city=None):
+    # v2 直通：GET 路由表里那条【最终 URL】，解析线路。
+    # 2026-11-26：按渠道注入地域参数（星宇=拼音省市、神龙=国标code），
+    # 渠道未开通定向时参数被忽略，行为与之前一致。
     url = (entry.get('url') or '').strip()
     if not url:
         log_info('❌ v2 路由条目缺 url')
         return []
+    url = _apply_region_params(url, province or '', city or '')
     fmt = (entry.get('format') or 'auto').strip().lower()
     try:
         r = requests.get(url, proxies={'http': None, 'https': None}, timeout=timeout)
         text = r.text or ''
     except Exception as e:
-        log_info(f'❌ 最终 URL 提取异常 provider={entry.get("provider")} url={url[:120]}: {str(e)[:80]}')
+        log_info('❌ 最终 URL 提取异常 provider=%s url=%s: %s'
+                 % (entry.get('provider'), url[:120], str(e)[:80]))
         return []
     if r.status_code != 200:
-        log_info(f'❌ 最终 URL 返回 HTTP {r.status_code}: {(text or "")[:120]}')
+        log_info('❌ 最终 URL 返回 HTTP %s: %s' % (r.status_code, (text or '')[:120]))
         return []
     ips = _parse_route_proxy_response(text, fmt)
     if ips:
-        log_info(f'✓ v2 路由提取成功 provider={entry.get("provider")} fmt={fmt} -> {len(ips)} 个')
+        log_info('✓ v2 路由提取成功 provider=%s fmt=%s -> %d 个'
+                 % (entry.get('provider'), fmt, len(ips)))
     else:
-        log_info(f'⚠️  v2 路由提取无结果 provider={entry.get("provider")} fmt={fmt} body={(text or "")[:120]}')
+        log_info('⚠️  v2 路由提取无结果 provider=%s fmt=%s body=%s'
+                 % (entry.get('provider'), fmt, (text or '')[:120]))
     return ips[:max(1, count)] if count and count > 1 else ips
 
 
@@ -676,7 +716,8 @@ def _extract_for_source(src_cfg: Dict, province: Optional[str], city: Optional[s
     """
     t = (src_cfg or {}).get('type')
     if t == 'route':
-        return _extract_by_final_url(src_cfg.get('route_entry') or {}, count=count)
+        return _extract_by_final_url(src_cfg.get('route_entry') or {}, count=count,
+                                     province=province, city=city)
     if t == 'zdtps':
         return _zdtps_extract(src_cfg, province=province, city=city, count=count)
     if t == 'shenlong':
