@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 
 import mcd_api
+from utils import log_info
 from config import make_redis, CREDENTIALS_KEY_TMPL
 
 # ========== 可调参数（用户 2026-11-24 定：并发最多 2-3 秒） ==========
