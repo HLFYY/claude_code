@@ -21,7 +21,7 @@ import inspect
 import time
 import requests
 from config import (CODE_DIR, LOG_DIR, REDIS_SET_URL, USE_PROXY, CAPTCHA_LOGIN_CONFIG, make_redis,
-                    MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, CREDENTIALS_KEY_TMPL)
+                    MERCHANT_ID_DEFAULT, PROXY_SOURCE_DEFAULT, CREDENTIALS_KEY_TMPL, GLOBAL_FIXED_IPS)
 from login_manager import LoginManager, login_refresh
 import utils
 
@@ -1433,7 +1433,12 @@ def proxy_whitelist_sync():
             continue
 
         del_url = str(cfg.get('del_url') or '').strip()
-        fixed = [x.strip() for x in str(cfg.get('fixed_ips') or '').split(',') if x.strip()]
+        # 商户自定义固定 IP + 全局常驻 IP（config.GLOBAL_FIXED_IPS），去重且顺序稳定。
+        # 常驻 IP 无条件加白（只加不删），商户不用在后台手填。
+        fixed = []
+        for ip in [x.strip() for x in str(cfg.get('fixed_ips') or '').split(',') if x.strip()] + list(GLOBAL_FIXED_IPS):
+            if ip not in fixed:
+                fixed.append(ip)
         cur = utils.get_egress_ip()
         try:
             last_ip = _cap_redis.get(ip_key) or ''
