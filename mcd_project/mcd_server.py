@@ -820,6 +820,12 @@ def universal_mcd_api(function_name):
     sig = inspect.signature(func)
     if 'mcd_id' in sig.parameters:
         params['mcd_id'] = meddy_id_from_redis
+    # refresh_token 自动注入（2026-11-26）：login_session_refresh 需要凭据里的 rt，
+    # 客户端不持有凭据 → 签名含 refresh_token 且调用方未传时自动从凭据补。
+    # rt 不轮换（11-24 实测），返回 sid/rt 与现值相同，纯「会话活跃度」画像信号。
+    if 'refresh_token' in sig.parameters and not str(params.get('refresh_token') or '').strip():
+        if getattr(login_manager, 'refresh_token', ''):
+            params['refresh_token'] = login_manager.refresh_token
     # 5. 自动获取代理（如果有 phone 参数且函数支持 proxies）
     proxy_used = None
     # pin_proxy（2026-11-16）：客户端指定的代理（提单过滑块重提必须与第一次同出口 IP，

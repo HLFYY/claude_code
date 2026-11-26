@@ -86,7 +86,7 @@ BIZ_MAP = {
     '/bff/promotion/price/calculate/product': ('101', '1001'),
     '/bff/order/confirmation/validationinfo': ('200', '1004'),
     '/bff/order/confirmation/promotion': ('202', '1020'),
-    '/bff/order/confirmation/addon': ('202', '1012'),
+    '/bff/order/confirmation/addon': ('', ''),        # 11-26 真机实测不带场景头（原 202/1012 是旧版入口）
     '/bff/order/confirmation/rightcard': ('202', '1019'),
     '/bff/order/orders': ('202', '1012'),
     '/bff/order/orders/list': ('202', '1006'),
@@ -1820,3 +1820,130 @@ def get_store_info(token, sid, store_code, be_type='1', order_type=1, proxies=No
                             path=path, query_params=params)
     url = f'{API_BASE}{path}'
     return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+# ==================== 画像/上报类动作（2026-11-26 真机三阶段抓包对照新增） ====================
+# 背景：开卡成功后第二次用优惠下单必撞 701135（「暂无法使用优惠」= 优惠使用资格审查）。
+# 对照真机抓包：我们的号画像 = 只有交易动作、零设备行为上报。
+# 真机启动必调 mdl×2 / ab / session/refresh / 首页周边，付款后有 badge 勋章上报与
+# community 页面动作，全程维持 pulse WebSocket 心跳。以下接口全部失败不阻断下单。
+
+def post_version_mdl(token, sid='', proxies=None):
+    """POST /bff/portal/version/mdl —— 启动设备模块清单上报（真机连打 ×2，无场景头）。
+
+    body 为固定模板：11 个模块索引 mi=1..11；响应带 ct/v，无业务价值，纯画像信号。
+    """
+    body = json.dumps({'audit': False,
+                       'rvs': [{'mi': i} for i in range(1, 12)]},
+                      separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/portal/version/mdl')
+    url = f'{API_BASE}/bff/portal/version/mdl'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def get_home_orderinfo(token, sid, proxies=None):
+    """GET /bff/portal/home/orderinfo —— 首页「我的订单」摘要（场景头 100/1009）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/portal/home/orderinfo',
+                            query_params=None)
+    url = f'{API_BASE}/bff/portal/home/orderinfo'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def get_hot_activity(token, sid, proxies=None):
+    """GET /bff/portal/home/hotActivity —— 首页热门活动（真机无场景头）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/portal/home/hotActivity')
+    url = f'{API_BASE}/bff/portal/home/hotActivity'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def get_order_addon(token, sid, store_code, daypart_code=None, be_type=1,
+                    order_type=1, proxies=None):
+    """GET /bff/order/confirmation/addon —— 结算页加购推荐（真机无场景头，11-26 实测）"""
+    params = {'beType': str(be_type), 'orderType': str(order_type),
+              'storeCode': str(store_code), 'expectDeliveryTime': '',
+              'date': '', 'time': '', 'pickupTimeType': '',
+              'dayPartCode': str(daypart_code or get_current_daypart_code())}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/order/confirmation/addon', query_params=params)
+    url = f'{API_BASE}/bff/order/confirmation/addon'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
+def put_order_rightcard(token, sid, store_code, cart_items, daypart_code=None,
+                        be_type='1', eat_type_code='eat-in', tableware_code='no',
+                        real_total_amount='0', menu_card_list=None,
+                        order_type='1', order_mode='0', pin_id='', proxies=None):
+    """PUT /bff/order/confirmation/rightcard —— 结算页选卡规格确认（场景头 202/1019）。
+
+    body 与 promotion/orders 同构：cartItems + menuCardList + realTotalAmount。
+    menuCardList 真机带 menuMembershipCode/menuMembershipSpecId/productCode 三字段。
+    仅随单开卡单调用（已有卡用户结算页无此步）。
+    """
+    if daypart_code is None:
+        daypart_code = get_current_daypart_code()
+    body_data = {
+        "activityOrder": 0, "autoMatch": False, "beType": be_type,
+        "cartItems": cart_items, "customerConfirm": False, "date": "",
+        "dayPartCode": str(daypart_code), "driveDuration": -1,
+        "driveDurationNew": -1, "eatTypeCode": eat_type_code,
+        "expectDeliveryDateCode": "", "latitude": 0.0, "longitude": 0.0,
+        "menuCardList": menu_card_list if menu_card_list is not None else [],
+        "orderMode": order_mode, "orderType": order_type, "pinId": pin_id,
+        "pinType": 0, "realTotalAmount": str(real_total_amount),
+        "simulationTest": 0, "skipDtTimeCheck": False, "skipPriceChange": False,
+        "source": 0, "storeCode": store_code, "tablewareCode": tableware_code,
+        "time": "",
+    }
+    body = json.dumps(body_data, separators=(',', ':'), ensure_ascii=False)
+    headers = build_headers(token, sid=sid, body=body, method='PUT',
+                            path='/bff/order/confirmation/rightcard')
+    url = f'{API_BASE}/bff/order/confirmation/rightcard'
+    return make_request('PUT', url, headers, data=body, proxies=proxies)
+
+
+def post_badge_order_pop(token, sid, order_id, proxies=None):
+    """POST /bff/journey/badge/order/pop —— 付款成功后勋章弹窗上报（真机无场景头）"""
+    body = json.dumps({'orderId': str(order_id)}, separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/journey/badge/order/pop')
+    url = f'{API_BASE}/bff/journey/badge/order/pop'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def post_badge_collect(token, sid, material_code_list, proxies=None):
+    """POST /bff/journey/badge/collect —— 勋章领取（materialCodeList 取自 order/pop 响应）"""
+    body = json.dumps({'materialCodeList': list(material_code_list or [])},
+                      separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/journey/badge/collect')
+    url = f'{API_BASE}/bff/journey/badge/collect'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def get_store_community(token, sid, proxies=None):
+    """GET /bff/store/stores/community —— 门店社群页（真机付款后每轮详情轮询伴随，无场景头）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/store/stores/community')
+    url = f'{API_BASE}/bff/store/stores/community'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def get_loyalty_reward_precalc(token, sid, proxies=None):
+    """GET /bff/mc/loyalty/reward/preCalculateReward —— 会员积分预计算（付款后，无场景头）"""
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/mc/loyalty/reward/preCalculateReward')
+    url = f'{API_BASE}/bff/mc/loyalty/reward/preCalculateReward'
+    return make_request('GET', url, headers, proxies=proxies)
+
+
+def post_campaign_materials(token, sid, store_code, scene='menu', be_type=1, proxies=None):
+    """POST /bff/common/normal/campaign/materials —— 进店营销素材拉取（真机每次进店都调，无场景头）"""
+    body = json.dumps({'beType': int(be_type), 'scene': scene,
+                       'storeCode': str(store_code)}, separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/common/normal/campaign/materials')
+    url = f'{API_BASE}/bff/common/normal/campaign/materials'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
