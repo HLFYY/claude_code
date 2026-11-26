@@ -1948,3 +1948,24 @@ def post_campaign_materials(token, sid, store_code, scene='menu', be_type=1, pro
                             path='/bff/common/normal/campaign/materials')
     url = f'{API_BASE}/bff/common/normal/campaign/materials'
     return make_request('POST', url, headers, data=body, proxies=proxies)
+
+
+def post_price_calculate_product(token, sid, store_code, product_code, quantity=1,
+                                 order_type=1, proxies=None):
+    """POST /bff/promotion/price/calculate/product —— 加购前券后价试算（真机每次加购前必调）。
+
+    只读接口：返回 originalPrice/price/estimatePrice，不改购物车与订单状态，
+    我们的实际金额判定仍以 validation 为准（此处纯行为链补齐）。
+    请求体极简（11-26 真机实测）：products[].promotionInfos 传空 cardId/promotionId。
+    场景头 101/1001（BIZ_MAP 已有）。
+    """
+    body = json.dumps({
+        'beCode': '', 'orderType': int(order_type),
+        'products': [{'code': str(product_code), 'quantity': int(quantity),
+                      'promotionInfos': [{'cardId': '', 'promotionId': ''}]}],
+        'storeCode': str(store_code),
+    }, separators=(',', ':'))
+    headers = build_headers(token, sid=sid, body=body, method='POST',
+                            path='/bff/promotion/price/calculate/product')
+    url = f'{API_BASE}/bff/promotion/price/calculate/product'
+    return make_request('POST', url, headers, data=body, proxies=proxies)
