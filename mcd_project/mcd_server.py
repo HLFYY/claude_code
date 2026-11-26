@@ -363,6 +363,7 @@ def maintenance_keepalive():
     import keepalive as ka
     body = request.get_json(silent=True) or {}
     only_merchant = str(body.get('merchant_id') or '').strip()
+    only_phone = str(body.get('only_phone') or '').strip()
     try:
         limit = int(body.get('limit') or 0)
     except Exception:
@@ -383,7 +384,7 @@ def maintenance_keepalive():
 
     t0 = time.time()
     try:
-        payload = ka.run_keepalive(merchant_id=only_merchant, limit=limit,
+        payload = ka.run_keepalive(merchant_id=only_merchant, limit=limit, only_phone=only_phone,
                                    min_interval_hours=min_hours, do_launch=do_launch,
                                    only_with_rt=only_with_rt)
     except Exception as e:

@@ -665,7 +665,7 @@ def _prewarm_city_ctx(r, merchant_id=''):
 
 
 def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True,
-                  only_with_rt=False, redis_client=None, workers=0):
+                  only_with_rt=False, redis_client=None, workers=0, only_phone=''):
     """批量保活。
 
     只做有 refreshToken 的号（用户 2026-11-24 定）：有 rt 才走真机那条 session/refresh 链路；
@@ -712,6 +712,8 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             errors.append('读 %s 失败: %s' % (key, e))
             continue
         for phone, raw in creds.items():
+            if only_phone and phone != only_phone:
+                continue
             if limit and len(targets) >= limit:
                 break
             try:
