@@ -31,6 +31,42 @@ import mcd_api
 from utils import log_info
 from config import make_redis, CREDENTIALS_KEY_TMPL
 
+# ========== 平台回写（2026-11-27）==========
+# 保活发现 sid 明确失效（dead / 401）时回写平台 verify-result(ok=false)，让平台把账号
+# 标成「不可用」(status=2)，下次入队不再派它 —— 避免坏号每轮保活白跑 9 个 401。
+# 令牌从共享 Redis mkt:{env}:{商户}:client:token 读（平台维护，与下单客户端同源）。
+PLATFORM_API = os.environ.get('MCD_PLATFORM_API',
+                              'https://connorguo.top/mkt_api/api/v1/client').rstrip('/')
+CLIENT_TOKEN_TMPL = 'mkt:{env}:{merchant_id}:client:token'
+
+
+def report_dead_to_platform(phone, merchant_id, msg='', redis_client=None):
+    """sid 明确失效 → 回写平台标不可用。返回 (ok, note)；任何异常静默，不影响保活主流程。
+
+    只在 dead（明确 401/登录失效）时调用；unknown（代理/网络抖动）绝不回写，
+    否则一次代理故障就把好号标死。凭据 field（手机号）即平台 account_no（绝大多数一致）。
+    """
+    try:
+        import requests
+        r = redis_client or make_redis()
+        env = os.environ.get('MCD_REGISTER_ENV', 'prod')
+        tok = (r.get(CLIENT_TOKEN_TMPL.format(env=env, merchant_id=merchant_id)) or '').strip()
+        if not tok:
+            return False, '平台令牌为空'
+        payload = {'account_no': phone, 'ok': False,
+                   'error': ('保活检测 sid 失效: ' + str(msg or ''))[:300]}
+        resp = requests.post(PLATFORM_API + '/accounts/verify-result',
+                             json=payload, headers={'X-Client-Token': tok}, timeout=10)
+        if resp.status_code != 200:
+            return False, 'HTTP %s' % resp.status_code
+        body = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
+        if body and body.get('error'):
+            return False, str(body.get('error'))[:80]
+        return True, ''
+    except Exception as e:
+        return False, '%s: %s' % (type(e).__name__, str(e)[:60])
+
+
 # ========== 可调参数（用户 2026-11-24 定：并发最多 2-3 秒） ==========
 WARMUP_PREHEAT_TIMEOUT = 3.0     # 预热（拉配置）单请求最多等这么久
 WARMUP_CONCURRENT_TIMEOUT = 2.5  # 并发段每个动作最多等这么久
@@ -435,14 +471,50 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
     except Exception:
         pass
 
-    # ---- 1) 续期（不走代理探活）----
+    # ====================================================================
+    # 动作顺序（2026-11-27 用户定）：先假启动 → 再 session/refresh 续期 → pulse
     #
-    # 为什么跳过探活：探活打的 URL 就是 /bff/common/normal/config，和保活「模拟启动」
-    # 的第一个请求（拉配置）完全一样 —— 探活等于把同一个请求发两遍，每号白等 1~7 秒
-    # （实测 4 个号光探活就占了 10 秒）。
-    # 改成「直接用这个代理发真实请求；失败且是代理层故障才换新代理重试一次」。
-    #
-    # 最多试 2 个代理（每次失败换新），避免坏代理把整批拖死。
+    # 真人逻辑：点亮手机打开 APP、产生一批访问痕迹（拉配置/主页/会员/设备…），
+    # 会话在后台由 App 自己续期。原实现是「先续期、成功才假启动」，顺序反了：
+    # 失效号连启动痕迹都不留，也不符合"模仿真人打开一次手机"。
+    # 代理：假启动拿一次（不探活，探活与「拉配置」是同一个请求、白等 1~7s），
+    # 续期复用同一个代理 = 同一出口 IP（真人一次打开全程一个出口）。
+    # ====================================================================
+
+    # ---- 1) 假启动（模拟打开 APP）----
+    launch = None
+    launch_dead = False  # 假启动动作里出现明确 401 → sid 失效信号，供后面 dead 判定
+    for attempt in range(2):
+        try:
+            if proxies is None:
+                proxies = mgr.get_login_proxy(is_send_code=False,
+                                             force_new=(attempt > 0), probe=False)
+            ctx = lookup_city(city, token, sid, proxies)
+            store = lookup_store(city)
+            store_code = store[0] if store else ''
+            be_code = store[1] if store else ''
+            launch = fake_launch(
+                token, sid, d=d, city=city, province=province,
+                store_code=store_code, city_code=(ctx or {}).get('code', ''),
+                lat=(ctx or {}).get('lat'), lng=(ctx or {}).get('lng'), proxies=proxies)
+            if be_code:
+                launch['be_code'] = be_code
+            detail = launch.get('detail') or ''
+            if any(x in detail.lower() for x in ('401', '登录失效', '其他设备登录', '重新登录')):
+                launch_dead = True
+            # 预热（拉配置）失败且是代理层故障 → 换新代理重跑
+            if attempt < 1 and launch.get('ok', 0) == 0 and any(
+                    x in detail for x in ('代理连接失败', '请求超时', '网络连接失败',
+                                          'ProxyError', 'ConnectionError')):
+                proxies = None
+                continue
+            break
+        except Exception as e:
+            launch = {'ok': 0, 'total': 0, 'elapsed': 0,
+                      'detail': '假启动异常: ' + str(e)[:60]}
+            break
+
+    # ---- 2) 续期（复用假启动的代理，同一出口 IP；不走代理探活）----
     last_proxy_err = ''
     ok = False
     msg = ''
@@ -483,55 +555,19 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
                 pass
 
     low = str(msg or '').lower()
-    dead = (not ok) and any(x in low for x in ['401', '登录失效', '其他设备登录', '重新登录'])
-    unknown = (not ok) and not dead
-
+    dead = (not ok) and (any(x in low for x in ['401', '登录失效', '其他设备登录', '重新登录'])
+                         or launch_dead)
     state = 'alive' if ok else ('dead' if dead else 'unknown')
     res = {'phone': phone, 'ok': bool(ok), 'state': state, 'msg': str(msg)[:120],
-           'refresh_kind': refresh_kind, 'has_rt': bool(rt), 'launch': None}
+           'refresh_kind': refresh_kind, 'has_rt': bool(rt), 'launch': launch,
+           'launch_dead': launch_dead}
     if last_proxy_err:
         res['msg'] = (res['msg'] + ' | 代理: ' + last_proxy_err)[:160]
 
-    if not ok:
-        # 续期就失败了 → 假启动没意义（会话本身就不被接受），直接返回
-        return res
-
-    # ---- 2) 假启动（模拟打开 APP）----
-    #
-    # 代理是「刚拿到没探活」的（见上面为什么跳过探活），可能第一个请求就撞上
-    # 代理层故障 → 换新代理整段重跑一次。所以这里最多试 2 个代理。
-    launch = None
-    for attempt in range(2):
-        try:
-            if proxies is None:
-                proxies = mgr.get_login_proxy(is_send_code=False,
-                                             force_new=(attempt > 0), probe=False)
-            ctx = lookup_city(city, token, sid, proxies)
-            store = lookup_store(city)
-            store_code = store[0] if store else ''
-            be_code = store[1] if store else ''
-            launch = fake_launch(
-                token, sid, d=d, city=city, province=province,
-                store_code=store_code, city_code=(ctx or {}).get('code', ''),
-                lat=(ctx or {}).get('lat'), lng=(ctx or {}).get('lng'), proxies=proxies)
-            if be_code:
-                launch['be_code'] = be_code
-            # 预热（拉配置）失败且是代理层故障 → 换新代理重跑
-            detail = launch.get('detail') or ''
-            if attempt < 1 and launch.get('ok', 0) == 0 and any(
-                    x in detail for x in ('代理连接失败', '请求超时', '网络连接失败',
-                                          'ProxyError', 'ConnectionError')):
-                proxies = None
-                continue
-            break
-        except Exception as e:
-            launch = {'ok': 0, 'total': 0, 'elapsed': 0,
-                      'detail': '假启动异常: ' + str(e)[:60]}
-            break
-    res['launch'] = launch
-    # ---- 3) pulse 心跳会话（假启动成功才建；daemon 到点自动断）----
+    # ---- 3) pulse 心跳会话（续期成功 + 假启动成功才建；daemon 到点自动断）----
+    # 会话没续上（dead/unknown）就不建心跳了 —— 会话都没了，心跳没意义。
     try:
-        if launch and launch.get('ok', 0) > 0 and PULSE_KEEP_SECONDS > 0:
+        if ok and launch and launch.get('ok', 0) > 0 and PULSE_KEEP_SECONDS > 0:
             _px = ''
             if proxies:
                 _px = (proxies.get('http') or proxies.get('https') or '').replace('http://', '')
@@ -541,7 +577,6 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
                              name='pulse-ka-%s' % phone).start()
     except Exception as e:
         log_info('💓 保活pulse启动失败(静默) %s: %s' % (phone, str(e)[:80]))
-
 
     return res
 
@@ -665,7 +700,8 @@ def _prewarm_city_ctx(r, merchant_id=''):
 
 
 def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True,
-                  only_with_rt=False, redis_client=None, workers=0, only_phone=''):
+                  only_with_rt=False, redis_client=None, workers=0, only_phone='',
+                  eligible=None):
     """批量保活。
 
     只做有 refreshToken 的号（用户 2026-11-24 定）：有 rt 才走真机那条 session/refresh 链路；
@@ -698,6 +734,9 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             errors.append('城市上下文预热失败: %s' % str(e)[:80])
 
     # ---- 1) 先把要保活的号收齐（读 Redis 很快，这步不占时间）----
+    # eligible（2026-11-27）：平台入队时给的「可用账号」凭据 field 名单。
+    # 非空时只保活名单里的号（跳过不可用/封禁/权益受限号）；None/空 = 老任务，照旧全扫。
+    eligible_set = set(str(x) for x in eligible) if eligible else None
     targets = []
     for key in r.scan_iter(match=pattern, count=200):
         parts = str(key).split(':')
@@ -713,6 +752,8 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             continue
         for phone, raw in creds.items():
             if only_phone and phone != only_phone:
+                continue
+            if eligible_set is not None and phone not in eligible_set:
                 continue
             if limit and len(targets) >= limit:
                 break
@@ -776,6 +817,13 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
             r.hset(key, phone, json.dumps(cred, ensure_ascii=False))
         except Exception:
             pass
+        # sid 明确失效（dead）→ 回写平台标「不可用」，下次入队不再派它。
+        # unknown（代理/网络抖动）不回写，避免误杀好号。verify-result 幂等，重复跑安全。
+        if res.get('state') == 'dead':
+            dok, dnote = report_dead_to_platform(phone, mid, res.get('msg', ''), r)
+            res['dead_reported'] = dok
+            if not dok:
+                log_info('⚠ 保活 dead 回写平台失败 %s: %s' % (phone, dnote))
         return res
 
     n_workers = workers if workers and workers > 0 else KEEPALIVE_WORKERS
@@ -808,6 +856,7 @@ def run_keepalive(merchant_id='', limit=0, min_interval_hours=20, do_launch=True
                 'refresh_kind': res.get('refresh_kind', ''),
                 'launch_ok': lz.get('ok', 0), 'launch_total': lz.get('total', 0),
                 'launch_detail': lz.get('detail', '')[:300],
+                'dead_reported': bool(res.get('dead_reported')),
             })
 
     payload = {

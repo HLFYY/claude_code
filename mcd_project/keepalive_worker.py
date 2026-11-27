@@ -21,7 +21,8 @@
 
 ★ 任务 JSON 是跨语言契约，与 Go 侧 internal/handler/admin_keepalive.go
   keepAliveQueueTask 一一对应，改字段必须两边同步：
-    merchant_id / limit / min_interval_hours / do_launch / source / requested_at
+    merchant_id / limit / min_interval_hours / do_launch / source / requested_at / eligible
+  eligible：可用账号凭据 field 名单，非空时只保活名单内账号（平台已筛掉不可用号）
 
 启动（94，独立进程，不重启 mcd-server）：
   systemctl restart mcd-keepalive-worker.service
@@ -79,16 +80,21 @@ def run_task(task):
     do_launch = task.get('do_launch')
     do_launch = True if do_launch is None else bool(do_launch)
     source = str(task.get('source') or '?')
+    # eligible（2026-11-27）：平台入队时筛出的「可用账号」名单。
+    # 老任务无此字段 → None → run_keepalive 全扫（兼容）；新任务只跑名单里的号。
+    eligible = task.get('eligible')
+    eligible = list(eligible) if isinstance(eligible, list) and eligible else None
 
-    log('■ 开始 mid=%s source=%s limit=%s min_interval=%s 请求于=%s'
-        % (mid, source, limit, min_hours, task.get('requested_at') or '-'))
+    log('■ 开始 mid=%s source=%s limit=%s min_interval=%s eligible=%s 请求于=%s'
+        % (mid, source, limit, min_hours,
+           len(eligible) if eligible else '全扫', task.get('requested_at') or '-'))
     t0 = time.time()
     try:
         # only_with_rt=True：只保活带 refreshToken 的号（与平台原默认一致）
         payload = ka.run_keepalive(merchant_id=mid, limit=limit,
                                    min_interval_hours=min_hours,
                                    do_launch=do_launch, only_with_rt=True,
-                                   redis_client=REDIS)
+                                   redis_client=REDIS, eligible=eligible)
     except Exception as e:
         log('■ 执行异常 mid=%s: %s' % (mid, e))
         _write_error_last(mid, e)
