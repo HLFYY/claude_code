@@ -1130,8 +1130,6 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         "cardId": card_id,
         "cardType": card_type,
         "code": product_code,
-        "couponCode": coupon_code,
-        "couponId": coupon_id,
         "gmAssistServiceCode": gm_assist_service_code,
         "id": f"1-{product_code}",
         "image": product_image,
@@ -1141,6 +1139,13 @@ def add_to_cart(token, sid, store_code, be_code='', product_code='', product_nam
         "sequence": sequence,
         "type": product_type
     }
+    # 2026-11-26 修：couponCode/couponId 空串不再下发（与 promotionId 同款模式）。
+    # 原生抓包（11-25 棒球帽单）products 里根本没有这两个字段——空串疑似导致
+    # 麦当劳不挂「限时特权立减5元」促销券（MKTT1795593717851 差 5 元的嫌疑根因）。
+    if coupon_code:
+        product_data["couponCode"] = coupon_code
+    if coupon_id:
+        product_data["couponId"] = coupon_id
 
     # 用券必需：麦当劳只有拿到 promotionId 才会把券挂到商品上（不带 → 按原价结算）。
     # 留空就不下发这个 key，行为与改造前完全一致。
