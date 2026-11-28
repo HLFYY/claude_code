@@ -186,7 +186,8 @@ class LoginManager:
         self.check_status: str = ''
         # 麦金卡状态:vip_time=最近开通下单时间(ISO);vip_status=valid/invalid/error(定义同 check_*,含义是麦金卡)
         self.vip_time: str = ''
-        # refreshToken（2026-11-21）：登录响应里带回的续期凭证，掉登录时可免重新接码。
+        # refreshToken（2026-11-21）：登录响应带回的会话校验凭证；
+        # 【11-24 实测】sid 被顶后旧 rt 也救不回，不能免接码恢复登录。
         # 之前完全没有保存，登录只返回一次，丢了就永久拿不回来。
         self.refresh_token: str = ''
         self.vip_status: str = ''
@@ -1132,7 +1133,7 @@ class LoginManager:
             self.phone, verify_code, self.token, proxies=proxies)
 
         if success:
-            # 保存凭证（含 refreshToken：掉登录时可用它续期，免得重新接码）
+            # 保存凭证（含 refreshToken：用于 session/refresh 校验；11-24 实测救不回被顶登录）
             self.refresh_token = refresh_token or self.refresh_token
             self.save_credentials(self.token, sid, meddy_id, refresh_token=refresh_token)
             return True, "登录成功"

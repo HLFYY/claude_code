@@ -500,7 +500,8 @@ def login_refresh(token, sid, d='', proxies=None):
     sid + token + v4 HMAC 签名校验"当前登录态是否被服务端接受"——服务端返回
     data=true 即通过。biz_scenario/biz_from 按真机 = 500/1020（见 BIZ_MAP）。
 
-    注意：refresh 只"校验/续期"，不会把 token 绑定到 sid、也不会下发新 sid；
+    注意：refresh 只做闸门校验，不会把 token 绑定到 sid、不会下发新 sid，也不会延长 sid 寿命；
+    【11-28 实测】sid 原样返回，refresh 续不了命，alive 仅代表此刻 sid 被接受；
     失败只说明这套 sid+设备头此刻不被接受（sid 失效 / 换设备被拒），应走重登。
 
     Args:
@@ -637,7 +638,8 @@ def login(phone, verify_code, token, proxies=None):
         sid = data.get('sid', '')
         meddy_id = data.get('meddyId', '')
         # refreshToken（2026-11-21）：登录响应 data 里除 sid/meddyId 还有 refreshToken，
-        # 之前整块丢弃。它用于「不重新发短信就能续期会话」，掉登录时可免接码。
+        # 之前整块丢弃。它用于 session/refresh 校验会话；【11-24 实测】sid 被顶掉后
+        # 旧 sid + 旧 rt 调 session/refresh 同样 401、救不回 —— 不能免接码恢复登录。
         # 返回值：success, sid, meddy_id, refresh_token, message（唯一调用方 login_manager.do_login）
         refresh_token = str(data.get('refreshToken') or data.get('refresh_token') or '')
         return True, sid, meddy_id, refresh_token, "登录成功"

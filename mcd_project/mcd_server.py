@@ -322,7 +322,8 @@ def login_verify():
                 'token': login_manager.token,
                 'sid': login_manager.sid,
                 'meddy_id': login_manager.meddy_id,
-                # refreshToken：平台/注册脚本要能拿到并持久化（掉登录时用它续期，免重新接码）
+                # refreshToken：平台/注册脚本要能拿到并持久化（用于 session/refresh 校验；
+                # 11-24 实测 sid 被顶后旧 rt 救不回，不能免接码恢复登录）
                 'refresh_token': getattr(login_manager, 'refresh_token', '') or ''
             },
             'message': message
@@ -346,12 +347,13 @@ def login_captcha_status():
 
 @app.route('/api/maintenance/keepalive', methods=['POST'])
 def maintenance_keepalive():
-    """账号保活：续期 SID + 模拟启动（打开 APP）。
+    """账号保活：会话校验 + 模拟启动（打开 APP）。
 
-    2026-11-24 重写。原来只调空体 /bff/passport/login/refresh 做续期；
+    2026-11-24 重写。原来只调空体 /bff/passport/login/refresh 做校验；
     现在改成：
-      1) 续期优先走 **session/refresh + refreshToken**（真机链路，11-23 抓包实测真机在用这条）
-      2) 续期成功后按该号属地做一次「模拟启动」：拉配置/主页/会员/通知/设备上报/附近门店，
+      1) 校验优先走 **session/refresh + refreshToken**（真机链路，11-23 抓包实测真机在用这条；
+         11-28 实测只校验、不换 sid、不续命，真机靠后台常驻进程活跃信号才不掉线）
+      2) 校验通过后按该号属地做一次「模拟启动」：拉配置/主页/会员/通知/设备上报/附近门店，
          并发发，整段 ≤ 2~3 秒（真机启动日志 16:42:01~16:42:10 的启动段）
       3) 只处理有 refreshToken 的号（没 rt 的号 session/refresh 调不了）
     结果写 Redis mkt:prod:{商户}:keepalive:last（24h 过期），后台「保活设置」弹窗读它。

@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""账号保活（keepalive）：续期 SID + 模拟启动（打开 APP）。
+"""账号保活（keepalive）：会话校验 + 模拟启动（打开 APP）。
 
 2026-11-24 新增。背景：
-  1) 麦当劳方说明「会话每天要用 refresh 激活一次，App 后台进程会自动发；不做就掉登录」。
+  1) 麦当劳方转述「会话每天要用 refresh 激活一次，App 后台进程会自动发；不做就掉登录」。
+     ★ 2026-11-28 实测修正：session/refresh 只校验当前 sid 是否被服务端接受，
+       sid 原样返回、不轮换、不续命；alive 仅代表接口 200，不代表会话寿命被延长。
+       真机不掉线靠的是 App 后台常驻进程持续发活跃信号（含真实设备 SDK 会话），
+       脚本没有这个进程，refresh 空校验挡不住 sid 闲置过期 —— 保活提频也无用。
   2) 11-23 真机抓包（cap_20261123_164049_70451）显示 App 启动时会并发打一批接口，
-     其中 /bff/portal/home/index（主页）真机调了两次 —— 单纯续期不够，
+     其中 /bff/portal/home/index（主页）真机调了两次 —— 单纯 refresh 校验不够，
      要让风控看到「这个号今天真的打开过 App」。
 
 本模块提供两件事：
-  - keepalive_account()：对一个账号做「续期 + 假启动」，返回结论明细
+  - keepalive_account()：对一个账号做「校验 + 假启动」，返回结论明细
   - run_keepalive()：批量跑（按商户/限额），把结果写回 Redis（供后台展示）
 
 ★ 与订单客户端 warmup 的区别：
@@ -443,15 +447,17 @@ def _pulse_keepalive_loop(phone, token, sid, meddy, proxy_ip, close_at):
 # ========== 单号保活 ==========
 
 def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
-    """对一个账号做「续期 + 假启动」。
+    """对一个账号做「会话校验 + 假启动」。
 
-    续期优先用 session/refresh + refreshToken（真机链路，2026-11-24 用户定）；
-    没有 rt 的号回落到空体 login/refresh（闸门校验，能续期但不是真机那条路）。
+    会话校验优先用 session/refresh + refreshToken（真机链路，2026-11-24 用户定）；
+    没有 rt 的号回落到空体 login/refresh（闸门校验）。
+    ★ 2026-11-28 实测：两种 refresh 都只校验 sid 是否被服务端接受，sid 不轮换、不续命，
+      alive 仅代表接口 200，不代表会话寿命延长 —— 别把"保活成功"当成"sid 被续期"。
 
     返回 dict：
       {phone, ok, state, msg, launch: {...}}
       state ∈ alive / dead / unknown
-        alive   = 续期成功
+        alive   = 校验通过（session/refresh 返回 200；sid 未轮换、未被真正续命）
         dead    = 明确 401（登录失效或在其他设备登录）→ 建议删号
         unknown = 代理/网络/服务端异常 → 结论不确定，不能当掉线
     """
@@ -472,13 +478,15 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
         pass
 
     # ====================================================================
-    # 动作顺序（2026-11-27 用户定）：先假启动 → 再 session/refresh 续期 → pulse
+    # 动作顺序（2026-11-27 用户定）：先假启动 → 再 session/refresh 校验 → pulse
     #
-    # 真人逻辑：点亮手机打开 APP、产生一批访问痕迹（拉配置/主页/会员/设备…），
-    # 会话在后台由 App 自己续期。原实现是「先续期、成功才假启动」，顺序反了：
+    # 真人逻辑：点亮手机打开 APP、产生一批访问痕迹（拉配置/主页/会员/设备…）。
+    # 【修正 11-28】旧注释说"会话在后台由 App 自己续期"——实测 refresh 不换 sid、不续命，
+    # 真机靠的是后台常驻进程持续发活跃信号，脚本没有这个进程，仅靠 refresh 挡不住过期。
+    # 原实现是「先校验、成功才假启动」，顺序反了：
     # 失效号连启动痕迹都不留，也不符合"模仿真人打开一次手机"。
     # 代理：假启动拿一次（不探活，探活与「拉配置」是同一个请求、白等 1~7s），
-    # 续期复用同一个代理 = 同一出口 IP（真人一次打开全程一个出口）。
+    # 会话校验复用同一个代理 = 同一出口 IP（真人一次打开全程一个出口）。
     # ====================================================================
 
     # ---- 1) 假启动（模拟打开 APP）----
@@ -514,7 +522,7 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
                       'detail': '假启动异常: ' + str(e)[:60]}
             break
 
-    # ---- 2) 续期（复用假启动的代理，同一出口 IP；不走代理探活）----
+    # ---- 2) 会话校验（复用假启动的代理，同一出口 IP；不走代理探活）----
     last_proxy_err = ''
     ok = False
     msg = ''
@@ -564,8 +572,8 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
     if last_proxy_err:
         res['msg'] = (res['msg'] + ' | 代理: ' + last_proxy_err)[:160]
 
-    # ---- 3) pulse 心跳会话（续期成功 + 假启动成功才建；daemon 到点自动断）----
-    # 会话没续上（dead/unknown）就不建心跳了 —— 会话都没了，心跳没意义。
+    # ---- 3) pulse 心跳会话（校验通过 + 假启动成功才建；daemon 到点自动断）----
+    # 会话没校验通过（dead/unknown）就不建心跳了 —— 会话都没了，心跳没意义。
     try:
         if ok and launch and launch.get('ok', 0) > 0 and PULSE_KEEP_SECONDS > 0:
             _px = ''
@@ -585,8 +593,8 @@ def launch_account(phone, merchant_id, city='', province='', proxies=None):
     """单号**只做假启动**（新号注册成功后养号用，2026-11-24 用户定）。
 
     与 keepalive_account() 的区别：
-      - 不做续期：注册流程已调过 /api/login/session_refresh（register_worker 4.5 步），
-        这里只补「打开 APP」那一段，避免二次刷新。
+      - 不做会话校验：注册流程已调过 /api/login/session_refresh（register_worker 4.5 步），
+        这里只补「打开 APP」那一段，避免二次校验。
       - 入参极简：只要 phone + merchant_id；city/province/d/token/sid 全部从 Redis 凭据读。
 
     返回 {'phone', 'merchant_id', 'city', 'province', 'ok', 'total', 'detail', 'elapsed'}
