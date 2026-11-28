@@ -1813,6 +1813,15 @@ def get_menu_campaign(token, sid, store_code, daypart_code=None, order_type=1, p
     return make_request('GET', url, headers, params=params, proxies=proxies)
 
 
+def get_store_hottags(token, sid, scene='1', proxies=None):
+    """GET /bff/store/stores/hottags —— 门店标签（真机进店带 scene=1，场景头 103/1014）"""
+    params = {'scene': str(scene)}
+    headers = build_headers(token, sid=sid, body='', method='GET',
+                            path='/bff/store/stores/hottags', query_params=params)
+    url = f'{API_BASE}/bff/store/stores/hottags'
+    return make_request('GET', url, headers, params=params, proxies=proxies)
+
+
 def get_store_info(token, sid, store_code, be_type='1', order_type=1, proxies=None):
     """GET /bff/store/stores/{storeCode} —— 进店门票（看门店详情）。
 
