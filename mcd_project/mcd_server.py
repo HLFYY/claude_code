@@ -352,7 +352,7 @@ def maintenance_keepalive():
     2026-11-24 重写。原来只调空体 /bff/passport/login/refresh 做校验；
     现在改成：
       1) 校验优先走 **session/refresh + refreshToken**（真机链路，11-23 抓包实测真机在用这条；
-         11-28 实测只校验、不换 sid、不续命，真机靠后台常驻进程活跃信号才不掉线）
+         11-28 实测只校验、不换 sid、不续命；alive 不代表会话被续期）
       2) 校验通过后按该号属地做一次「模拟启动」：拉配置/主页/会员/通知/设备上报/附近门店，
          并发发，整段 ≤ 2~3 秒（真机启动日志 16:42:01~16:42:10 的启动段）
       3) 只处理有 refreshToken 的号（没 rt 的号 session/refresh 调不了）
