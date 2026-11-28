@@ -32,6 +32,10 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 import mcd_api
 from utils import log_info
 from config import make_redis, CREDENTIALS_KEY_TMPL
+from pulse_protocol import (
+    PULSE_WS_URL, PULSE_HEARTBEAT, PULSE_INTERVAL, build_pulse_headers,
+    pulse_message_type as _pulse_message_type, pulse_proxy_options,
+)
 
 # ========== 平台回写（2026-11-27）==========
 # 保活发现 sid 明确失效（dead / 401）时回写平台 verify-result(ok=false)，让平台把账号
@@ -384,62 +388,73 @@ def fake_launch(token, sid, d='', city='', province='', store_code='', city_code
 # ---- pulse WebSocket 心跳会话（2026-11-26，与下单客户端 PULSE_* 常量同源）----
 # 真机打开 APP 即建 pulse 长连接（15s 心跳，固定 39B gzip 包）——保活假启动成功后
 # 模拟「用户打开 APP 停留几分钟」，daemon 线程到点自动断开，不阻塞保活主流程。
-PULSE_WS_URL = 'wss://ws.mcd.cn/bff/pulse/ws'
-PULSE_HEARTBEAT = bytes.fromhex(
-    '1f8b08000000000000007312f470750c0a7172750c890f720d0c750d0e01003c955b8113000000')
-PULSE_INTERVAL = 15
 PULSE_KEEP_SECONDS = 180   # 保活场景：打开 APP 停留约 3 分钟
-PULSE_APP_VERSION = '7.0.45.1'
 
 
-def _pulse_keepalive_loop(phone, token, sid, meddy, proxy_ip, close_at):
-    """保活专属 pulse 心跳线程：到点自动断开，全程失败静默。"""
+def _pulse_headers(sid, meddy, profile, st=None):
+    """按 SocketRequest.kt 构造握手头；偏移默认 0，不额外发起校时请求。"""
+    return build_pulse_headers(sid, meddy, profile, st=st, now=time.time())
+
+
+def _pulse_keepalive_loop(phone, sid, meddy, proxy_ip, close_at):
+    """限时后台心跳；close_at 使用 monotonic，失败停止且不影响保活校验结果。"""
     try:
         import websocket
     except ImportError:
         log_info('💓 保活pulse跳过(无websocket库) %s' % phone)
         return
-    import base64 as _b64
-    import hashlib as _hashlib
-    import hmac as _hmac
-    st = str(int(time.time() * 1000))
-    headers = {
-        'sid': sid, 'ct': '102', 'v': PULSE_APP_VERSION, 'meddyId': meddy or '',
-        'scene': '', 'sv': 'v4', 'st': st,
-        'sign': _b64.b64encode(_hmac.new((token or '').encode(), st.encode(),
-                                         _hashlib.sha256).digest()).decode() if token else '',
-        'User-Agent': 'okhttp/4.9.2', 'Accept-Encoding': 'gzip',
-    }
-    kw = {'header': headers, 'timeout': 20}
-    if proxy_ip:
-        _host = proxy_ip.split('://')[-1].rsplit(':', 1)
-        if len(_host) == 2 and _host[1].isdigit():
-            kw['http_proxy_host'], kw['http_proxy_port'] = _host[0], int(_host[1])
+    import zlib
+
+    ws = None
+    sent = acknowledged = other = invalid = 0
+    reason = 'deadline'
     try:
+        remaining = close_at - time.monotonic()
+        if remaining <= 0:
+            return
+        headers = _pulse_headers(sid, meddy, mcd_api.CLIENT_PROFILE)
+        kw = {'header': headers, 'timeout': min(20, remaining)}
+        if proxy_ip:
+            kw.update(pulse_proxy_options(proxy_ip), http_proxy_timeout=min(20, remaining))
         ws = websocket.create_connection(PULSE_WS_URL, **kw)
-        ws.settimeout(PULSE_INTERVAL + 5)
         log_info('💓 保活pulse连接建立 %s（保持%ds）' % (phone, PULSE_KEEP_SECONDS))
-        while time.time() < close_at:
-            t0 = time.time()
-            try:
+        next_send = time.monotonic() + PULSE_INTERVAL
+        while time.monotonic() < close_at:
+            now = time.monotonic()
+            if now >= next_send:
                 ws.send(PULSE_HEARTBEAT, opcode=websocket.ABNF.OPCODE_BINARY)
-            except Exception:
-                log_info('💓 保活pulse发送断开 %s' % phone)
-                return
+                sent += 1
+                next_send = time.monotonic() + PULSE_INTERVAL
+            remaining = min(close_at, next_send) - time.monotonic()
+            if remaining <= 0:
+                continue
+            ws.settimeout(min(1, remaining))
             try:
-                ws.recv()
+                opcode, payload = ws.recv_data(control_frame=True)
+            except websocket.WebSocketTimeoutException:
+                continue
+            if opcode == websocket.ABNF.OPCODE_CLOSE:
+                reason = 'peer_closed'
+                break
+            if opcode in (websocket.ABNF.OPCODE_PING, websocket.ABNF.OPCODE_PONG):
+                continue
+            try:
+                if _pulse_message_type(payload) == 'HEARTBEAT_RESPONSE':
+                    acknowledged += 1
+                else:
+                    other += 1
+            except (ValueError, OSError, EOFError, zlib.error):
+                invalid += 1
+    except Exception as error:
+        reason = type(error).__name__
+    finally:
+        if ws is not None:
+            try:
+                ws.close(timeout=3)
             except Exception:
                 pass
-            wait = PULSE_INTERVAL - (time.time() - t0)
-            if wait > 0:
-                time.sleep(wait)
-        try:
-            ws.close()
-        except Exception:
-            pass
-        log_info('💓 保活pulse会话结束 %s' % phone)
-    except Exception as e:
-        log_info('💓 保活pulse异常(静默) %s: %s' % (phone, str(e)[:80]))
+        log_info('💓 保活pulse结束 %s reason=%s sent=%d ack=%d other=%d invalid=%d'
+                 % (phone, reason, sent, acknowledged, other, invalid))
 
 
 # ========== 单号保活 ==========
@@ -576,10 +591,10 @@ def keepalive_account(phone, merchant_id, city='', province='', proxies=None):
         if ok and launch and launch.get('ok', 0) > 0 and PULSE_KEEP_SECONDS > 0:
             _px = ''
             if proxies:
-                _px = (proxies.get('http') or proxies.get('https') or '').replace('http://', '')
+                _px = proxies.get('http') or proxies.get('https') or ''
             threading.Thread(target=_pulse_keepalive_loop, daemon=True,
-                             args=(phone, token, mgr.sid, mgr.meddy_id, _px,
-                                   time.time() + PULSE_KEEP_SECONDS),
+                             args=(phone, mgr.sid, mgr.meddy_id, _px,
+                                   time.monotonic() + PULSE_KEEP_SECONDS),
                              name='pulse-ka-%s' % phone).start()
     except Exception as e:
         log_info('💓 保活pulse启动失败(静默) %s: %s' % (phone, str(e)[:80]))

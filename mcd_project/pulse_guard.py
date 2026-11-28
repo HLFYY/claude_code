@@ -21,36 +21,29 @@
 systemd: /etc/systemd/system/mcd-pulse-guard.service
 """
 import argparse
-import base64 as _b64
-import hashlib as _hashlib
-import hmac as _hmac
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import zlib
 
 # 让脚本可从任意 cwd 启动：把本目录加进 sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import config
 from config import make_redis, CREDENTIALS_KEY_TMPL
+from mcd_profiles import get_client_profile
+from pulse_protocol import (
+    PULSE_WS_URL, PULSE_HEARTBEAT, PULSE_INTERVAL, build_pulse_headers,
+    pulse_message_type, pulse_proxy_options,
+)
 from utils import get_short_proxy
 
-PULSE_WS_URL = 'wss://ws.mcd.cn/bff/pulse/ws'
-# 真机固定 39B gzip HEARTBEAT 包（与下单客户端/保活同源）
-PULSE_HEARTBEAT = bytes.fromhex(
-    '1f8b08000000000000007312f470750c0a7172750c890f720d0c750d0e01003c955b8113000000')
-PULSE_INTERVAL = 15
-PULSE_APP_VERSION = '7.0.45.1'
+CLIENT_PROFILE = get_client_profile()
 MAX_BACKOFF = 300          # 重连退避上限 5 分钟
 LOG_FILE = '/home/pi/work/logs/mcd_pulse_guard.log'
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
 log = logging.getLogger('pulse_guard')
 
 _stop = threading.Event()
@@ -74,22 +67,17 @@ def _get_proxy(city, province, merchant_id):
     try:
         return get_short_proxy(city or None, province=province or None,
                                merchant_id=merchant_id, as_dict=True)
-    except Exception as e:
-        log.warning('  取代理异常 city=%s: %s' % (city, str(e)[:80]))
+    except Exception as error:
+        log.warning('  取代理异常 city=%s: %s' % (city, type(error).__name__))
         return None
 
 
 def _proxy_kw(proxies):
     """requests proxies dict → websocket.create_connection 的 proxy kw。"""
-    kw = {}
-    if not proxies:
-        return kw
-    url = proxies.get('http') or proxies.get('https') or ''
-    host = url.split('://')[-1].rsplit(':', 1)
-    if len(host) == 2 and host[1].isdigit():
-        kw['http_proxy_host'] = host[0]
-        kw['http_proxy_port'] = int(host[1])
-    return kw
+    url = (proxies or {}).get('http') or (proxies or {}).get('https') or ''
+    if not url:
+        raise ValueError('缺少 HTTP 代理地址')
+    return pulse_proxy_options(url)
 
 
 def heartbeat_worker(phone, merchant_id, r):
@@ -101,7 +89,7 @@ def heartbeat_worker(phone, merchant_id, r):
             log.warning('%s 无凭据/sid，60s 后重试' % phone)
             _stop.wait(60)
             continue
-        sid, token, meddy, city, province = cred
+        sid, _token, meddy, city, province = cred
         proxies = _get_proxy(city, province, merchant_id)
         if not proxies:
             log.warning('%s 无可用代理(city=%s)，30s 后重试' % (phone, city))
@@ -115,42 +103,52 @@ def heartbeat_worker(phone, merchant_id, r):
             _stop.set()
             return
 
-        st = str(int(time.time() * 1000))
-        headers = {
-            'sid': sid, 'ct': '102', 'v': PULSE_APP_VERSION,
-            'meddyId': meddy or '', 'scene': '', 'sv': 'v4', 'st': st,
-            'sign': _b64.b64encode(_hmac.new(
-                (token or '').encode(), st.encode(), _hashlib.sha256
-            ).digest()).decode() if token else '',
-            'User-Agent': 'okhttp/4.9.2', 'Accept-Encoding': 'gzip',
-        }
-        kw = dict(header=headers, timeout=20, **_proxy_kw(proxies))
         ws = None
+        sent = acknowledged = other = invalid = 0
+        reason = 'stopped'
         try:
+            headers = build_pulse_headers(sid, meddy, CLIENT_PROFILE)
+            kw = dict(header=headers, timeout=20, http_proxy_timeout=20, **_proxy_kw(proxies))
             ws = websocket.create_connection(PULSE_WS_URL, **kw)
-            ws.settimeout(PULSE_INTERVAL + 5)
             backoff = 5   # 连上即重置退避
-            log.info('%s ✅心跳连接建立 city=%s 代理=%s' % (
-                phone, city, (proxies.get('http') or proxies.get('https') or '')[-24:]))
+            log.info('%s ✅心跳连接建立 city=%s v=%s' % (phone, city, CLIENT_PROFILE.version))
+            next_send = time.monotonic() + PULSE_INTERVAL
             while not _stop.is_set():
-                t0 = time.time()
-                try:
+                now = time.monotonic()
+                if now >= next_send:
                     ws.send(PULSE_HEARTBEAT, opcode=websocket.ABNF.OPCODE_BINARY)
-                    ws.recv()   # 服务端回 HEARTBEAT_RESPONSE，不解析
-                except Exception as e:
-                    log.warning('%s 心跳中断(%s)，准备重连' % (phone, str(e)[:60]))
-                    break
-                wait = PULSE_INTERVAL - (time.time() - t0)
-                if wait > 0:
-                    _stop.wait(wait)
-        except Exception as e:
-            log.warning('%s 连接失败(%s)' % (phone, str(e)[:60]))
-        finally:
-            if ws:
+                    sent += 1
+                    next_send = time.monotonic() + PULSE_INTERVAL
+                remaining = next_send - time.monotonic()
+                if remaining <= 0:
+                    continue
+                ws.settimeout(min(1, remaining))
                 try:
-                    ws.close()
+                    opcode, payload = ws.recv_data(control_frame=True)
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if opcode == websocket.ABNF.OPCODE_CLOSE:
+                    reason = 'peer_closed'
+                    break
+                if opcode in (websocket.ABNF.OPCODE_PING, websocket.ABNF.OPCODE_PONG):
+                    continue
+                try:
+                    if pulse_message_type(payload) == 'HEARTBEAT_RESPONSE':
+                        acknowledged += 1
+                    else:
+                        other += 1
+                except (ValueError, OSError, EOFError, zlib.error):
+                    invalid += 1
+        except Exception as error:
+            reason = type(error).__name__
+        finally:
+            if ws is not None:
+                try:
+                    ws.close(timeout=3)
                 except Exception:
                     pass
+            log.info('%s 心跳会话结束 reason=%s sent=%d ack=%d other=%d invalid=%d'
+                     % (phone, reason, sent, acknowledged, other, invalid))
         if not _stop.is_set():
             log.info('%s %ds 后重连（退避）' % (phone, backoff))
             _stop.wait(backoff)
@@ -168,6 +166,10 @@ def main():
         log.error('--phones 为空，拒绝启动')
         return 1
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
     r = make_redis()
     log.info('=== pulse_guard 启动 merchant=%s 号数=%d 号=%s ===' % (
         args.merchant, len(phones), ','.join(phones)))

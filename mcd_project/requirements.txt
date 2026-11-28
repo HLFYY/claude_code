@@ -5,3 +5,4 @@ redis==5.0.1
 pycryptodome==3.19.0
 schedule==1.2.0
 DrissionPage==4.0.4.22
+websocket-client==1.9.0

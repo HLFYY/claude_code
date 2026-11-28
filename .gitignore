@@ -20,6 +20,7 @@ __pycache__/
 # 忽略特定文件
 *.log
 *.env
+mcd_project/mcd_profiles.local.json
 *.apk
 *.zip
 *.img
